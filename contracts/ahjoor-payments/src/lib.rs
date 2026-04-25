@@ -84,6 +84,8 @@ pub enum Error {
     RateLimitExceeded = 1,
     SubscriptionPaused = 2,
     OracleConditionNotMet = 3,
+    /// Subscription's trial period has not elapsed; charging is deferred (#133)
+    SubscriptionInTrial = 4,
 }
 
 /// Direction for oracle price condition (#125)
@@ -248,6 +250,9 @@ pub struct Subscription {
     pub paused: bool,
     /// Ledger timestamp when the subscription was paused (#124)
     pub paused_at: u64,
+    /// Ledger timestamp at which the trial ends and the first charge becomes
+    /// available. 0 = no trial (immediate first charge). (#133)
+    pub trial_ends_at: u64,
 }
 
 #[contracttype]
@@ -2179,6 +2184,35 @@ impl AhjoorPaymentsContract {
         interval_seconds: u64,
         max_charges: u32,
     ) -> u32 {
+        Self::create_subscription_with_trial(
+            env,
+            subscriber,
+            merchant,
+            amount,
+            token,
+            interval_seconds,
+            max_charges,
+            None,
+        )
+    }
+
+    /// Subscriber creates a recurring payment with an optional trial period (#133).
+    ///
+    /// When `trial_period_seconds` is `Some(n)` (n > 0), the first charge is
+    /// deferred until `created_at + n`. Charging during the trial returns
+    /// `Error::SubscriptionInTrial`. A trial of `0` or `None` behaves like the
+    /// historical `create_subscription` (immediate first charge available).
+    #[allow(clippy::too_many_arguments)]
+    pub fn create_subscription_with_trial(
+        env: Env,
+        subscriber: Address,
+        merchant: Address,
+        amount: i128,
+        token: Address,
+        interval_seconds: u64,
+        max_charges: u32,
+        trial_period_seconds: Option<u64>,
+    ) -> u32 {
         Self::require_not_paused(&env);
         subscriber.require_auth();
         if amount <= 0 {
@@ -2201,10 +2235,14 @@ impl AhjoorPaymentsContract {
             .instance()
             .set(&DataKey::SubscriptionCounter, &counter);
 
+        let now = env.ledger().timestamp();
+        let trial_seconds = trial_period_seconds.unwrap_or(0);
+        let trial_ends_at = if trial_seconds > 0 { now + trial_seconds } else { 0 };
+
         let sub = Subscription {
             id: sub_id,
-            subscriber,
-            merchant,
+            subscriber: subscriber.clone(),
+            merchant: merchant.clone(),
             amount,
             token,
             interval_seconds,
@@ -2214,6 +2252,7 @@ impl AhjoorPaymentsContract {
             active: true,
             paused: false,
             paused_at: 0,
+            trial_ends_at,
         };
 
         env.storage()
@@ -2227,7 +2266,27 @@ impl AhjoorPaymentsContract {
         env.storage()
             .instance()
             .extend_ttl(INSTANCE_LIFETIME_THRESHOLD, INSTANCE_BUMP_AMOUNT);
+
+        if trial_ends_at > 0 {
+            events::emit_subscription_trial_started(&env, sub_id, trial_ends_at);
+        }
         sub_id
+    }
+
+    /// Returns the remaining seconds in the subscription's trial period (#133).
+    /// Returns 0 if there is no trial or the trial has already ended.
+    pub fn get_trial_remaining(env: Env, subscription_id: u32) -> u64 {
+        let sub: Subscription = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Subscription(subscription_id))
+            .expect("Subscription not found");
+        let now = env.ledger().timestamp();
+        if sub.trial_ends_at == 0 || sub.trial_ends_at <= now {
+            0
+        } else {
+            sub.trial_ends_at - now
+        }
     }
 
     /// Charge a subscription. Callable by anyone when the interval has elapsed.
@@ -2250,9 +2309,13 @@ impl AhjoorPaymentsContract {
         }
 
         let now = env.ledger().timestamp();
+        if sub.charges_count == 0 && sub.trial_ends_at > now {
+            panic_with_error!(&env, Error::SubscriptionInTrial);
+        }
         if sub.last_charged_at > 0 && now < sub.last_charged_at + sub.interval_seconds {
             panic!("Interval has not elapsed");
         }
+        let trial_just_ended = sub.charges_count == 0 && sub.trial_ends_at > 0;
 
         let client = token::Client::new(&env, &sub.token);
         client.transfer(
@@ -2282,6 +2345,9 @@ impl AhjoorPaymentsContract {
             sub.amount,
             now,
         );
+        if trial_just_ended {
+            events::emit_subscription_trial_ended(&env, subscription_id);
+        }
 
         env.storage()
             .instance()

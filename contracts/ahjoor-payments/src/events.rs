@@ -158,6 +158,21 @@ pub struct SubscriptionCancelled {
     pub cancelled_by: Address,
 }
 
+/// Event: Subscription created with a trial period (#133)
+#[contractevent]
+#[derive(Clone, Debug)]
+pub struct SubscriptionTrialStarted {
+    pub subscription_id: u32,
+    pub trial_ends_at: u64,
+}
+
+/// Event: Subscription trial ended on first successful charge (#133)
+#[contractevent]
+#[derive(Clone, Debug)]
+pub struct SubscriptionTrialEnded {
+    pub subscription_id: u32,
+}
+
 /// Event: Merchant settlement batch processed.
 #[contractevent]
 #[derive(Clone, Debug)]
@@ -393,6 +408,18 @@ pub fn emit_subscription_cancelled(e: &Env, subscription_id: u32, cancelled_by: 
         cancelled_by,
     }
     .publish(e);
+}
+
+pub fn emit_subscription_trial_started(e: &Env, subscription_id: u32, trial_ends_at: u64) {
+    SubscriptionTrialStarted {
+        subscription_id,
+        trial_ends_at,
+    }
+    .publish(e);
+}
+
+pub fn emit_subscription_trial_ended(e: &Env, subscription_id: u32) {
+    SubscriptionTrialEnded { subscription_id }.publish(e);
 }
 
 pub fn emit_batch_settlement_processed(

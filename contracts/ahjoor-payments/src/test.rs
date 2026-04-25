@@ -5186,3 +5186,112 @@ fn test_invoice_hash_consistency() {
     let hash2 = s.client.get_invoice_hash(&payment_id2).unwrap();
     assert_eq!(hash1, hash2);
 }
+
+// ===========================================================================
+//  #133 — Subscription Trial Period
+// ===========================================================================
+
+#[test]
+fn test_subscription_without_trial_charges_immediately() {
+    let s = setup();
+    s.init();
+    let subscriber = Address::generate(&s.env);
+    let merchant = Address::generate(&s.env);
+    s.token_admin_client.mint(&subscriber, &10_000);
+
+    let sub_id = s.client.create_subscription_with_trial(
+        &subscriber, &merchant, &100, &s.token_addr, &60, &10, &None,
+    );
+
+    s.client.charge_subscription(&sub_id);
+    let sub = s.client.get_subscription(&sub_id);
+    assert_eq!(sub.charges_count, 1);
+    assert_eq!(s.token_client.balance(&merchant), 100);
+}
+
+#[test]
+fn test_subscription_with_zero_trial_charges_immediately() {
+    let s = setup();
+    s.init();
+    let subscriber = Address::generate(&s.env);
+    let merchant = Address::generate(&s.env);
+    s.token_admin_client.mint(&subscriber, &10_000);
+
+    let sub_id = s.client.create_subscription_with_trial(
+        &subscriber, &merchant, &100, &s.token_addr, &60, &10, &Some(0),
+    );
+
+    s.client.charge_subscription(&sub_id);
+    assert_eq!(s.client.get_subscription(&sub_id).charges_count, 1);
+}
+
+#[test]
+#[should_panic]
+fn test_charge_during_trial_panics() {
+    let s = setup();
+    s.init();
+    let subscriber = Address::generate(&s.env);
+    let merchant = Address::generate(&s.env);
+    s.token_admin_client.mint(&subscriber, &10_000);
+
+    let sub_id = s.client.create_subscription_with_trial(
+        &subscriber, &merchant, &100, &s.token_addr, &60, &10, &Some(86_400),
+    );
+
+    s.client.charge_subscription(&sub_id);
+}
+
+#[test]
+fn test_charge_after_trial_succeeds() {
+    let s = setup();
+    s.init();
+    let subscriber = Address::generate(&s.env);
+    let merchant = Address::generate(&s.env);
+    s.token_admin_client.mint(&subscriber, &10_000);
+
+    let sub_id = s.client.create_subscription_with_trial(
+        &subscriber, &merchant, &100, &s.token_addr, &60, &10, &Some(86_400),
+    );
+
+    s.env.ledger().with_mut(|l| l.timestamp += 86_400 + 1);
+
+    s.client.charge_subscription(&sub_id);
+    assert_eq!(s.client.get_subscription(&sub_id).charges_count, 1);
+    assert_eq!(s.token_client.balance(&merchant), 100);
+}
+
+#[test]
+fn test_get_trial_remaining_during_and_after_trial() {
+    let s = setup();
+    s.init();
+    let subscriber = Address::generate(&s.env);
+    let merchant = Address::generate(&s.env);
+    s.token_admin_client.mint(&subscriber, &10_000);
+
+    let sub_id = s.client.create_subscription_with_trial(
+        &subscriber, &merchant, &100, &s.token_addr, &60, &10, &Some(3600),
+    );
+
+    assert_eq!(s.client.get_trial_remaining(&sub_id), 3600);
+
+    s.env.ledger().with_mut(|l| l.timestamp += 1800);
+    assert_eq!(s.client.get_trial_remaining(&sub_id), 1800);
+
+    s.env.ledger().with_mut(|l| l.timestamp += 1800);
+    assert_eq!(s.client.get_trial_remaining(&sub_id), 0);
+}
+
+#[test]
+fn test_subscription_without_trial_reports_zero_remaining() {
+    let s = setup();
+    s.init();
+    let subscriber = Address::generate(&s.env);
+    let merchant = Address::generate(&s.env);
+    s.token_admin_client.mint(&subscriber, &10_000);
+
+    let sub_id = s.client.create_subscription_with_trial(
+        &subscriber, &merchant, &100, &s.token_addr, &60, &10, &None,
+    );
+
+    assert_eq!(s.client.get_trial_remaining(&sub_id), 0);
+}

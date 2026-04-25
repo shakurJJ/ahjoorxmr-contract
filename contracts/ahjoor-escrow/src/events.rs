@@ -48,6 +48,15 @@ pub struct PartialReleased {
     pub remaining_amount: i128,
 }
 
+/// Event: Milestone approved and amount released to seller (#136)
+#[contractevent]
+#[derive(Clone, Debug)]
+pub struct MilestoneApproved {
+    pub escrow_id: u32,
+    pub milestone_index: u32,
+    pub amount_released: i128,
+}
+
 /// Event: Escrow disputed
 #[contractevent]
 #[derive(Clone, Debug)]
@@ -295,6 +304,20 @@ pub fn emit_partial_released(
         escrow_id,
         released_amount,
         remaining_amount,
+    }
+    .publish(e);
+}
+
+pub fn emit_milestone_approved(
+    e: &Env,
+    escrow_id: u32,
+    milestone_index: u32,
+    amount_released: i128,
+) {
+    MilestoneApproved {
+        escrow_id,
+        milestone_index,
+        amount_released,
     }
     .publish(e);
 }

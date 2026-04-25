@@ -3651,3 +3651,205 @@ fn test_oracle_release_emits_event() {
     let found = events.iter().any(|e| e.1 == topic);
     assert!(found, "Expected oracle_release_triggered event");
 }
+
+// ===========================================================================
+//  #136 — Milestone-Based Escrow Release
+// ===========================================================================
+
+fn make_milestones(env: &Env, amounts: &[i128]) -> soroban_sdk::Vec<Milestone> {
+    let mut v = soroban_sdk::Vec::new(env);
+    for amt in amounts.iter() {
+        v.push_back(Milestone {
+            description_hash: BytesN::from_array(env, &[0u8; 32]),
+            amount: *amt,
+            status: MilestoneStatus::Pending,
+        });
+    }
+    v
+}
+
+#[test]
+fn test_create_milestone_escrow_locks_total() {
+    let s = setup();
+    let buyer = Address::generate(&s.env);
+    let seller = Address::generate(&s.env);
+    let arbiter = Address::generate(&s.env);
+    s.token_admin_client.mint(&buyer, &1000);
+
+    let deadline = s.env.ledger().timestamp() + 1000;
+    let escrow_id = s.client.create_milestone_escrow(
+        &buyer,
+        &seller,
+        &arbiter,
+        &s.token_addr,
+        &deadline,
+        &make_milestones(&s.env, &[100, 200, 300]),
+    );
+
+    assert_eq!(s.token_client.balance(&buyer), 400);
+    let milestones = s.client.get_milestones(&escrow_id);
+    assert_eq!(milestones.len(), 3);
+    assert_eq!(milestones.get(0).unwrap().amount, 100);
+    assert_eq!(milestones.get(1).unwrap().status, MilestoneStatus::Pending);
+}
+
+#[test]
+fn test_milestone_partial_release_pays_seller() {
+    let s = setup();
+    let buyer = Address::generate(&s.env);
+    let seller = Address::generate(&s.env);
+    let arbiter = Address::generate(&s.env);
+    s.token_admin_client.mint(&buyer, &1000);
+
+    let deadline = s.env.ledger().timestamp() + 1000;
+    let escrow_id = s.client.create_milestone_escrow(
+        &buyer,
+        &seller,
+        &arbiter,
+        &s.token_addr,
+        &deadline,
+        &make_milestones(&s.env, &[100, 200, 300]),
+    );
+
+    s.client.approve_milestone(&buyer, &escrow_id, &0);
+
+    assert_eq!(s.token_client.balance(&seller), 100);
+    let m = s.client.get_milestones(&escrow_id);
+    assert_eq!(m.get(0).unwrap().status, MilestoneStatus::Approved);
+    assert_eq!(m.get(1).unwrap().status, MilestoneStatus::Pending);
+    assert_eq!(s.client.get_escrow(&escrow_id).status, EscrowStatus::Active);
+}
+
+#[test]
+fn test_milestone_full_release_transitions_to_released() {
+    let s = setup();
+    let buyer = Address::generate(&s.env);
+    let seller = Address::generate(&s.env);
+    let arbiter = Address::generate(&s.env);
+    s.token_admin_client.mint(&buyer, &1000);
+
+    let deadline = s.env.ledger().timestamp() + 1000;
+    let escrow_id = s.client.create_milestone_escrow(
+        &buyer,
+        &seller,
+        &arbiter,
+        &s.token_addr,
+        &deadline,
+        &make_milestones(&s.env, &[100, 200, 300]),
+    );
+
+    s.client.approve_milestone(&buyer, &escrow_id, &0);
+    s.client.approve_milestone(&buyer, &escrow_id, &1);
+    s.client.approve_milestone(&arbiter, &escrow_id, &2);
+
+    assert_eq!(s.token_client.balance(&seller), 600);
+    assert_eq!(s.token_client.balance(&s.client.address), 0);
+    assert_eq!(s.client.get_escrow(&escrow_id).status, EscrowStatus::Released);
+}
+
+#[test]
+#[should_panic(expected = "Milestone not pending")]
+fn test_double_approve_milestone_panics() {
+    let s = setup();
+    let buyer = Address::generate(&s.env);
+    let seller = Address::generate(&s.env);
+    let arbiter = Address::generate(&s.env);
+    s.token_admin_client.mint(&buyer, &1000);
+
+    let deadline = s.env.ledger().timestamp() + 1000;
+    let escrow_id = s.client.create_milestone_escrow(
+        &buyer,
+        &seller,
+        &arbiter,
+        &s.token_addr,
+        &deadline,
+        &make_milestones(&s.env, &[100, 200, 300]),
+    );
+
+    s.client.approve_milestone(&buyer, &escrow_id, &0);
+    s.client.approve_milestone(&buyer, &escrow_id, &0);
+}
+
+#[test]
+#[should_panic(expected = "Only buyer or arbiter can approve milestones")]
+fn test_seller_cannot_approve_own_milestone() {
+    let s = setup();
+    let buyer = Address::generate(&s.env);
+    let seller = Address::generate(&s.env);
+    let arbiter = Address::generate(&s.env);
+    s.token_admin_client.mint(&buyer, &1000);
+
+    let deadline = s.env.ledger().timestamp() + 1000;
+    let escrow_id = s.client.create_milestone_escrow(
+        &buyer,
+        &seller,
+        &arbiter,
+        &s.token_addr,
+        &deadline,
+        &make_milestones(&s.env, &[100, 200, 300]),
+    );
+
+    s.client.approve_milestone(&seller, &escrow_id, &0);
+}
+
+#[test]
+#[should_panic(expected = "Milestone amount must be positive")]
+fn test_zero_milestone_amount_rejected() {
+    let s = setup();
+    let buyer = Address::generate(&s.env);
+    let seller = Address::generate(&s.env);
+    let arbiter = Address::generate(&s.env);
+    s.token_admin_client.mint(&buyer, &1000);
+
+    let deadline = s.env.ledger().timestamp() + 1000;
+    s.client.create_milestone_escrow(
+        &buyer,
+        &seller,
+        &arbiter,
+        &s.token_addr,
+        &deadline,
+        &make_milestones(&s.env, &[0, 100]),
+    );
+}
+
+#[test]
+#[should_panic(expected = "At least one milestone required")]
+fn test_empty_milestones_rejected() {
+    let s = setup();
+    let buyer = Address::generate(&s.env);
+    let seller = Address::generate(&s.env);
+    let arbiter = Address::generate(&s.env);
+    s.token_admin_client.mint(&buyer, &1000);
+
+    let deadline = s.env.ledger().timestamp() + 1000;
+    s.client.create_milestone_escrow(
+        &buyer,
+        &seller,
+        &arbiter,
+        &s.token_addr,
+        &deadline,
+        &make_milestones(&s.env, &[]),
+    );
+}
+
+#[test]
+#[should_panic(expected = "Milestone index out of range")]
+fn test_milestone_out_of_range_rejected() {
+    let s = setup();
+    let buyer = Address::generate(&s.env);
+    let seller = Address::generate(&s.env);
+    let arbiter = Address::generate(&s.env);
+    s.token_admin_client.mint(&buyer, &1000);
+
+    let deadline = s.env.ledger().timestamp() + 1000;
+    let escrow_id = s.client.create_milestone_escrow(
+        &buyer,
+        &seller,
+        &arbiter,
+        &s.token_addr,
+        &deadline,
+        &make_milestones(&s.env, &[100, 200]),
+    );
+
+    s.client.approve_milestone(&buyer, &escrow_id, &5);
+}

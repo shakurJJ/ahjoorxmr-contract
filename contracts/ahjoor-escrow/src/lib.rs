@@ -147,6 +147,26 @@ pub struct EscrowTemplate {
     pub active: bool,
 }
 
+/// Status of a milestone in a milestone-based escrow (#136).
+#[contracttype]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MilestoneStatus {
+    Pending = 0,
+    Approved = 1,
+    Disputed = 2,
+}
+
+/// Single milestone in a milestone-based escrow (#136).
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Milestone {
+    pub description_hash: BytesN<32>,
+    pub amount: i128,
+    pub status: MilestoneStatus,
+}
+
+const MAX_MILESTONES: u32 = 20;
+
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct EscrowBatchConfig {
@@ -195,6 +215,8 @@ pub enum DataKey {
     InsuranceClaimed(u32),
     /// Last timestamp of any buyer action for inactivity tracking (#150)
     LastBuyerAction(u32),
+    /// Optional milestone schedule attached to an escrow (#136)
+    EscrowMilestones(u32),
 }
 
 const MAX_PROTOCOL_FEE_BPS: u32 = 200; // 2%
@@ -906,6 +928,178 @@ impl AhjoorEscrowContract {
         env.storage()
             .instance()
             .extend_ttl(INSTANCE_LIFETIME_THRESHOLD, INSTANCE_BUMP_AMOUNT);
+    }
+
+    // --- Milestone-based escrow release (#136) ---
+
+    /// Create a milestone-based escrow.
+    ///
+    /// `milestones[i].amount` must be positive and the sum of all milestone
+    /// amounts must equal `total_amount`. Tokens for `total_amount` are
+    /// transferred from `buyer` into the contract up front; each milestone is
+    /// released independently via `approve_milestone`. When all milestones are
+    /// approved, the escrow transitions automatically to `Released`.
+    pub fn create_milestone_escrow(
+        env: Env,
+        buyer: Address,
+        seller: Address,
+        arbiter: Address,
+        token: Address,
+        deadline: u64,
+        milestones: Vec<Milestone>,
+    ) -> u32 {
+        buyer.require_auth();
+
+        if milestones.is_empty() {
+            panic!("At least one milestone required");
+        }
+        if milestones.len() > MAX_MILESTONES {
+            panic!("Too many milestones");
+        }
+
+        let mut total_amount: i128 = 0;
+        for i in 0..milestones.len() {
+            let m = milestones.get(i).unwrap();
+            if m.amount <= 0 {
+                panic!("Milestone amount must be positive");
+            }
+            if m.status != MilestoneStatus::Pending {
+                panic!("New milestones must start as Pending");
+            }
+            total_amount += m.amount;
+        }
+
+        let request = EscrowCreateRequest {
+            seller,
+            arbiter,
+            amount: total_amount,
+            token,
+            deadline,
+            metadata_hash: None,
+            sellers: Vec::new(&env),
+            auto_renew: false,
+            renewal_count: 0,
+            buyer_inactivity_secs: 0,
+            min_lock_until: None,
+            release_base: None,
+            release_quote: None,
+            release_comparison: None,
+            release_threshold_price: None,
+            arbiter_fee_bps: None,
+        };
+        let escrow_id = Self::create_escrow_core(&env, &buyer, request);
+
+        env.storage()
+            .persistent()
+            .set(&DataKey::EscrowMilestones(escrow_id), &milestones);
+        env.storage().persistent().extend_ttl(
+            &DataKey::EscrowMilestones(escrow_id),
+            PERSISTENT_LIFETIME_THRESHOLD,
+            PERSISTENT_BUMP_AMOUNT,
+        );
+
+        escrow_id
+    }
+
+    /// Approve a single milestone, releasing its `amount` to the seller.
+    ///
+    /// Callable by buyer or arbiter. The targeted milestone must be `Pending`.
+    /// Disputed milestones do not block other milestones from being approved.
+    /// When every milestone reaches a terminal state and at least one was
+    /// approved, the escrow auto-transitions to `Released`.
+    pub fn approve_milestone(
+        env: Env,
+        caller: Address,
+        escrow_id: u32,
+        milestone_index: u32,
+    ) {
+        caller.require_auth();
+
+        let mut escrow: Escrow = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Escrow(escrow_id))
+            .expect("Escrow not found");
+
+        if escrow.status == EscrowStatus::Released
+            || escrow.status == EscrowStatus::Refunded
+            || escrow.status == EscrowStatus::Resolved
+        {
+            panic!("Escrow already terminal");
+        }
+
+        if caller != escrow.buyer && caller != escrow.arbiter {
+            panic!("Only buyer or arbiter can approve milestones");
+        }
+
+        let mut milestones: Vec<Milestone> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::EscrowMilestones(escrow_id))
+            .expect("Escrow has no milestones");
+
+        if milestone_index >= milestones.len() {
+            panic!("Milestone index out of range");
+        }
+
+        let mut milestone = milestones.get(milestone_index).unwrap();
+        if milestone.status != MilestoneStatus::Pending {
+            panic!("Milestone not pending");
+        }
+
+        let client = token::Client::new(&env, &escrow.token);
+        client.transfer(&env.current_contract_address(), &escrow.seller, &milestone.amount);
+
+        let amount_released = milestone.amount;
+        milestone.status = MilestoneStatus::Approved;
+        milestones.set(milestone_index, milestone);
+
+        env.storage()
+            .persistent()
+            .set(&DataKey::EscrowMilestones(escrow_id), &milestones);
+        env.storage().persistent().extend_ttl(
+            &DataKey::EscrowMilestones(escrow_id),
+            PERSISTENT_LIFETIME_THRESHOLD,
+            PERSISTENT_BUMP_AMOUNT,
+        );
+
+        // Auto-transition to Released when every milestone is in a terminal
+        // state and at least one was approved.
+        let mut all_terminal = true;
+        let mut any_approved = false;
+        for i in 0..milestones.len() {
+            let m = milestones.get(i).unwrap();
+            match m.status {
+                MilestoneStatus::Pending => all_terminal = false,
+                MilestoneStatus::Approved => any_approved = true,
+                MilestoneStatus::Disputed => {}
+            }
+        }
+        if all_terminal && any_approved && escrow.status == EscrowStatus::Active {
+            escrow.status = EscrowStatus::Released;
+            env.storage()
+                .persistent()
+                .set(&DataKey::Escrow(escrow_id), &escrow);
+            env.storage().persistent().extend_ttl(
+                &DataKey::Escrow(escrow_id),
+                PERSISTENT_LIFETIME_THRESHOLD,
+                PERSISTENT_BUMP_AMOUNT,
+            );
+        }
+
+        events::emit_milestone_approved(&env, escrow_id, milestone_index, amount_released);
+
+        env.storage()
+            .instance()
+            .extend_ttl(INSTANCE_LIFETIME_THRESHOLD, INSTANCE_BUMP_AMOUNT);
+    }
+
+    /// Read the current milestone schedule for a milestone-based escrow.
+    pub fn get_milestones(env: Env, escrow_id: u32) -> Vec<Milestone> {
+        env.storage()
+            .persistent()
+            .get(&DataKey::EscrowMilestones(escrow_id))
+            .expect("Escrow has no milestones")
     }
 
     /// Dispute an escrow. Can be called by buyer or seller.
