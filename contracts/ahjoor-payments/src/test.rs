@@ -4015,7 +4015,15 @@ fn test_no_category_does_not_appear_in_index() {
     let merchant = Address::generate(&s.env);
     s.token_admin_client.mint(&customer, &1000);
 
-    s.client.create_payment(&customer, &merchant, &200, &s.token_addr, &None, &None, &None);
+    s.client.create_payment(
+        &customer,
+        &merchant,
+        &200,
+        &s.token_addr,
+        &None,
+        &None,
+        &None,
+    );
 
     let cat = soroban_sdk::Symbol::new(&s.env, "anything");
     let results = s.client.get_payments_by_category(&merchant, &cat, &0, &10);
@@ -4034,14 +4042,33 @@ fn test_bulk_expire_payments_success() {
     let merchant = Address::generate(&s.env);
     s.token_admin_client.mint(&customer, &1000);
 
-    let pid0 = s.client.create_payment(&customer, &merchant, &100, &s.token_addr, &None, &None, &None);
-    let pid1 = s.client.create_payment(&customer, &merchant, &200, &s.token_addr, &None, &None, &None);
+    let pid0 = s.client.create_payment(
+        &customer,
+        &merchant,
+        &100,
+        &s.token_addr,
+        &None,
+        &None,
+        &None,
+    );
+    let pid1 = s.client.create_payment(
+        &customer,
+        &merchant,
+        &200,
+        &s.token_addr,
+        &None,
+        &None,
+        &None,
+    );
 
     // Advance past default 7-day expiry
-    s.env.ledger().with_mut(|l| l.timestamp = 7 * 24 * 60 * 60 + 1);
+    s.env
+        .ledger()
+        .with_mut(|l| l.timestamp = 7 * 24 * 60 * 60 + 1);
 
     let customer_balance_before = s.token_client.balance(&customer);
-    s.client.bulk_expire_payments(&s.admin, &vec![&s.env, pid0, pid1]);
+    s.client
+        .bulk_expire_payments(&s.admin, &vec![&s.env, pid0, pid1]);
 
     assert_eq!(s.client.get_payment(&pid0).status, PaymentStatus::Expired);
     assert_eq!(s.client.get_payment(&pid1).status, PaymentStatus::Expired);
@@ -4060,15 +4087,34 @@ fn test_bulk_expire_ineligible_payment_reverts_entire_batch() {
     let merchant = Address::generate(&s.env);
     s.token_admin_client.mint(&customer, &1000);
 
-    let pid0 = s.client.create_payment(&customer, &merchant, &100, &s.token_addr, &None, &None, &None);
-    let pid1 = s.client.create_payment(&customer, &merchant, &200, &s.token_addr, &None, &None, &None);
+    let pid0 = s.client.create_payment(
+        &customer,
+        &merchant,
+        &100,
+        &s.token_addr,
+        &None,
+        &None,
+        &None,
+    );
+    let pid1 = s.client.create_payment(
+        &customer,
+        &merchant,
+        &200,
+        &s.token_addr,
+        &None,
+        &None,
+        &None,
+    );
 
     // Advance past expiry then complete pid1 so it is ineligible
-    s.env.ledger().with_mut(|l| l.timestamp = 7 * 24 * 60 * 60 + 1);
+    s.env
+        .ledger()
+        .with_mut(|l| l.timestamp = 7 * 24 * 60 * 60 + 1);
     s.client.complete_payment(&pid1);
 
     // Batch contains one eligible (pid0) and one ineligible (pid1, Completed) — must revert
-    s.client.bulk_expire_payments(&s.admin, &vec![&s.env, pid0, pid1]);
+    s.client
+        .bulk_expire_payments(&s.admin, &vec![&s.env, pid0, pid1]);
 }
 
 #[test]
@@ -4092,7 +4138,15 @@ fn test_bulk_expire_not_expired_rejected() {
     let merchant = Address::generate(&s.env);
     s.token_admin_client.mint(&customer, &500);
 
-    let pid = s.client.create_payment(&customer, &merchant, &100, &s.token_addr, &None, &None, &None);
+    let pid = s.client.create_payment(
+        &customer,
+        &merchant,
+        &100,
+        &s.token_addr,
+        &None,
+        &None,
+        &None,
+    );
     // Do NOT advance time — payment hasn't expired
     s.client.bulk_expire_payments(&s.admin, &vec![&s.env, pid]);
 }
@@ -4109,9 +4163,9 @@ fn test_pause_subscription_blocks_charge() {
     let merchant = Address::generate(&s.env);
     s.token_admin_client.mint(&subscriber, &10_000);
 
-    let sub_id = s.client.create_subscription(
-        &subscriber, &merchant, &100, &s.token_addr, &60, &10,
-    );
+    let sub_id =
+        s.client
+            .create_subscription(&subscriber, &merchant, &100, &s.token_addr, &60, &10);
 
     s.client.pause_subscription(&subscriber, &sub_id);
 
@@ -4129,9 +4183,9 @@ fn test_charge_paused_subscription_fails() {
     let merchant = Address::generate(&s.env);
     s.token_admin_client.mint(&subscriber, &10_000);
 
-    let sub_id = s.client.create_subscription(
-        &subscriber, &merchant, &100, &s.token_addr, &60, &10,
-    );
+    let sub_id =
+        s.client
+            .create_subscription(&subscriber, &merchant, &100, &s.token_addr, &60, &10);
 
     // Initial charge succeeds
     s.client.charge_subscription(&sub_id);
@@ -4153,20 +4207,24 @@ fn test_resume_resets_interval_from_resume_time() {
     let merchant = Address::generate(&s.env);
     s.token_admin_client.mint(&subscriber, &10_000);
 
-    let sub_id = s.client.create_subscription(
-        &subscriber, &merchant, &100, &s.token_addr, &60, &10,
-    );
+    let sub_id =
+        s.client
+            .create_subscription(&subscriber, &merchant, &100, &s.token_addr, &60, &10);
 
     // Charge once to set last_charged_at
     s.client.charge_subscription(&sub_id);
     let after_first_charge = s.env.ledger().timestamp();
 
     // Pause mid-interval
-    s.env.ledger().with_mut(|l| l.timestamp = after_first_charge + 30);
+    s.env
+        .ledger()
+        .with_mut(|l| l.timestamp = after_first_charge + 30);
     s.client.pause_subscription(&subscriber, &sub_id);
 
     // Advance through a full interval while paused
-    s.env.ledger().with_mut(|l| l.timestamp = after_first_charge + 120);
+    s.env
+        .ledger()
+        .with_mut(|l| l.timestamp = after_first_charge + 120);
     s.client.resume_subscription(&subscriber, &sub_id);
     let resumed_at = s.env.ledger().timestamp();
 
@@ -4186,9 +4244,9 @@ fn test_non_subscriber_cannot_pause() {
     let other = Address::generate(&s.env);
     s.token_admin_client.mint(&subscriber, &1000);
 
-    let sub_id = s.client.create_subscription(
-        &subscriber, &merchant, &100, &s.token_addr, &60, &5,
-    );
+    let sub_id = s
+        .client
+        .create_subscription(&subscriber, &merchant, &100, &s.token_addr, &60, &5);
 
     s.client.pause_subscription(&other, &sub_id);
 }
@@ -4202,9 +4260,9 @@ fn test_resume_not_paused_subscription_fails() {
     let merchant = Address::generate(&s.env);
     s.token_admin_client.mint(&subscriber, &1000);
 
-    let sub_id = s.client.create_subscription(
-        &subscriber, &merchant, &100, &s.token_addr, &60, &5,
-    );
+    let sub_id = s
+        .client
+        .create_subscription(&subscriber, &merchant, &100, &s.token_addr, &60, &5);
 
     s.client.resume_subscription(&subscriber, &sub_id);
 }
@@ -4268,4 +4326,863 @@ fn test_payment_without_condition_completes_normally() {
 
     let payment = s.client.get_payment(&pid);
     assert_eq!(payment.status, PaymentStatus::Completed);
+}
+
+// ===========================================================================
+//  #127 Payment Authorization Pre-Approval (Two-Step Settlement)
+// ===========================================================================
+
+#[test]
+fn test_authorize_payment_succeeds() {
+    let s = setup();
+    s.init();
+    let customer = Address::generate(&s.env);
+    let merchant = Address::generate(&s.env);
+    s.token_admin_client.mint(&customer, &1000);
+
+    let pid = s.client.create_payment(
+        &customer,
+        &merchant,
+        &300,
+        &s.token_addr,
+        &None,
+        &None,
+        &None,
+    );
+    s.env.ledger().set_timestamp(1000);
+    s.client.authorize_payment(&merchant, &pid, &3600u64);
+
+    let payment = s.client.get_payment(&pid);
+    assert_eq!(payment.status, PaymentStatus::Authorized);
+    assert_eq!(payment.capture_deadline, 4600); // 1000 + 3600
+    assert_eq!(s.token_client.balance(&s.client.address), 300);
+    assert_eq!(s.token_client.balance(&merchant), 0);
+}
+
+#[test]
+#[should_panic(expected = "Only the payment merchant can authorize")]
+fn test_authorize_payment_non_merchant_panics() {
+    let s = setup();
+    s.init();
+    let customer = Address::generate(&s.env);
+    let merchant = Address::generate(&s.env);
+    let stranger = Address::generate(&s.env);
+    s.token_admin_client.mint(&customer, &1000);
+
+    let pid = s.client.create_payment(
+        &customer,
+        &merchant,
+        &300,
+        &s.token_addr,
+        &None,
+        &None,
+        &None,
+    );
+    s.client.authorize_payment(&stranger, &pid, &3600u64);
+}
+
+#[test]
+#[should_panic(expected = "capture_window_seconds must be positive")]
+fn test_authorize_payment_zero_window_panics() {
+    let s = setup();
+    s.init();
+    let customer = Address::generate(&s.env);
+    let merchant = Address::generate(&s.env);
+    s.token_admin_client.mint(&customer, &1000);
+
+    let pid = s.client.create_payment(
+        &customer,
+        &merchant,
+        &300,
+        &s.token_addr,
+        &None,
+        &None,
+        &None,
+    );
+    s.client.authorize_payment(&merchant, &pid, &0u64);
+}
+
+#[test]
+#[should_panic(expected = "Only pending payments can be authorized")]
+fn test_authorize_already_completed_panics() {
+    let s = setup();
+    s.init();
+    let customer = Address::generate(&s.env);
+    let merchant = Address::generate(&s.env);
+    s.token_admin_client.mint(&customer, &1000);
+
+    let pid = s.client.create_payment(
+        &customer,
+        &merchant,
+        &300,
+        &s.token_addr,
+        &None,
+        &None,
+        &None,
+    );
+    s.client.complete_payment(&pid);
+    s.client.authorize_payment(&merchant, &pid, &3600u64);
+}
+
+#[test]
+fn test_capture_authorized_payment_within_window() {
+    let s = setup();
+    s.init();
+    let customer = Address::generate(&s.env);
+    let merchant = Address::generate(&s.env);
+    s.token_admin_client.mint(&customer, &1000);
+
+    let pid = s.client.create_payment(
+        &customer,
+        &merchant,
+        &300,
+        &s.token_addr,
+        &None,
+        &None,
+        &None,
+    );
+    s.env.ledger().set_timestamp(1000);
+    s.client.authorize_payment(&merchant, &pid, &3600u64);
+
+    s.env.ledger().set_timestamp(2000);
+    s.client.capture_payment(&merchant, &pid);
+
+    let payment = s.client.get_payment(&pid);
+    assert_eq!(payment.status, PaymentStatus::Completed);
+    assert_eq!(s.token_client.balance(&merchant), 300);
+    assert_eq!(s.token_client.balance(&s.client.address), 0);
+}
+
+#[test]
+#[should_panic(expected = "Capture window has expired")]
+fn test_capture_after_deadline_panics() {
+    let s = setup();
+    s.init();
+    let customer = Address::generate(&s.env);
+    let merchant = Address::generate(&s.env);
+    s.token_admin_client.mint(&customer, &1000);
+
+    let pid = s.client.create_payment(
+        &customer,
+        &merchant,
+        &300,
+        &s.token_addr,
+        &None,
+        &None,
+        &None,
+    );
+    s.env.ledger().set_timestamp(1000);
+    s.client.authorize_payment(&merchant, &pid, &3600u64);
+
+    s.env.ledger().set_timestamp(5000); // past deadline (4600)
+    s.client.capture_payment(&merchant, &pid);
+}
+
+#[test]
+#[should_panic(expected = "Payment is not authorized")]
+fn test_capture_pending_payment_panics() {
+    let s = setup();
+    s.init();
+    let customer = Address::generate(&s.env);
+    let merchant = Address::generate(&s.env);
+    s.token_admin_client.mint(&customer, &1000);
+
+    let pid = s.client.create_payment(
+        &customer,
+        &merchant,
+        &300,
+        &s.token_addr,
+        &None,
+        &None,
+        &None,
+    );
+    s.client.capture_payment(&merchant, &pid);
+}
+
+#[test]
+fn test_expire_authorized_payment_refunds_customer() {
+    let s = setup();
+    s.init();
+    let customer = Address::generate(&s.env);
+    let merchant = Address::generate(&s.env);
+    s.token_admin_client.mint(&customer, &1000);
+
+    let pid = s.client.create_payment(
+        &customer,
+        &merchant,
+        &300,
+        &s.token_addr,
+        &None,
+        &None,
+        &None,
+    );
+    s.env.ledger().set_timestamp(1000);
+    s.client.authorize_payment(&merchant, &pid, &3600u64);
+
+    // Advance past capture_deadline
+    s.env.ledger().set_timestamp(5000);
+    s.client.expire_payment(&pid);
+
+    let payment = s.client.get_payment(&pid);
+    assert_eq!(payment.status, PaymentStatus::Expired);
+    assert_eq!(s.token_client.balance(&customer), 1000);
+    assert_eq!(s.token_client.balance(&merchant), 0);
+    assert_eq!(s.token_client.balance(&s.client.address), 0);
+}
+
+#[test]
+fn test_dispute_authorized_payment() {
+    let s = setup();
+    s.init();
+    let customer = Address::generate(&s.env);
+    let merchant = Address::generate(&s.env);
+    s.token_admin_client.mint(&customer, &1000);
+
+    let pid = s.client.create_payment(
+        &customer,
+        &merchant,
+        &300,
+        &s.token_addr,
+        &None,
+        &None,
+        &None,
+    );
+    s.client.authorize_payment(&merchant, &pid, &3600u64);
+
+    let reason = String::from_str(&s.env, "Unauthorized charge");
+    s.client.dispute_payment(&customer, &pid, &reason);
+
+    let payment = s.client.get_payment(&pid);
+    assert_eq!(payment.status, PaymentStatus::Disputed);
+}
+
+#[test]
+fn test_bulk_expire_authorized_payments() {
+    let s = setup();
+    s.init();
+    let customer = Address::generate(&s.env);
+    let merchant = Address::generate(&s.env);
+    s.token_admin_client.mint(&customer, &1000);
+
+    let pid0 = s.client.create_payment(
+        &customer,
+        &merchant,
+        &100,
+        &s.token_addr,
+        &None,
+        &None,
+        &None,
+    );
+    let pid1 = s.client.create_payment(
+        &customer,
+        &merchant,
+        &200,
+        &s.token_addr,
+        &None,
+        &None,
+        &None,
+    );
+
+    s.env.ledger().set_timestamp(1000);
+    s.client.authorize_payment(&merchant, &pid0, &3600u64);
+    s.client.authorize_payment(&merchant, &pid1, &3600u64);
+
+    // Advance past both capture_deadlines
+    s.env.ledger().set_timestamp(5000);
+    s.client
+        .bulk_expire_payments(&s.admin, &vec![&s.env, pid0, pid1]);
+
+    assert_eq!(s.client.get_payment(&pid0).status, PaymentStatus::Expired);
+    assert_eq!(s.client.get_payment(&pid1).status, PaymentStatus::Expired);
+    assert_eq!(s.token_client.balance(&customer), 1000);
+}
+
+#[test]
+fn test_authorization_events_emitted() {
+    let s = setup();
+    s.init();
+    let customer = Address::generate(&s.env);
+    let merchant = Address::generate(&s.env);
+    s.token_admin_client.mint(&customer, &1000);
+
+    let pid = s.client.create_payment(
+        &customer,
+        &merchant,
+        &300,
+        &s.token_addr,
+        &None,
+        &None,
+        &None,
+    );
+    s.env.ledger().set_timestamp(1000);
+    s.client.authorize_payment(&merchant, &pid, &3600u64);
+    s.client.capture_payment(&merchant, &pid);
+
+    let events = s.env.events().all();
+    // Should have at least PaymentAuthorized, PaymentCaptured, PaymentCompleted, PaymentStatusChanged (x2)
+    assert!(events.len() >= 5);
+}
+
+// ===========================================================================
+//  Withdrawal Queue Tests (#126)
+// ===========================================================================
+
+#[test]
+fn test_withdrawal_queue_fifo_order() {
+    let s = setup();
+    s.init();
+    let customer = Address::generate(&s.env);
+    let merchant = Address::generate(&s.env);
+    s.token_admin_client.mint(&customer, &1000);
+
+    // Create and complete 3 payments
+    let pid1 = s.client.create_payment(
+        &customer,
+        &merchant,
+        &100,
+        &s.token_addr,
+        &None,
+        &None,
+        &None,
+    );
+    let pid2 = s.client.create_payment(
+        &customer,
+        &merchant,
+        &200,
+        &s.token_addr,
+        &None,
+        &None,
+        &None,
+    );
+    let pid3 = s.client.create_payment(
+        &customer,
+        &merchant,
+        &300,
+        &s.token_addr,
+        &None,
+        &None,
+        &None,
+    );
+
+    s.client.complete_payment(&pid1);
+    s.client.complete_payment(&pid2);
+    s.client.complete_payment(&pid3);
+
+    // Check queue has 3 entries in FIFO order
+    let queue = s.client.get_merchant_withdrawal_queue(&merchant);
+    assert_eq!(queue.len(), 3);
+    assert_eq!(queue.get(0).unwrap(), (pid1, 100));
+    assert_eq!(queue.get(1).unwrap(), (pid2, 200));
+    assert_eq!(queue.get(2).unwrap(), (pid3, 300));
+
+    // Process 2 entries
+    let withdrawn = s.client.process_withdrawal_queue(&merchant, &2);
+    assert_eq!(withdrawn, 300); // 100 + 200
+
+    // Check queue now has 1 entry
+    let queue = s.client.get_merchant_withdrawal_queue(&merchant);
+    assert_eq!(queue.len(), 1);
+    assert_eq!(queue.get(0).unwrap(), (pid3, 300));
+
+    // Process remaining
+    let withdrawn = s.client.process_withdrawal_queue(&merchant, &10);
+    assert_eq!(withdrawn, 300);
+
+    // Queue should be empty
+    let queue = s.client.get_merchant_withdrawal_queue(&merchant);
+    assert_eq!(queue.len(), 0);
+}
+
+#[test]
+fn test_withdrawal_queue_priority_override() {
+    let s = setup();
+    s.init();
+    let customer = Address::generate(&s.env);
+    let merchant = Address::generate(&s.env);
+    s.token_admin_client.mint(&customer, &1000);
+
+    // Create and complete 3 payments
+    let pid1 = s.client.create_payment(
+        &customer,
+        &merchant,
+        &100,
+        &s.token_addr,
+        &None,
+        &None,
+        &None,
+    );
+    let pid2 = s.client.create_payment(
+        &customer,
+        &merchant,
+        &200,
+        &s.token_addr,
+        &None,
+        &None,
+        &None,
+    );
+    let pid3 = s.client.create_payment(
+        &customer,
+        &merchant,
+        &300,
+        &s.token_addr,
+        &None,
+        &None,
+        &None,
+    );
+
+    s.client.complete_payment(&pid1);
+    s.client.complete_payment(&pid2);
+    s.client.complete_payment(&pid3);
+
+    // Prioritize pid3 (move to front)
+    s.client.prioritize_withdrawal(&merchant, &pid3);
+
+    // Check queue order changed
+    let queue = s.client.get_merchant_withdrawal_queue(&merchant);
+    assert_eq!(queue.len(), 3);
+    assert_eq!(queue.get(0).unwrap(), (pid3, 300)); // pid3 now first
+    assert_eq!(queue.get(1).unwrap(), (pid1, 100));
+    assert_eq!(queue.get(2).unwrap(), (pid2, 200));
+
+    // Process 1 entry (should be pid3)
+    let withdrawn = s.client.process_withdrawal_queue(&merchant, &1);
+    assert_eq!(withdrawn, 300);
+
+    // Check remaining queue
+    let queue = s.client.get_merchant_withdrawal_queue(&merchant);
+    assert_eq!(queue.len(), 2);
+    assert_eq!(queue.get(0).unwrap(), (pid1, 100));
+    assert_eq!(queue.get(1).unwrap(), (pid2, 200));
+}
+
+#[test]
+fn test_withdrawal_queue_partial_drain() {
+    let s = setup();
+    s.init();
+    let customer = Address::generate(&s.env);
+    let merchant = Address::generate(&s.env);
+    s.token_admin_client.mint(&customer, &10000);
+
+    // Create and complete 5 payments
+    let mut pids = Vec::new(&s.env);
+    for i in 1..=5 {
+        let amount = (i as i128) * 100;
+        let pid = s.client.create_payment(
+            &customer,
+            &merchant,
+            &amount,
+            &s.token_addr,
+            &None,
+            &None,
+            &None,
+        );
+        s.client.complete_payment(&pid);
+        pids.push_back(pid);
+    }
+
+    // Check queue has 5 entries
+    let queue = s.client.get_merchant_withdrawal_queue(&merchant);
+    assert_eq!(queue.len(), 5);
+
+    // Process with max_count = 3
+    let withdrawn = s.client.process_withdrawal_queue(&merchant, &3);
+    assert_eq!(withdrawn, 600); // 100 + 200 + 300
+
+    // Check 2 entries remain
+    let queue = s.client.get_merchant_withdrawal_queue(&merchant);
+    assert_eq!(queue.len(), 2);
+    assert_eq!(queue.get(0).unwrap(), (pids.get(3).unwrap(), 400));
+    assert_eq!(queue.get(1).unwrap(), (pids.get(4).unwrap(), 500));
+}
+
+#[test]
+fn test_withdrawal_queue_empty() {
+    let s = setup();
+    s.init();
+    let merchant = Address::generate(&s.env);
+
+    // Empty queue
+    let queue = s.client.get_merchant_withdrawal_queue(&merchant);
+    assert_eq!(queue.len(), 0);
+
+    // Process empty queue
+    let withdrawn = s.client.process_withdrawal_queue(&merchant, &10);
+    assert_eq!(withdrawn, 0);
+}
+
+#[test]
+#[should_panic(expected = "Payment not found in withdrawal queue")]
+fn test_prioritize_nonexistent_payment() {
+    let s = setup();
+    s.init();
+    let customer = Address::generate(&s.env);
+    let merchant = Address::generate(&s.env);
+    s.token_admin_client.mint(&customer, &1000);
+
+    let pid = s.client.create_payment(
+        &customer,
+        &merchant,
+        &100,
+        &s.token_addr,
+        &None,
+        &None,
+        &None,
+    );
+    s.client.complete_payment(&pid);
+
+    // Try to prioritize a different payment ID
+    s.client.prioritize_withdrawal(&merchant, &999);
+}
+
+#[test]
+fn test_prioritize_already_first() {
+    let s = setup();
+    s.init();
+    let customer = Address::generate(&s.env);
+    let merchant = Address::generate(&s.env);
+    s.token_admin_client.mint(&customer, &1000);
+
+    let pid1 = s.client.create_payment(
+        &customer,
+        &merchant,
+        &100,
+        &s.token_addr,
+        &None,
+        &None,
+        &None,
+    );
+    let pid2 = s.client.create_payment(
+        &customer,
+        &merchant,
+        &200,
+        &s.token_addr,
+        &None,
+        &None,
+        &None,
+    );
+
+    s.client.complete_payment(&pid1);
+    s.client.complete_payment(&pid2);
+
+    // Prioritize pid1 (already first) - should do nothing
+    s.client.prioritize_withdrawal(&merchant, &pid1);
+
+    let queue = s.client.get_merchant_withdrawal_queue(&merchant);
+    assert_eq!(queue.len(), 2);
+    assert_eq!(queue.get(0).unwrap(), (pid1, 100));
+    assert_eq!(queue.get(1).unwrap(), (pid2, 200));
+}
+
+// ===========================================================================
+//  Invoice Line Items Tests (#128)
+// ===========================================================================
+
+#[test]
+fn test_create_payment_with_invoice_success() {
+    let s = setup();
+    s.init();
+    let customer = Address::generate(&s.env);
+    let merchant = Address::generate(&s.env);
+    s.token_admin_client.mint(&customer, &1000);
+
+    // Create invoice with one line item: 100 * 2 = 200, tax = 0, total = 200
+    let mut line_items = Vec::new(&s.env);
+    line_items.push_back(LineItem {
+        description: Symbol::new(&s.env, "item1"),
+        quantity: 2,
+        unit_price: 100,
+    });
+
+    let invoice = InvoiceData {
+        line_items,
+        tax_bps: 0,
+        currency_label: Symbol::new(&s.env, "USD"),
+    };
+
+    let payment_id = s.client.create_payment_with_invoice(
+        &customer,
+        &merchant,
+        &200,
+        &s.token_addr,
+        &None,
+        &None,
+        &Some(invoice),
+        &None,
+    );
+
+    // Verify invoice hash was stored
+    let invoice_hash = s.client.get_invoice_hash(&payment_id);
+    assert!(invoice_hash.is_some());
+
+    let payment = s.client.get_payment(&payment_id);
+    assert_eq!(payment.amount, 200);
+}
+
+#[test]
+#[should_panic(expected = "Invoice total does not match payment amount")]
+fn test_create_payment_with_invoice_total_mismatch() {
+    let s = setup();
+    s.init();
+    let customer = Address::generate(&s.env);
+    let merchant = Address::generate(&s.env);
+    s.token_admin_client.mint(&customer, &1000);
+
+    // Create invoice with total 200, but payment amount is 250
+    let mut line_items = Vec::new(&s.env);
+    line_items.push_back(LineItem {
+        description: Symbol::new(&s.env, "item1"),
+        quantity: 2,
+        unit_price: 100,
+    });
+
+    let invoice = InvoiceData {
+        line_items,
+        tax_bps: 0,
+        currency_label: Symbol::new(&s.env, "USD"),
+    };
+
+    // This should panic because total 200 != payment 250
+    s.client.create_payment_with_invoice(
+        &customer,
+        &merchant,
+        &250,
+        &s.token_addr,
+        &None,
+        &None,
+        &Some(invoice),
+        &None,
+    );
+}
+
+#[test]
+fn test_create_payment_with_invoice_with_tax() {
+    let s = setup();
+    s.init();
+    let customer = Address::generate(&s.env);
+    let merchant = Address::generate(&s.env);
+    s.token_admin_client.mint(&customer, &1000);
+
+    // Create invoice: 100 * 2 = 200, tax = 10% = 20, total = 220
+    let mut line_items = Vec::new(&s.env);
+    line_items.push_back(LineItem {
+        description: Symbol::new(&s.env, "item1"),
+        quantity: 2,
+        unit_price: 100,
+    });
+
+    let invoice = InvoiceData {
+        line_items,
+        tax_bps: 1000, // 10%
+        currency_label: Symbol::new(&s.env, "USD"),
+    };
+
+    let payment_id = s.client.create_payment_with_invoice(
+        &customer,
+        &merchant,
+        &220,
+        &s.token_addr,
+        &None,
+        &None,
+        &Some(invoice),
+        &None,
+    );
+
+    let payment = s.client.get_payment(&payment_id);
+    assert_eq!(payment.amount, 220);
+}
+
+#[test]
+fn test_create_payment_with_multiple_line_items() {
+    let s = setup();
+    s.init();
+    let customer = Address::generate(&s.env);
+    let merchant = Address::generate(&s.env);
+    s.token_admin_client.mint(&customer, &1000);
+
+    // Create invoice with 3 line items: (100*2) + (50*3) + (75*1) = 200 + 150 + 75 = 425
+    let mut line_items = Vec::new(&s.env);
+    line_items.push_back(LineItem {
+        description: Symbol::new(&s.env, "item1"),
+        quantity: 2,
+        unit_price: 100,
+    });
+    line_items.push_back(LineItem {
+        description: Symbol::new(&s.env, "item2"),
+        quantity: 3,
+        unit_price: 50,
+    });
+    line_items.push_back(LineItem {
+        description: Symbol::new(&s.env, "item3"),
+        quantity: 1,
+        unit_price: 75,
+    });
+
+    let invoice = InvoiceData {
+        line_items,
+        tax_bps: 0,
+        currency_label: Symbol::new(&s.env, "USD"),
+    };
+
+    let payment_id = s.client.create_payment_with_invoice(
+        &customer,
+        &merchant,
+        &425,
+        &s.token_addr,
+        &None,
+        &None,
+        &Some(invoice),
+        &None,
+    );
+
+    let payment = s.client.get_payment(&payment_id);
+    assert_eq!(payment.amount, 425);
+}
+
+#[test]
+#[should_panic(expected = "Invoice line items exceed maximum of 20")]
+fn test_create_payment_with_too_many_line_items() {
+    let s = setup();
+    s.init();
+    let customer = Address::generate(&s.env);
+    let merchant = Address::generate(&s.env);
+    s.token_admin_client.mint(&customer, &10000);
+
+    // Create invoice with 21 line items (exceeds max of 20)
+    let mut line_items = Vec::new(&s.env);
+    for _i in 0..21 {
+        line_items.push_back(LineItem {
+            description: Symbol::new(&s.env, "item"),
+            quantity: 1,
+            unit_price: 10,
+        });
+    }
+
+    let invoice = InvoiceData {
+        line_items,
+        tax_bps: 0,
+        currency_label: Symbol::new(&s.env, "USD"),
+    };
+
+    // This should panic because 21 items > max 20
+    s.client.create_payment_with_invoice(
+        &customer,
+        &merchant,
+        &210,
+        &s.token_addr,
+        &None,
+        &None,
+        &Some(invoice),
+        &None,
+    );
+}
+
+#[test]
+#[should_panic(expected = "Invoice line_items cannot be empty")]
+fn test_create_payment_with_empty_invoice() {
+    let s = setup();
+    s.init();
+    let customer = Address::generate(&s.env);
+    let merchant = Address::generate(&s.env);
+    s.token_admin_client.mint(&customer, &1000);
+
+    // Create invoice with no line items (should panic)
+    let line_items = Vec::new(&s.env);
+
+    let invoice = InvoiceData {
+        line_items,
+        tax_bps: 0,
+        currency_label: Symbol::new(&s.env, "USD"),
+    };
+
+    s.client.create_payment_with_invoice(
+        &customer,
+        &merchant,
+        &0,
+        &s.token_addr,
+        &None,
+        &None,
+        &Some(invoice),
+        &None,
+    );
+}
+
+#[test]
+fn test_create_payment_without_invoice_backward_compat() {
+    let s = setup();
+    s.init();
+    let customer = Address::generate(&s.env);
+    let merchant = Address::generate(&s.env);
+    s.token_admin_client.mint(&customer, &1000);
+
+    // Create payment without invoice - should work normally
+    let payment_id = s.client.create_payment(
+        &customer,
+        &merchant,
+        &200,
+        &s.token_addr,
+        &None,
+        &None,
+        &None,
+    );
+
+    // Verify no invoice hash was stored
+    let invoice_hash = s.client.get_invoice_hash(&payment_id);
+    assert!(invoice_hash.is_none());
+
+    let payment = s.client.get_payment(&payment_id);
+    assert_eq!(payment.amount, 200);
+}
+
+#[test]
+fn test_invoice_hash_consistency() {
+    let s = setup();
+    s.init();
+    let customer = Address::generate(&s.env);
+    let merchant = Address::generate(&s.env);
+    s.token_admin_client.mint(&customer, &2000);
+
+    // Create two identical invoices
+    let create_invoice = |env: &Env| -> InvoiceData {
+        let mut line_items = Vec::new(env);
+        line_items.push_back(LineItem {
+            description: Symbol::new(env, "item1"),
+            quantity: 2,
+            unit_price: 100,
+        });
+        InvoiceData {
+            line_items,
+            tax_bps: 0,
+            currency_label: Symbol::new(env, "USD"),
+        }
+    };
+
+    let invoice1 = create_invoice(&s.env);
+    let invoice2 = create_invoice(&s.env);
+
+    let payment_id1 = s.client.create_payment_with_invoice(
+        &customer,
+        &merchant,
+        &200,
+        &s.token_addr,
+        &None,
+        &None,
+        &Some(invoice1),
+        &None,
+    );
+
+    let payment_id2 = s.client.create_payment_with_invoice(
+        &customer,
+        &merchant,
+        &200,
+        &s.token_addr,
+        &None,
+        &None,
+        &Some(invoice2),
+        &None,
+    );
+
+    // Both hashes should be identical for identical invoices
+    let hash1 = s.client.get_invoice_hash(&payment_id1).unwrap();
+    let hash2 = s.client.get_invoice_hash(&payment_id2).unwrap();
+    assert_eq!(hash1, hash2);
 }

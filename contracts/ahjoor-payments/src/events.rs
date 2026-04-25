@@ -114,6 +114,21 @@ pub struct PaymentExpired {
     pub expired_at: u64,
 }
 
+/// Event: Payment authorized by merchant — funds held in escrow (#127)
+#[contractevent]
+#[derive(Clone, Debug)]
+pub struct PaymentAuthorized {
+    pub payment_id: u32,
+    pub capture_deadline: u64,
+}
+
+/// Event: Authorized payment captured by merchant — funds released (#127)
+#[contractevent]
+#[derive(Clone, Debug)]
+pub struct PaymentCaptured {
+    pub payment_id: u32,
+}
+
 /// Event: Partial refund issued on a pending/disputed payment
 #[contractevent]
 #[derive(Clone, Debug)]
@@ -221,6 +236,31 @@ pub struct ContractResumed {
     pub timestamp: u64,
 }
 
+/// Event: Payment queued for merchant withdrawal (#126)
+#[contractevent]
+#[derive(Clone, Debug)]
+pub struct WithdrawalQueued {
+    pub merchant: Address,
+    pub payment_id: u32,
+    pub amount: i128,
+}
+
+/// Event: Merchant withdrawal queue processed (#126)
+#[contractevent]
+#[derive(Clone, Debug)]
+pub struct WithdrawalProcessed {
+    pub merchant: Address,
+    pub total: u32,
+}
+
+/// Event: Invoice attached to payment (#128)
+#[contractevent]
+#[derive(Clone, Debug)]
+pub struct InvoiceAttached {
+    pub payment_id: u32,
+    pub invoice_hash: BytesN<32>,
+}
+
 // --- Helper Emission Functions ---
 
 pub fn emit_payment_created(
@@ -299,6 +339,18 @@ pub fn emit_payment_expired(
         expired_at,
     }
     .publish(e);
+}
+
+pub fn emit_payment_authorized(e: &Env, payment_id: u32, capture_deadline: u64) {
+    PaymentAuthorized {
+        payment_id,
+        capture_deadline,
+    }
+    .publish(e);
+}
+
+pub fn emit_payment_captured(e: &Env, payment_id: u32) {
+    PaymentCaptured { payment_id }.publish(e);
 }
 
 pub fn emit_payment_partial_refund(
@@ -588,6 +640,71 @@ pub fn emit_multi_token_payment_created(
         payment_token,
         token_amount,
         oracle_price,
+    }
+    .publish(e);
+}
+
+pub fn emit_withdrawal_queued(e: &Env, merchant: Address, payment_id: u32, amount: i128) {
+    WithdrawalQueued {
+        merchant,
+        payment_id,
+        amount,
+    }
+    .publish(e);
+}
+
+pub fn emit_withdrawal_processed(e: &Env, merchant: Address, total: u32) {
+    WithdrawalProcessed { merchant, total }.publish(e);
+}
+
+pub fn emit_invoice_attached(e: &Env, payment_id: u32, invoice_hash: BytesN<32>) {
+    InvoiceAttached {
+        payment_id,
+        invoice_hash,
+    }
+    .publish(e);
+}
+
+// --- Collateral Events (#129) ---
+
+/// Event: Merchant deposited collateral
+#[contractevent]
+#[derive(Clone, Debug)]
+pub struct CollateralDeposited {
+    pub merchant: Address,
+    pub amount: i128,
+}
+
+/// Event: Merchant withdrew collateral
+#[contractevent]
+#[derive(Clone, Debug)]
+pub struct CollateralWithdrawn {
+    pub merchant: Address,
+    pub amount: i128,
+}
+
+/// Event: Merchant collateral slashed due to dispute resolved for customer
+#[contractevent]
+#[derive(Clone, Debug)]
+pub struct CollateralSlashed {
+    pub merchant: Address,
+    pub amount: i128,
+    pub payment_id: u32,
+}
+
+pub fn emit_collateral_deposited(e: &Env, merchant: Address, amount: i128) {
+    CollateralDeposited { merchant, amount }.publish(e);
+}
+
+pub fn emit_collateral_withdrawn(e: &Env, merchant: Address, amount: i128) {
+    CollateralWithdrawn { merchant, amount }.publish(e);
+}
+
+pub fn emit_collateral_slashed(e: &Env, merchant: Address, amount: i128, payment_id: u32) {
+    CollateralSlashed {
+        merchant,
+        amount,
+        payment_id,
     }
     .publish(e);
 }

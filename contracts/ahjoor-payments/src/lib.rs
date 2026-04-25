@@ -56,6 +56,8 @@ const TEMP_BUMP_AMOUNT: u32 = 15_000;
 const DEFAULT_MAX_BATCH_SIZE: u32 = 20;
 /// Maximum number of tags per payment (#122)
 const MAX_TAGS: u32 = 3;
+/// Maximum number of line items in invoice (#128)
+const MAX_INVOICE_LINE_ITEMS: u32 = 20;
 const MAX_SETTLEMENT_BATCH_SIZE: u32 = 50;
 const SETTLEMENT_FEE_BPS: i128 = 0;
 const DEFAULT_DISPUTE_TIMEOUT: u64 = 7 * 24 * 60 * 60; // 7 days in seconds
@@ -73,6 +75,8 @@ const DEFAULT_FEE_BPS: u32 = 0;
 /// Idempotency key TTL: 24 hours in ledgers (~17,280 ledgers at 5s/ledger)
 const IDEMPOTENCY_KEY_LIFETIME_THRESHOLD: u32 = 10_000;
 const IDEMPOTENCY_KEY_BUMP_AMOUNT: u32 = 17_280;
+/// Minimum collateral a merchant must maintain at all times (#129)
+const DEFAULT_MIN_COLLATERAL: i128 = 1_000_000; // 1 USDC (7 decimals)
 
 #[contracterror]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -84,7 +88,7 @@ pub enum Error {
 
 /// Direction for oracle price condition (#125)
 #[contracttype]
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum OracleDirection {
     Gte = 0,
     Lte = 1,
@@ -107,7 +111,8 @@ pub enum PaymentStatus {
     Refunded = 2,
     Disputed = 3,
     Expired = 4,
-    ScheduledPending = 5,
+    Authorized = 5,
+    ScheduledPending = 6,
 }
 
 #[contracttype]
@@ -130,6 +135,24 @@ pub struct SplitTransfer {
 pub struct FeeTier {
     pub min_volume: i128,
     pub fee_bps: u32,
+}
+
+/// Invoice line item for payment (#128)
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct LineItem {
+    pub description: Symbol,
+    pub quantity: u32,
+    pub unit_price: i128,
+}
+
+/// Invoice data attached to payment (#128)
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct InvoiceData {
+    pub line_items: Vec<LineItem>,
+    pub tax_bps: u32,
+    pub currency_label: Symbol,
 }
 
 #[contracttype]
@@ -158,6 +181,8 @@ pub struct Payment {
     pub category: Option<Symbol>,
     /// Optional tags (max 3) immutable after creation (#122)
     pub tags: Option<Vec<Symbol>>,
+    /// Ledger timestamp after which an authorized payment can no longer be captured. 0 = not authorized.
+    pub capture_deadline: u64,
     /// Optional oracle price condition required for completion (#125)
     pub release_condition: Option<OracleCondition>,
 }
@@ -314,6 +339,14 @@ pub enum DataKey {
     MerchantCurrentTierBps(Address),
     /// Persistent: (merchant, category) → Vec<payment_id> for category analytics (#122)
     CategoryPayments(Address, Symbol),
+    /// Persistent: merchant withdrawal queue — Vec<(payment_id, amount)> (#126)
+    WithdrawalQueue(Address),
+    /// Persistent: invoice hash (SHA256) for payment (#128)
+    InvoiceHash(u32),
+    /// Persistent: merchant collateral balance (#129)
+    MerchantCollateral(Address),
+    /// Instance: minimum collateral required for merchant approval (#129)
+    MinCollateral,
     // --- Temporary ---
     Dispute(u32),
     /// Temporary: idempotency key → payment_id mapping (expires after 24h)
@@ -406,6 +439,52 @@ impl AhjoorPaymentsContract {
         )
     }
 
+    /// Create a payment with optional invoice data attached (#128).
+    pub fn create_payment_with_invoice(
+        env: Env,
+        customer: Address,
+        merchant: Address,
+        amount: i128,
+        token: Address,
+        reference: Option<String>,
+        metadata: Option<Map<String, String>>,
+        invoice: Option<InvoiceData>,
+        idempotency_key: Option<BytesN<32>>,
+    ) -> u32 {
+        // Validate invoice against payment amount
+        Self::validate_invoice_data(&env, &invoice, amount);
+
+        // Create the payment using the base function
+        let payment_id = Self::create_payment_with_options(
+            env.clone(),
+            customer,
+            merchant,
+            amount,
+            token,
+            reference,
+            metadata,
+            None,
+            None,
+            idempotency_key,
+        );
+
+        // If invoice provided, compute hash and store it
+        if let Some(inv) = invoice {
+            let invoice_hash = Self::compute_invoice_hash(&env, &inv);
+            env.storage()
+                .persistent()
+                .set(&DataKey::InvoiceHash(payment_id), &invoice_hash);
+            env.storage().persistent().extend_ttl(
+                &DataKey::InvoiceHash(payment_id),
+                PERSISTENT_LIFETIME_THRESHOLD,
+                PERSISTENT_BUMP_AMOUNT,
+            );
+            events::emit_invoice_attached(&env, payment_id, invoice_hash);
+        }
+
+        payment_id
+    }
+
     /// Extended payment creation with optional recipient splits and scheduling.
     #[allow(clippy::too_many_arguments)]
     pub fn create_payment_with_options(
@@ -482,6 +561,7 @@ impl AhjoorPaymentsContract {
             execute_after: execute_after_ts,
             category: None,
             tags: None,
+            capture_deadline: 0,
             release_condition: None,
         };
 
@@ -530,7 +610,7 @@ impl AhjoorPaymentsContract {
         payment_id
     }
 
-    /// Create multiple payments atomically. All payment records go to persistent storage.
+    /// Create multiple payments atomically.
     /// Returns a Vec of payment IDs.
     pub fn create_payments_batch(
         env: Env,
@@ -595,6 +675,7 @@ impl AhjoorPaymentsContract {
                 execute_after: 0,
                 category: None,
                 tags: None,
+                capture_deadline: 0,
                 release_condition: None,
             };
 
@@ -820,8 +901,8 @@ impl AhjoorPaymentsContract {
             panic!("Only the payment customer can dispute");
         }
 
-        if payment.status != PaymentStatus::Pending {
-            panic!("Only pending payments can be disputed");
+        if payment.status != PaymentStatus::Pending && payment.status != PaymentStatus::Authorized {
+            panic!("Only pending or authorized payments can be disputed");
         }
 
         let old_status = payment.status;
@@ -894,14 +975,67 @@ impl AhjoorPaymentsContract {
                 PERSISTENT_BUMP_AMOUNT,
             );
         } else {
-            client.transfer(
-                &env.current_contract_address(),
-                &payment.customer,
-                &payment.amount,
-            );
+            // Resolved in customer's favour: refund from escrow first.
+            // If the escrowed amount is insufficient (e.g. partial refunds already
+            // issued), cover the shortfall by slashing merchant collateral (#129).
+            let already_refunded = payment.refunded_amount;
+            let owed_to_customer = payment.amount - already_refunded;
+
+            if owed_to_customer > 0 {
+                // Try to cover from escrow (the remaining escrowed balance).
+                // The contract holds `owed_to_customer` for this payment in escrow.
+                client.transfer(
+                    &env.current_contract_address(),
+                    &payment.customer,
+                    &owed_to_customer,
+                );
+            }
+
+            // Check whether collateral needs to be slashed.
+            // Slashing applies when the merchant's pending balance is insufficient
+            // to cover the refund — i.e. the payment token differs from the
+            // collateral token (USDC) or the admin explicitly signals a shortfall.
+            // For simplicity we slash collateral equal to the full disputed amount
+            // only when the payment token is the collateral token (USDC), so the
+            // slash covers the exact economic loss.
+            let usdc_token: Option<Address> = env
+                .storage()
+                .instance()
+                .get(&DataKey::UsdcToken);
+            if let Some(ref usdc) = usdc_token {
+                if payment.token == *usdc && owed_to_customer > 0 {
+                    let collateral_key =
+                        DataKey::MerchantCollateral(payment.merchant.clone());
+                    let collateral: i128 = env
+                        .storage()
+                        .persistent()
+                        .get(&collateral_key)
+                        .unwrap_or(0);
+
+                    if collateral > 0 {
+                        // Slash up to the full owed amount, capped by available collateral.
+                        let slash_amount = owed_to_customer.min(collateral);
+                        let new_collateral = collateral - slash_amount;
+                        env.storage()
+                            .persistent()
+                            .set(&collateral_key, &new_collateral);
+                        env.storage().persistent().extend_ttl(
+                            &collateral_key,
+                            PERSISTENT_LIFETIME_THRESHOLD,
+                            PERSISTENT_BUMP_AMOUNT,
+                        );
+                        events::emit_collateral_slashed(
+                            &env,
+                            payment.merchant.clone(),
+                            slash_amount,
+                            payment_id,
+                        );
+                    }
+                }
+            }
+
             payment.status = PaymentStatus::Refunded;
         }
-
         env.storage()
             .persistent()
             .set(&DataKey::Payment(payment_id), &payment);
@@ -1077,6 +1211,7 @@ impl AhjoorPaymentsContract {
                 execute_after: 0,
                 category: None,
                 tags: None,
+                capture_deadline: 0,
                 release_condition: None,
             };
 
@@ -1193,6 +1328,7 @@ impl AhjoorPaymentsContract {
             execute_after: 0,
             category: None,
             tags: None,
+            capture_deadline: 0,
             release_condition: None,
         };
 
@@ -1602,6 +1738,13 @@ impl AhjoorPaymentsContract {
             .unwrap_or(false)
     }
 
+    /// Returns the invoice hash for a payment if one was attached (#128).
+    pub fn get_invoice_hash(env: Env, payment_id: u32) -> Option<BytesN<32>> {
+        env.storage()
+            .persistent()
+            .get::<DataKey, BytesN<32>>(&DataKey::InvoiceHash(payment_id))
+    }
+
     /// Look up all payment IDs for a merchant+reference pair (#67).
     pub fn get_payments_by_reference(env: Env, merchant: Address, reference: String) -> Vec<u32> {
         let hash = Self::reference_hash(&env, &reference);
@@ -1695,7 +1838,7 @@ impl AhjoorPaymentsContract {
             .unwrap_or(DEFAULT_PAYMENT_TIMEOUT)
     }
 
-    /// Expire a pending payment after its deadline. Callable by anyone.
+    /// Expire a pending or authorized payment after its deadline. Callable by anyone.
     /// Returns funds to the customer and emits PaymentExpired event.
     pub fn expire_payment(env: Env, payment_id: u32) {
         Self::require_not_paused(&env);
@@ -1705,13 +1848,23 @@ impl AhjoorPaymentsContract {
             .get(&DataKey::Payment(payment_id))
             .expect("Payment not found");
 
-        if payment.status != PaymentStatus::Pending {
-            panic!("Only pending payments can expire");
+        if payment.status != PaymentStatus::Pending && payment.status != PaymentStatus::Authorized {
+            panic!("Only pending or authorized payments can expire");
         }
-        if payment.expires_at == 0 {
-            panic!("Payment has no expiry set");
-        }
-        if env.ledger().timestamp() < payment.expires_at {
+
+        let now = env.ledger().timestamp();
+        let expired = match payment.status {
+            PaymentStatus::Pending => {
+                if payment.expires_at == 0 {
+                    panic!("Payment has no expiry set");
+                }
+                now >= payment.expires_at
+            }
+            PaymentStatus::Authorized => now >= payment.capture_deadline,
+            _ => false,
+        };
+
+        if !expired {
             panic!("Payment has not expired yet");
         }
 
@@ -1824,6 +1977,7 @@ impl AhjoorPaymentsContract {
     // --- Merchant Allowlist (#58) ---
 
     /// Admin approves a merchant address.
+    /// Requires the merchant to have deposited at least the minimum collateral (#129).
     pub fn approve_merchant(env: Env, merchant: Address) {
         Self::require_not_paused(&env);
         let admin: Address = env
@@ -1832,6 +1986,18 @@ impl AhjoorPaymentsContract {
             .get(&DataKey::Admin)
             .expect("Not initialized");
         admin.require_auth();
+
+        // Enforce minimum collateral before approval (#129)
+        let min_collateral = Self::get_min_collateral_internal(&env);
+        let collateral: i128 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::MerchantCollateral(merchant.clone()))
+            .unwrap_or(0);
+        if collateral < min_collateral {
+            panic!("Merchant collateral below minimum required");
+        }
+
         env.storage()
             .persistent()
             .set(&DataKey::MerchantApproved(merchant), &true);
@@ -1878,6 +2044,127 @@ impl AhjoorPaymentsContract {
             .instance()
             .get(&DataKey::MerchantOpenMode)
             .unwrap_or(true)
+    }
+
+    // --- Merchant Collateral (#129) ---
+
+    /// Admin sets the minimum collateral required for merchant approval.
+    pub fn set_min_collateral(env: Env, min_collateral: i128) {
+        Self::require_not_paused(&env);
+        let admin: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .expect("Not initialized");
+        admin.require_auth();
+
+        if min_collateral < 0 {
+            panic!("min_collateral cannot be negative");
+        }
+
+        env.storage()
+            .instance()
+            .set(&DataKey::MinCollateral, &min_collateral);
+        env.storage()
+            .instance()
+            .extend_ttl(INSTANCE_LIFETIME_THRESHOLD, INSTANCE_BUMP_AMOUNT);
+    }
+
+    /// Returns the current minimum collateral threshold.
+    pub fn get_min_collateral(env: Env) -> i128 {
+        Self::get_min_collateral_internal(&env)
+    }
+
+    /// Merchant deposits collateral into the contract.
+    /// The collateral token is the configured USDC token.
+    /// Emits CollateralDeposited event.
+    pub fn deposit_collateral(env: Env, merchant: Address, amount: i128) {
+        Self::require_not_paused(&env);
+        merchant.require_auth();
+
+        if amount <= 0 {
+            panic!("Deposit amount must be positive");
+        }
+
+        let usdc_token: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::UsdcToken)
+            .expect("Collateral token not configured; call set_oracle first");
+
+        let token_client = token::Client::new(&env, &usdc_token);
+        token_client.transfer(&merchant, &env.current_contract_address(), &amount);
+
+        let key = DataKey::MerchantCollateral(merchant.clone());
+        let prev: i128 = env.storage().persistent().get(&key).unwrap_or(0);
+        let new_balance = prev.checked_add(amount).expect("Collateral overflow");
+        env.storage().persistent().set(&key, &new_balance);
+        env.storage().persistent().extend_ttl(
+            &key,
+            PERSISTENT_LIFETIME_THRESHOLD,
+            PERSISTENT_BUMP_AMOUNT,
+        );
+
+        events::emit_collateral_deposited(&env, merchant, amount);
+
+        env.storage()
+            .instance()
+            .extend_ttl(INSTANCE_LIFETIME_THRESHOLD, INSTANCE_BUMP_AMOUNT);
+    }
+
+    /// Merchant withdraws collateral from the contract.
+    /// Withdrawal is blocked if it would drop the balance below the minimum.
+    /// Emits CollateralWithdrawn event.
+    pub fn withdraw_collateral(env: Env, merchant: Address, amount: i128) {
+        Self::require_not_paused(&env);
+        merchant.require_auth();
+
+        if amount <= 0 {
+            panic!("Withdrawal amount must be positive");
+        }
+
+        let key = DataKey::MerchantCollateral(merchant.clone());
+        let current: i128 = env.storage().persistent().get(&key).unwrap_or(0);
+
+        if amount > current {
+            panic!("Insufficient collateral balance");
+        }
+
+        let min_collateral = Self::get_min_collateral_internal(&env);
+        let remaining = current - amount;
+        if remaining < min_collateral {
+            panic!("Withdrawal would drop collateral below minimum required");
+        }
+
+        let usdc_token: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::UsdcToken)
+            .expect("Collateral token not configured");
+
+        let token_client = token::Client::new(&env, &usdc_token);
+        token_client.transfer(&env.current_contract_address(), &merchant, &amount);
+
+        env.storage().persistent().set(&key, &remaining);
+        env.storage().persistent().extend_ttl(
+            &key,
+            PERSISTENT_LIFETIME_THRESHOLD,
+            PERSISTENT_BUMP_AMOUNT,
+        );
+
+        events::emit_collateral_withdrawn(&env, merchant, amount);
+
+        env.storage()
+            .instance()
+            .extend_ttl(INSTANCE_LIFETIME_THRESHOLD, INSTANCE_BUMP_AMOUNT);
+    }
+
+    /// Returns the current collateral balance for a merchant.
+    pub fn get_collateral_balance(env: Env, merchant: Address) -> i128 {
+        env.storage()
+            .persistent()
+            .get(&DataKey::MerchantCollateral(merchant))
+            .unwrap_or(0)
     }
 
     // --- Subscriptions (#60) ---
@@ -2183,6 +2470,7 @@ impl AhjoorPaymentsContract {
             execute_after: 0,
             category: category.clone(),
             tags: tags.clone(),
+            capture_deadline: 0,
             release_condition,
         };
 
@@ -2262,10 +2550,8 @@ impl AhjoorPaymentsContract {
         result
     }
 
-    // --- Bulk Expire Payments (#123) ---
-
     /// Expire a batch of payments atomically. Admin only.
-    /// Each payment must be Pending or Disputed and past its expiry timestamp.
+    /// Each payment must be Pending, Disputed, or Authorized and past its expiry/capture deadline.
     /// If any payment is ineligible the entire batch reverts.
     /// Batch size capped at MAX_SETTLEMENT_BATCH_SIZE (50).
     pub fn bulk_expire_payments(env: Env, admin: Address, payment_ids: Vec<u32>) {
@@ -2300,10 +2586,16 @@ impl AhjoorPaymentsContract {
 
             if payment.status != PaymentStatus::Pending
                 && payment.status != PaymentStatus::Disputed
+                && payment.status != PaymentStatus::Authorized
             {
-                panic!("Payment is not in Pending or Disputed status");
+                panic!("Payment is not in Pending, Disputed, or Authorized status");
             }
-            if payment.expires_at == 0 || now < payment.expires_at {
+            let deadline = if payment.status == PaymentStatus::Authorized {
+                payment.capture_deadline
+            } else {
+                payment.expires_at
+            };
+            if deadline == 0 || now < deadline {
                 panic!("Payment has not expired yet");
             }
         }
@@ -2403,6 +2695,120 @@ impl AhjoorPaymentsContract {
             .unwrap_or(String::from_str(&env, ""))
     }
 
+    // --- Merchant Withdrawal Queue (#126) ---
+
+    /// Process up to max_count entries from the merchant's withdrawal queue.
+    /// Transfers funds from contract to merchant in FIFO order.
+    /// Merchant must authorize the call.
+    /// Returns the number of payments processed.
+    pub fn process_withdrawal_queue(env: Env, merchant: Address, max_count: u32) -> u32 {
+        Self::require_not_paused(&env);
+        merchant.require_auth();
+
+        let queue = Self::get_withdrawal_queue(&env, &merchant);
+        if queue.is_empty() {
+            return 0;
+        }
+
+        let max_count = if max_count == 0 {
+            DEFAULT_MAX_BATCH_SIZE
+        } else {
+            max_count
+        };
+        let process_count = max_count.min(queue.len() as u32) as usize;
+
+        let mut processed_count = 0u32;
+        let mut remaining_queue = Vec::new(&env);
+
+        // Process the first process_count entries
+        for i in 0..process_count {
+            let (payment_id, amount) = queue.get(i as u32).unwrap();
+            processed_count += 1;
+
+            let payment: Payment = env
+                .storage()
+                .persistent()
+                .get(&DataKey::Payment(payment_id))
+                .expect("Payment not found in queue");
+            if payment.status != PaymentStatus::Completed {
+                panic!("Payment in queue is not completed");
+            }
+
+            let token_client = token::Client::new(&env, &payment.token);
+            token_client.transfer(&env.current_contract_address(), &merchant, &amount);
+        }
+
+        // Remove processed entries from queue
+        for i in process_count..(queue.len() as usize) {
+            remaining_queue.push_back(queue.get(i as u32).unwrap());
+        }
+
+        Self::set_withdrawal_queue(&env, &merchant, remaining_queue);
+        events::emit_withdrawal_processed(&env, merchant, processed_count);
+
+        env.storage()
+            .instance()
+            .extend_ttl(INSTANCE_LIFETIME_THRESHOLD, INSTANCE_BUMP_AMOUNT);
+
+        processed_count
+    }
+
+    /// Move a specific payment to the front of the merchant's withdrawal queue.
+    /// Merchant must authorize the call.
+    pub fn prioritize_withdrawal(env: Env, merchant: Address, payment_id: u32) {
+        Self::require_not_paused(&env);
+        merchant.require_auth();
+
+        let queue = Self::get_withdrawal_queue(&env, &merchant);
+        if queue.is_empty() {
+            panic!("Withdrawal queue is empty");
+        }
+
+        // Find the payment in the queue
+        let mut found_index = None;
+        let mut found_amount = 0i128;
+        for i in 0..queue.len() {
+            let (pid, amount) = queue.get(i).unwrap();
+            if pid == payment_id {
+                found_index = Some(i);
+                found_amount = amount;
+                break;
+            }
+        }
+
+        if found_index.is_none() {
+            panic!("Payment not found in withdrawal queue");
+        }
+
+        let index = found_index.unwrap();
+
+        // If already at front, do nothing
+        if index == 0 {
+            return;
+        }
+
+        // Remove from current position and insert at front
+        let mut new_queue = Vec::new(&env);
+        new_queue.push_back((payment_id, found_amount));
+
+        for i in 0..queue.len() {
+            if i != index {
+                new_queue.push_back(queue.get(i).unwrap());
+            }
+        }
+
+        Self::set_withdrawal_queue(&env, &merchant, new_queue);
+
+        env.storage()
+            .instance()
+            .extend_ttl(INSTANCE_LIFETIME_THRESHOLD, INSTANCE_BUMP_AMOUNT);
+    }
+
+    /// Get the merchant's current withdrawal queue.
+    pub fn get_merchant_withdrawal_queue(env: Env, merchant: Address) -> Vec<(u32, i128)> {
+        Self::get_withdrawal_queue(&env, &merchant)
+    }
+
     // --- Internal Helpers ---
 
     fn require_not_paused(env: &Env) {
@@ -2450,6 +2856,92 @@ impl AhjoorPaymentsContract {
             panic!("Payment has expired");
         }
 
+        Self::finalize_payment(env, payment_id, &mut payment);
+    }
+
+    /// Merchant authorizes a pending payment, converting it to Authorized status.
+    /// Funds remain in escrow. The payment must be captured before capture_deadline.
+    pub fn authorize_payment(
+        env: Env,
+        merchant: Address,
+        payment_id: u32,
+        capture_window_seconds: u64,
+    ) {
+        Self::require_not_paused(&env);
+        merchant.require_auth();
+
+        let mut payment: Payment = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Payment(payment_id))
+            .expect("Payment not found");
+
+        if payment.merchant != merchant {
+            panic!("Only the payment merchant can authorize");
+        }
+        if payment.status != PaymentStatus::Pending {
+            panic!("Only pending payments can be authorized");
+        }
+        if capture_window_seconds == 0 {
+            panic!("capture_window_seconds must be positive");
+        }
+
+        let now = env.ledger().timestamp();
+        let old_status = payment.status;
+        payment.status = PaymentStatus::Authorized;
+        payment.capture_deadline = now + capture_window_seconds;
+
+        env.storage()
+            .persistent()
+            .set(&DataKey::Payment(payment_id), &payment);
+        env.storage().persistent().extend_ttl(
+            &DataKey::Payment(payment_id),
+            PERSISTENT_LIFETIME_THRESHOLD,
+            PERSISTENT_BUMP_AMOUNT,
+        );
+
+        events::emit_payment_authorized(&env, payment_id, payment.capture_deadline);
+        events::emit_payment_status_changed(
+            &env,
+            payment_id,
+            old_status,
+            PaymentStatus::Authorized,
+        );
+
+        env.storage()
+            .instance()
+            .extend_ttl(INSTANCE_LIFETIME_THRESHOLD, INSTANCE_BUMP_AMOUNT);
+    }
+
+    /// Merchant captures an authorized payment, completing it and releasing funds.
+    /// Must be called before capture_deadline.
+    pub fn capture_payment(env: Env, merchant: Address, payment_id: u32) {
+        Self::require_not_paused(&env);
+        merchant.require_auth();
+
+        let mut payment: Payment = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Payment(payment_id))
+            .expect("Payment not found");
+
+        if payment.merchant != merchant {
+            panic!("Only the payment merchant can capture");
+        }
+        if payment.status != PaymentStatus::Authorized {
+            panic!("Payment is not authorized");
+        }
+        if env.ledger().timestamp() >= payment.capture_deadline {
+            panic!("Capture window has expired");
+        }
+
+        Self::finalize_payment(&env, payment_id, &mut payment);
+        events::emit_payment_captured(&env, payment_id);
+    }
+
+    /// Shared settlement logic: checks conditions, deducts fees, distributes funds,
+    /// updates stats, emits events, and stores receipt. `payment` is mutated in-place.
+    fn finalize_payment(env: &Env, payment_id: u32, payment: &mut Payment) {
         // Oracle price condition check (#125)
         if let Some(ref condition) = payment.release_condition.clone() {
             let oracle_addr: Address = env
@@ -2522,19 +3014,20 @@ impl AhjoorPaymentsContract {
             );
         }
 
-        let split_transfers = Self::distribute_net_payment(env, &payment, net_amount);
+        let split_transfers = Self::distribute_net_payment(env, payment, net_amount);
         if split_transfers.len() > 0 {
             events::emit_payment_split_completed(env, payment_id, split_transfers);
         }
 
         let old_status = payment.status;
         payment.status = PaymentStatus::Completed;
+        let original_amount = payment.amount;
         payment.amount = net_amount;
         let completed_at = env.ledger().timestamp();
 
         env.storage()
             .persistent()
-            .set(&DataKey::Payment(payment_id), &payment);
+            .set(&DataKey::Payment(payment_id), payment);
         env.storage().persistent().extend_ttl(
             &DataKey::Payment(payment_id),
             PERSISTENT_LIFETIME_THRESHOLD,
@@ -2570,7 +3063,10 @@ impl AhjoorPaymentsContract {
         Self::inc_global_completed(env, &payment.token, net_amount);
         Self::inc_merchant_completed(env, &payment.merchant, &payment.token, net_amount);
         Self::inc_volume_bucket(env, &payment.token, net_amount);
-        Self::inc_merchant_volume_bucket(env, &payment.merchant, payment.amount + fee_amount);
+        Self::inc_merchant_volume_bucket(env, &payment.merchant, original_amount);
+
+        // Auto-enqueue completed payment into merchant's withdrawal queue (#126)
+        Self::enqueue_withdrawal(env, &payment.merchant, payment_id, net_amount);
 
         let rolling_after = Self::rolling_merchant_volume(env, &payment.merchant);
         let new_tier_bps = Self::fee_bps_for_volume(env, rolling_after);
@@ -2700,6 +3196,66 @@ impl AhjoorPaymentsContract {
             }
             last_min_volume = tier.min_volume;
         }
+    }
+
+    /// Validate invoice data and verify total matches payment amount (#128).
+    fn validate_invoice_data(env: &Env, invoice: &Option<InvoiceData>, payment_amount: i128) {
+        if let Some(inv) = invoice {
+            if inv.line_items.len() == 0 {
+                panic!("Invoice line_items cannot be empty");
+            }
+            if (inv.line_items.len() as u32) > MAX_INVOICE_LINE_ITEMS {
+                panic!("Invoice line items exceed maximum of 20");
+            }
+
+            let mut invoice_subtotal: i128 = 0;
+            for item in inv.line_items.iter() {
+                if item.quantity == 0 {
+                    panic!("Line item quantity must be positive");
+                }
+                if item.unit_price < 0 {
+                    panic!("Line item unit_price cannot be negative");
+                }
+                let line_amount = (item.quantity as i128)
+                    .checked_mul(item.unit_price)
+                    .expect("Line item amount overflow");
+                invoice_subtotal = invoice_subtotal
+                    .checked_add(line_amount)
+                    .expect("Invoice subtotal overflow");
+            }
+
+            let tax_amount = (invoice_subtotal * inv.tax_bps as i128) / 10_000;
+            let invoice_total = invoice_subtotal
+                .checked_add(tax_amount)
+                .expect("Invoice total overflow");
+
+            if invoice_total != payment_amount {
+                panic!("Invoice total does not match payment amount");
+            }
+
+            let _ = env; // suppress unused warning
+        }
+    }
+
+    /// Compute SHA256 hash of serialized invoice data (#128).
+    fn compute_invoice_hash(env: &Env, invoice: &InvoiceData) -> BytesN<32> {
+        let mut preimage = Bytes::new(env);
+
+        // Serialize line items count
+        preimage.extend_from_array(&(invoice.line_items.len() as u32).to_be_bytes());
+
+        // Serialize each line item
+        for item in invoice.line_items.iter() {
+            // For Symbol, we'll use its XDR representation
+            preimage.append(&item.description.to_xdr(env));
+            preimage.extend_from_array(&item.quantity.to_be_bytes());
+            preimage.extend_from_array(&item.unit_price.to_be_bytes());
+        }
+
+        preimage.extend_from_array(&invoice.tax_bps.to_be_bytes());
+        preimage.append(&invoice.currency_label.clone().to_xdr(env));
+
+        env.crypto().sha256(&preimage).into()
     }
 
     fn fee_bps_for_volume(env: &Env, volume: i128) -> u32 {
@@ -3052,9 +3608,60 @@ impl AhjoorPaymentsContract {
                 window_size_ledgers: DEFAULT_RATE_LIMIT_WINDOW_SIZE_LEDGERS,
             })
     }
+
+    /// Returns the configured minimum collateral, falling back to the default (#129).
+    fn get_min_collateral_internal(env: &Env) -> i128 {
+        env.storage()
+            .instance()
+            .get(&DataKey::MinCollateral)
+            .unwrap_or(DEFAULT_MIN_COLLATERAL)
+    }
+
+    // --- Withdrawal Queue Helpers (#126) ---
+
+    /// Enqueue a completed payment into the merchant's withdrawal queue.
+    fn enqueue_withdrawal(env: &Env, merchant: &Address, payment_id: u32, amount: i128) {
+        let key = DataKey::WithdrawalQueue(merchant.clone());
+        let mut queue: Vec<(u32, i128)> = env
+            .storage()
+            .persistent()
+            .get(&key)
+            .unwrap_or(Vec::new(env));
+        queue.push_back((payment_id, amount));
+        env.storage().persistent().set(&key, &queue);
+        env.storage().persistent().extend_ttl(
+            &key,
+            PERSISTENT_LIFETIME_THRESHOLD,
+            PERSISTENT_BUMP_AMOUNT,
+        );
+        events::emit_withdrawal_queued(env, merchant.clone(), payment_id, amount);
+    }
+
+    /// Get the merchant's withdrawal queue.
+    fn get_withdrawal_queue(env: &Env, merchant: &Address) -> Vec<(u32, i128)> {
+        let key = DataKey::WithdrawalQueue(merchant.clone());
+        env.storage()
+            .persistent()
+            .get(&key)
+            .unwrap_or(Vec::new(env))
+    }
+
+    /// Set the merchant's withdrawal queue.
+    fn set_withdrawal_queue(env: &Env, merchant: &Address, queue: Vec<(u32, i128)>) {
+        let key = DataKey::WithdrawalQueue(merchant.clone());
+        env.storage().persistent().set(&key, &queue);
+        env.storage().persistent().extend_ttl(
+            &key,
+            PERSISTENT_LIFETIME_THRESHOLD,
+            PERSISTENT_BUMP_AMOUNT,
+        );
+    }
 }
 
 #[cfg(test)]
 mod test;
+
+#[cfg(test)]
+mod test_collateral;
 
 pub use events::*;
