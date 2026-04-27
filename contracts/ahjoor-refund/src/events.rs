@@ -439,3 +439,70 @@ pub fn emit_refund_request_cancelled(e: &Env, refund_id: u32, cancelled_by: Addr
     }
     .publish(e);
 }
+
+// --- Fraud Score Events ---
+
+/// Event: Fraud score updated for a buyer
+#[contractevent]
+#[derive(Clone, Debug)]
+pub struct FraudScoreUpdated {
+    pub buyer: Address,
+    pub new_score: u32,
+    pub reason: Symbol,
+}
+
+/// Event: Buyer blocked for exceeding fraud score threshold
+#[contractevent]
+#[derive(Clone, Debug)]
+pub struct BuyerBlockedForFraud {
+    pub buyer: Address,
+    pub score: u32,
+    pub threshold: u32,
+}
+
+/// Event: Buyer's fraud score manually reset by admin
+#[contractevent]
+#[derive(Clone, Debug)]
+pub struct FraudScoreReset {
+    pub buyer: Address,
+    pub reset_by: Address,
+}
+
+/// Event: Fraud score decay applied
+#[contractevent]
+#[derive(Clone, Debug)]
+pub struct FraudScoreDecayApplied {
+    pub buyer: Address,
+    pub old_score: u32,
+    pub new_score: u32,
+}
+
+/// Event: Fraud score block threshold updated
+#[contractevent]
+#[derive(Clone, Debug)]
+pub struct FraudScoreBlockThresholdUpdated {
+    pub old_threshold: u32,
+    pub new_threshold: u32,
+}
+
+// --- Helper Emission Functions ---
+
+pub fn emit_fraud_score_updated(e: &Env, buyer: Address, new_score: u32, reason: Symbol) {
+    FraudScoreUpdated { buyer, new_score, reason }.publish(e);
+}
+
+pub fn emit_buyer_blocked_for_fraud(e: &Env, buyer: Address, score: u32, threshold: u32) {
+    BuyerBlockedForFraud { buyer, score, threshold }.publish(e);
+}
+
+pub fn emit_fraud_score_reset(e: &Env, buyer: Address, reset_by: Address) {
+    FraudScoreReset { buyer, reset_by }.publish(e);
+}
+
+pub fn emit_fraud_score_decay_applied(e: &Env, buyer: Address, old_score: u32, new_score: u32) {
+    FraudScoreDecayApplied { buyer, old_score, new_score }.publish(e);
+}
+
+pub fn emit_fraud_score_block_threshold_updated(e: &Env, old_threshold: u32, new_threshold: u32) {
+    FraudScoreBlockThresholdUpdated { old_threshold, new_threshold }.publish(e);
+}

@@ -159,6 +159,14 @@ pub enum DataKey {
     CustomerCancelWindow,
     /// Token whitelist contract address
     TokenWhitelistContract,
+    /// Fraud score per buyer address
+    FraudScore(Address),
+    /// Admin-configurable threshold for blocking refund requests
+    FraudScoreBlockThreshold,
+    /// Last fraud score update timestamp for decay calculation
+    FraudScoreLastUpdate(Address),
+    /// Fraud score decay interval in seconds (default: 30 days)
+    FraudScoreDecayInterval,
 }
 
 mod events;
@@ -351,6 +359,13 @@ impl AhjoorRefundContract {
                 events::emit_refund_cooldown_active(&env, customer.clone(), next_eligible_at);
                 panic!("RefundCooldownActive");
             }
+        }
+
+        // Fraud score check: block buyers at or above threshold
+        if Self::is_buyer_blocked(&env, &customer) {
+            let score = Self::get_fraud_score(env.clone(), customer.clone());
+            let threshold = Self::get_fraud_score_block_threshold(env.clone());
+            panic!("BuyerBlockedForFraud: score={}, threshold={}", score, threshold);
         }
 
         // --- Cross-contract validation (#64) ---
@@ -580,6 +595,9 @@ impl AhjoorRefundContract {
         // #164: Remove from pending queue
         Self::remove_from_pending_queue(&env, refund_id);
 
+        // Update fraud score: decrement on approved refund
+        Self::decrement_fraud_score(&env, &refund.customer);
+
         Self::update_stats_on_approve(&env, &refund.merchant);
 
         if is_delegate {
@@ -636,6 +654,13 @@ impl AhjoorRefundContract {
 
         // #164: Remove from pending queue
         Self::remove_from_pending_queue(&env, refund_id);
+
+        // Update fraud score: increment on rejected refund (+2 for admin, +1 for delegate)
+        if is_admin {
+            Self::increment_fraud_score(&env, &refund.customer, Symbol::new(&env, "admin_rejected"));
+        } else {
+            Self::increment_fraud_score(&env, &refund.customer, Symbol::new(&env, "rejected"));
+        }
 
         Self::update_stats_on_reject(&env, &refund.merchant);
 
@@ -1166,6 +1191,18 @@ impl AhjoorRefundContract {
         // Remove from pending queue
         Self::remove_from_pending_queue(&env, refund_id);
 
+        // Update fraud score: increment if cancelled after dispute window (+1)
+        // This penalizes buyers who cancel after the merchant has had time to review
+        let dispute_window: u64 = env
+            .storage()
+            .instance()
+            .get(&DataKey::DisputeWindow)
+            .unwrap_or(0);
+        let now = env.ledger().timestamp();
+        if now > refund.requested_at + dispute_window {
+            Self::increment_fraud_score(&env, &refund.customer, Symbol::new(&env, "cancelled_late"));
+        }
+
         events::emit_refund_request_cancelled(&env, refund_id, customer);
 
         env.storage()
@@ -1236,6 +1273,168 @@ impl AhjoorRefundContract {
             .instance()
             .get(&DataKey::CustomerCancelWindow)
             .expect("Customer cancel window not configured")
+    }
+
+    // -------------------------------------------------------------------------
+    // Fraud Score Tracking Functions
+    // -------------------------------------------------------------------------
+
+    /// Set the fraud score block threshold. Admin only.
+    /// Buyers at or above this threshold cannot submit new refund requests.
+    pub fn set_fraud_score_block_threshold(env: Env, admin: Address, threshold: u32) {
+        Self::require_admin(&env, &admin);
+
+        if threshold == 0 {
+            panic!("Threshold must be positive");
+        }
+
+        let old_threshold: u32 = env
+            .storage()
+            .instance()
+            .get(&DataKey::FraudScoreBlockThreshold)
+            .unwrap_or(10);
+
+        env.storage()
+            .instance()
+            .set(&DataKey::FraudScoreBlockThreshold, &threshold);
+
+        events::emit_fraud_score_block_threshold_updated(&env, old_threshold, threshold);
+
+        env.storage()
+            .instance()
+            .extend_ttl(INSTANCE_LIFETIME_THRESHOLD, INSTANCE_BUMP_AMOUNT);
+    }
+
+    /// Get the current fraud score block threshold.
+    pub fn get_fraud_score_block_threshold(env: Env) -> u32 {
+        env.storage()
+            .instance()
+            .get(&DataKey::FraudScoreBlockThreshold)
+            .unwrap_or(10)
+    }
+
+    /// Get the fraud score for a buyer.
+    pub fn get_fraud_score(env: Env, buyer: Address) -> u32 {
+        env.storage()
+            .instance()
+            .get(&DataKey::FraudScore(buyer))
+            .unwrap_or(0)
+    }
+
+    /// Manually reset a buyer's fraud score. Admin only.
+    pub fn reset_fraud_score(env: Env, admin: Address, buyer: Address) {
+        Self::require_admin(&env, &admin);
+
+        let current_score = Self::get_fraud_score(env.clone(), buyer);
+        if current_score == 0 {
+            return; // Nothing to reset
+        }
+
+        env.storage()
+            .instance()
+            .set(&DataKey::FraudScore(buyer.clone()), &0u32);
+        env.storage()
+            .instance()
+            .set(&DataKey::FraudScoreLastUpdate(buyer.clone()), &env.ledger().timestamp());
+
+        events::emit_fraud_score_reset(&env, buyer, admin);
+
+        env.storage()
+            .instance()
+            .extend_ttl(INSTANCE_LIFETIME_THRESHOLD, INSTANCE_BUMP_AMOUNT);
+    }
+
+    /// Apply time-based decay to a buyer's fraud score.
+    /// Called internally when the decay interval has elapsed.
+    fn apply_fraud_score_decay(env: &Env, buyer: &Address) {
+        let decay_interval: u64 = env
+            .storage()
+            .instance()
+            .get(&DataKey::FraudScoreDecayInterval)
+            .unwrap_or(30 * 24 * 60 * 60); // default 30 days
+
+        let last_update: u64 = env
+            .storage()
+            .instance()
+            .get(&DataKey::FraudScoreLastUpdate(buyer.clone()))
+            .unwrap_or(0);
+
+        if last_update == 0 {
+            return; // No score to decay
+        }
+
+        let now = env.ledger().timestamp();
+        if now - last_update < decay_interval {
+            return; // Not enough time has passed
+        }
+
+        let current_score = Self::get_fraud_score(env.clone(), buyer.clone());
+        if current_score == 0 {
+            return;
+        }
+
+        // Decay by 1 point
+        let new_score = current_score.saturating_sub(1);
+        env.storage()
+            .instance()
+            .set(&DataKey::FraudScore(buyer.clone()), &new_score);
+        env.storage()
+            .instance()
+            .set(&DataKey::FraudScoreLastUpdate(buyer.clone()), &now);
+
+        events::emit_fraud_score_decay_applied(&env, buyer.clone(), current_score, new_score);
+    }
+
+    /// Increment fraud score for a buyer. Called on specific events.
+    fn increment_fraud_score(env: &Env, buyer: &Address, reason: Symbol) {
+        // Apply decay first
+        Self::apply_fraud_score_decay(env, buyer);
+
+        let current_score = Self::get_fraud_score(env.clone(), buyer.clone());
+        let new_score = current_score.saturating_add(1);
+        
+        env.storage()
+            .instance()
+            .set(&DataKey::FraudScore(buyer.clone()), &new_score);
+        env.storage()
+            .instance()
+            .set(&DataKey::FraudScoreLastUpdate(buyer.clone()), &env.ledger().timestamp());
+
+        events::emit_fraud_score_updated(&env, buyer.clone(), new_score, reason.clone());
+
+        // Check if buyer should be blocked
+        let threshold = Self::get_fraud_score_block_threshold(env.clone());
+        if new_score >= threshold {
+            events::emit_buyer_blocked_for_fraud(&env, buyer.clone(), new_score, threshold);
+        }
+    }
+
+    /// Decrement fraud score for a buyer. Called on positive events.
+    fn decrement_fraud_score(env: &Env, buyer: &Address) {
+        // Apply decay first
+        Self::apply_fraud_score_decay(env, buyer);
+
+        let current_score = Self::get_fraud_score(env.clone(), buyer.clone());
+        if current_score == 0 {
+            return;
+        }
+
+        let new_score = current_score.saturating_sub(1);
+        env.storage()
+            .instance()
+            .set(&DataKey::FraudScore(buyer.clone()), &new_score);
+        env.storage()
+            .instance()
+            .set(&DataKey::FraudScoreLastUpdate(buyer.clone()), &env.ledger().timestamp());
+
+        events::emit_fraud_score_updated(&env, buyer.clone(), new_score, Symbol::new(env, "approved"));
+    }
+
+    /// Check if a buyer is blocked from requesting refunds.
+    fn is_buyer_blocked(env: &Env, buyer: &Address) -> bool {
+        let score = Self::get_fraud_score(env.clone(), buyer.clone());
+        let threshold = Self::get_fraud_score_block_threshold(env.clone());
+        score >= threshold
     }
 
     // -------------------------------------------------------------------------
@@ -1343,6 +1542,9 @@ impl AhjoorRefundContract {
 
         // #164: Remove from pending queue
         Self::remove_from_pending_queue(&env, refund_id);
+
+        // Update fraud score: increment on auto-rejected refund (+1)
+        Self::increment_fraud_score(&env, &refund.customer, Symbol::new(&env, "auto_rejected"));
 
         Self::update_stats_on_reject(&env, &refund.merchant);
 

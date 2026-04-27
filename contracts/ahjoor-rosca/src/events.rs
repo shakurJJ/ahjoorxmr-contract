@@ -1,5 +1,5 @@
 use crate::DistributionType;
-use soroban_sdk::{contractevent, Address, Env, Symbol, Vec};
+use soroban_sdk::{contractevent, Address, BytesN, Env, Symbol, Vec};
 
 /// Event: Rosca initialized
 #[contractevent]
@@ -841,4 +841,170 @@ pub fn emit_cycle_record_archived(e: &Env, cycle_number: u32) {
 
 pub fn emit_retention_window_updated(e: &Env, old_window: u32, new_window: u32) {
     RetentionWindowUpdated { old_window, new_window }.publish(e);
+}
+
+// --- Emergency Payout Events ---
+
+/// Event: Emergency payout requested
+#[contractevent]
+#[derive(Clone, Debug)]
+pub struct EmergencyPayoutRequested {
+    pub requester: Address,
+    pub round: u32,
+    pub reason_hash: BytesN<32>,
+    pub deadline: u64,
+}
+
+/// Event: Vote cast on emergency payout
+#[contractevent]
+#[derive(Clone, Debug)]
+pub struct EmergencyPayoutVoteCast {
+    pub requester: Address,
+    pub round: u32,
+    pub voter: Address,
+    pub approve: bool,
+    pub votes_for: i128,
+    pub votes_against: i128,
+}
+
+/// Event: Emergency payout approved by quorum
+#[contractevent]
+#[derive(Clone, Debug)]
+pub struct EmergencyPayoutApproved {
+    pub requester: Address,
+    pub round: u32,
+    pub payout_amount: i128,
+}
+
+/// Event: Emergency payout rejected (quorum not met or vote expired)
+#[contractevent]
+#[derive(Clone, Debug)]
+pub struct EmergencyPayoutRejected {
+    pub requester: Address,
+    pub round: u32,
+    pub reason: Symbol,
+}
+
+/// Event: Emergency payout executed
+#[contractevent]
+#[derive(Clone, Debug)]
+pub struct EmergencyPayoutExecuted {
+    pub requester: Address,
+    pub round: u32,
+    pub payout_amount: i128,
+}
+
+/// Event: Emergency payout config updated
+#[contractevent]
+#[derive(Clone, Debug)]
+pub struct EmergencyPayoutConfigUpdated {
+    pub emergency_quorum_bps: u32,
+    pub vote_window_seconds: u64,
+    pub max_emergency_per_cycle: u32,
+}
+
+// --- Group Dissolution Events ---
+
+/// Event: Dissolution vote started
+#[contractevent]
+#[derive(Clone, Debug)]
+pub struct DissolutionVoteStarted {
+    pub round: u32,
+    pub deadline: u64,
+}
+
+/// Event: Vote cast on dissolution
+#[contractevent]
+#[derive(Clone, Debug)]
+pub struct DissolutionVoteCast {
+    pub round: u32,
+    pub voter: Address,
+    pub approve: bool,
+    pub votes_for: i128,
+}
+
+/// Event: Dissolution quorum reached
+#[contractevent]
+#[derive(Clone, Debug)]
+pub struct DissolutionQuorumReached {
+    pub round: u32,
+    pub votes_for: i128,
+}
+
+/// Event: Group dissolved
+#[contractevent]
+#[derive(Clone, Debug)]
+pub struct GroupDissolved {
+    pub round: u32,
+    pub reason_hash: BytesN<32>,
+    pub total_pool: i128,
+    pub member_count: u32,
+}
+
+/// Event: Member refunded during dissolution
+#[contractevent]
+#[derive(Clone, Debug)]
+pub struct MemberRefunded {
+    pub member: Address,
+    pub amount: i128,
+    pub contribution: i128,
+    pub total_pool: i128,
+}
+
+/// Event: Dissolution config updated
+#[contractevent]
+#[derive(Clone, Debug)]
+pub struct DissolutionConfigUpdated {
+    pub dissolution_quorum_bps: u32,
+    pub vote_window_seconds: u64,
+}
+
+// --- Helper Emission Functions ---
+
+pub fn emit_emergency_payout_requested(e: &Env, requester: Address, round: u32, reason_hash: BytesN<32>, deadline: u64) {
+    EmergencyPayoutRequested { requester, round, reason_hash, deadline }.publish(e);
+}
+
+pub fn emit_emergency_payout_vote_cast(e: &Env, requester: Address, round: u32, voter: Address, approve: bool, votes_for: i128, votes_against: i128) {
+    EmergencyPayoutVoteCast { requester, round, voter, approve, votes_for, votes_against }.publish(e);
+}
+
+pub fn emit_emergency_payout_approved(e: &Env, requester: Address, round: u32, payout_amount: i128) {
+    EmergencyPayoutApproved { requester, round, payout_amount }.publish(e);
+}
+
+pub fn emit_emergency_payout_rejected(e: &Env, requester: Address, round: u32, reason: Symbol) {
+    EmergencyPayoutRejected { requester, round, reason }.publish(e);
+}
+
+pub fn emit_emergency_payout_executed(e: &Env, requester: Address, round: u32, payout_amount: i128) {
+    EmergencyPayoutExecuted { requester, round, payout_amount }.publish(e);
+}
+
+pub fn emit_emergency_payout_config_updated(e: &Env, emergency_quorum_bps: u32, vote_window_seconds: u64, max_emergency_per_cycle: u32) {
+    EmergencyPayoutConfigUpdated { emergency_quorum_bps, vote_window_seconds, max_emergency_per_cycle }.publish(e);
+}
+
+pub fn emit_dissolution_vote_started(e: &Env, round: u32, deadline: u64) {
+    DissolutionVoteStarted { round, deadline }.publish(e);
+}
+
+pub fn emit_dissolution_vote_cast(e: &Env, round: u32, voter: Address, approve: bool, votes_for: i128) {
+    DissolutionVoteCast { round, voter, approve, votes_for }.publish(e);
+}
+
+pub fn emit_dissolution_quorum_reached(e: &Env, round: u32, votes_for: i128) {
+    DissolutionQuorumReached { round, votes_for }.publish(e);
+}
+
+pub fn emit_group_dissolved(e: &Env, round: u32, reason_hash: BytesN<32>, total_pool: i128, member_count: u32) {
+    GroupDissolved { round, reason_hash, total_pool, member_count }.publish(e);
+}
+
+pub fn emit_member_refunded(e: &Env, member: Address, amount: i128, contribution: i128, total_pool: i128) {
+    MemberRefunded { member, amount, contribution, total_pool }.publish(e);
+}
+
+pub fn emit_dissolution_config_updated(e: &Env, dissolution_quorum_bps: u32, vote_window_seconds: u64) {
+    DissolutionConfigUpdated { dissolution_quorum_bps, vote_window_seconds }.publish(e);
 }

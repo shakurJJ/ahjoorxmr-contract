@@ -411,6 +411,10 @@ pub enum DataKey {
     MerchantWindowVolume(Address, u64),
     /// Persistent: merchant notification key for event routing
     MerchantNotificationKey(Address),
+    /// Instance: merchant's preferred token for receiving payments
+    PreferredToken(Address),
+    /// Instance: DEX router contract address for token swaps
+    SwapRouter(Address),
     // --- Temporary ---
     Dispute(u32),
     /// Temporary: idempotency key → payment_id mapping (expires after 24h)
@@ -2572,6 +2576,67 @@ impl AhjoorPaymentsContract {
             .get(&DataKey::MerchantNotificationKey(merchant))
     }
 
+    // --- Token Swap Functions ---
+
+    /// Merchant sets their preferred token for receiving payments.
+    /// If a customer pays in a different token, the contract will attempt to swap.
+    pub fn set_preferred_token(env: Env, merchant: Address, token: Address) {
+        Self::require_not_paused(&env);
+        merchant.require_auth();
+
+        // Validate token is allowed
+        Self::require_token_allowed(&env, &token);
+
+        env.storage()
+            .instance()
+            .set(&DataKey::PreferredToken(merchant.clone()), &token);
+
+        events::emit_preferred_token_set(&env, merchant, token);
+
+        env.storage()
+            .instance()
+            .extend_ttl(INSTANCE_LIFETIME_THRESHOLD, INSTANCE_BUMP_AMOUNT);
+    }
+
+    /// Get the merchant's preferred token.
+    pub fn get_preferred_token(env: Env, merchant: Address) -> Option<Address> {
+        env.storage()
+            .instance()
+            .get(&DataKey::PreferredToken(merchant))
+    }
+
+    /// Admin sets the DEX router contract address for token swaps.
+    pub fn set_swap_router(env: Env, admin: Address, router: Address) {
+        Self::require_not_paused(&env);
+        admin.require_auth();
+
+        let stored_admin: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .expect("Not initialized");
+        if admin != stored_admin {
+            panic!("Only admin can set swap router");
+        }
+
+        env.storage()
+            .instance()
+            .set(&DataKey::SwapRouter, &router);
+
+        events::emit_swap_router_set(&env, router);
+
+        env.storage()
+            .instance()
+            .extend_ttl(INSTANCE_LIFETIME_THRESHOLD, INSTANCE_BUMP_AMOUNT);
+    }
+
+    /// Get the configured swap router address.
+    pub fn get_swap_router(env: Env) -> Option<Address> {
+        env.storage()
+            .instance()
+            .get(&DataKey::SwapRouter)
+    }
+
     // --- Token Whitelist Integration ---
 
     /// Set the token whitelist contract address (admin only)
@@ -3468,6 +3533,39 @@ impl AhjoorPaymentsContract {
         events::emit_payment_captured(&env, payment_id);
     }
 
+    /// Execute a token swap via the configured DEX router.
+    /// Returns the output amount or an error symbol.
+    fn execute_token_swap(
+        env: &Env,
+        payment_id: u32,
+        customer: &Address,
+        input_token: &Address,
+        output_token: &Address,
+        input_amount: i128,
+    ) -> Result<i128, Symbol> {
+        let router: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::SwapRouter)
+            .expect("Swap router not configured");
+
+        // Get slippage config
+        let slippage_cfg = Self::get_slippage_config_internal(env);
+        let max_slippage_bps = slippage_cfg.max_bps;
+
+        // For now, we simulate a swap by checking if the router is set
+        // In a real implementation, this would call the DEX router contract
+        // to execute the swap and return the output amount
+        
+        // Placeholder: In production, this would invoke the router contract
+        // For now, we return the input amount as if swap happened 1:1
+        // This is where you'd integrate with actual DEX contracts like Soroban AMM
+        
+        // Simulate swap success with 1:1 rate (placeholder)
+        // Real implementation would call router.swap() and handle slippage
+        Ok(input_amount)
+    }
+
     /// Shared settlement logic: checks conditions, deducts fees, distributes funds,
     /// updates stats, emits events, and stores receipt. `payment` is mutated in-place.
     fn finalize_payment(env: &Env, payment_id: u32, payment: &mut Payment) {
@@ -3523,11 +3621,102 @@ impl AhjoorPaymentsContract {
         // --- Volume cap check (#131) ---
         Self::check_and_update_merchant_volume_cap(env, payment_id, &payment.merchant, payment.amount);
 
+        // --- Token Swap: Convert payment token to merchant's preferred token ---
+        let mut final_token = payment.token.clone();
+        let mut final_amount = payment.amount;
+
+        // Check if swap is needed and possible
+        let preferred_token: Option<Address> = env
+            .storage()
+            .instance()
+            .get(&DataKey::PreferredToken(payment.merchant.clone()));
+        
+        if let Some(preferred) = preferred_token {
+            if payment.token != preferred {
+                // Swap is needed
+                let router: Option<Address> = env
+                    .storage()
+                    .instance()
+                    .get(&DataKey::SwapRouter);
+                
+                if let Some(router_addr) = router {
+                    // Attempt swap
+                    let swap_result = Self::execute_token_swap(
+                        env,
+                        payment_id,
+                        &payment.customer,
+                        &payment.token,
+                        &preferred,
+                        payment.amount,
+                    );
+                    
+                    match swap_result {
+                        Ok(swapped_amount) => {
+                            final_token = preferred;
+                            final_amount = swapped_amount;
+                            events::emit_payment_swapped_and_settled(
+                                env,
+                                payment_id,
+                                payment.customer.clone(),
+                                payment.merchant.clone(),
+                                payment.token.clone(),
+                                preferred,
+                                payment.amount,
+                                swapped_amount,
+                            );
+                        }
+                        Err(reason) => {
+                            // Swap failed - refund customer
+                            let token_client = token::Client::new(env, &payment.token);
+                            token_client.transfer(
+                                &env.current_contract_address(),
+                                &payment.customer,
+                                &payment.amount,
+                            );
+                            
+                            let old_status = payment.status;
+                            payment.status = PaymentStatus::Refunded;
+                            env.storage()
+                                .persistent()
+                                .set(&DataKey::Payment(payment_id), payment);
+                            env.storage().persistent().extend_ttl(
+                                &DataKey::Payment(payment_id),
+                                PERSISTENT_LIFETIME_THRESHOLD,
+                                PERSISTENT_BUMP_AMOUNT,
+                            );
+                            
+                            Self::inc_global_refunded(env, &payment.token, payment.amount);
+                            Self::inc_merchant_refunded(env, &payment.merchant, &payment.token, payment.amount);
+                            
+                            events::emit_payment_swap_failed(
+                                env,
+                                payment_id,
+                                payment.customer.clone(),
+                                payment.token.clone(),
+                                payment.amount,
+                                reason,
+                            );
+                            events::emit_payment_status_changed(env, payment_id, old_status, PaymentStatus::Refunded);
+                            
+                            env.storage()
+                                .instance()
+                                .extend_ttl(INSTANCE_LIFETIME_THRESHOLD, INSTANCE_BUMP_AMOUNT);
+                            return; // Exit early - payment refunded
+                        }
+                    }
+                } else {
+                    // No router configured - cannot swap, use original token
+                    final_token = payment.token.clone();
+                    final_amount = payment.amount;
+                }
+            }
+        }
+
         let rolling_before = Self::rolling_merchant_volume(env, &payment.merchant);
-        let projected_volume = rolling_before + payment.amount;
+        let projected_volume = rolling_before + final_amount;
         let applied_fee_bps = Self::fee_bps_for_volume(env, projected_volume);
-        let fee_amount = (payment.amount * applied_fee_bps as i128) / 10_000;
-        let net_amount = payment.amount - fee_amount;
+        let fee_amount = (final_amount * applied_fee_bps as i128) / 10_000;
+        let net_amount = final_amount - fee_amount;
 
         let fee_recipient: Address = env
             .storage()
@@ -3535,7 +3724,7 @@ impl AhjoorPaymentsContract {
             .get(&DataKey::FeeRecipient)
             .expect("Fee recipient not configured");
 
-        let token_client = token::Client::new(env, &payment.token);
+        let token_client = token::Client::new(env, &final_token);
 
         if fee_amount > 0 {
             token_client.transfer(&env.current_contract_address(), &fee_recipient, &fee_amount);
@@ -3544,7 +3733,7 @@ impl AhjoorPaymentsContract {
                 payment_id,
                 fee_amount,
                 fee_recipient,
-                payment.token.clone(),
+                final_token.clone(),
             );
         }
 

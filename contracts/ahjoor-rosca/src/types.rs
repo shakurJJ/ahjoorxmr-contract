@@ -1,4 +1,4 @@
-use soroban_sdk::{contracttype, Address, Map, String, Vec};
+use soroban_sdk::{contracttype, Address, BytesN, Map, String, Vec};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[contracttype]
@@ -221,6 +221,18 @@ pub enum DataKey2 {
     CycleRecordRetentionWindow, // u32 — number of cycles to retain in persistent storage
     ArchivedCycleRecords,    // Map<u32, CycleRecord> — archived records in temporary storage
     CycleStartTimestamps,    // Map<u32, u64> — track when each cycle started
+    // Emergency Payout
+    EmergencyPayoutConfig,   // EmergencyPayoutConfig
+    EmergencyPayoutRequests, // Map<(u32, Address), EmergencyPayoutRequest> — (round, requester)
+    EmergencyPayoutVotes,    // Map<(u32, Address, Address), bool> — (round, requester, voter)
+    EmergencyPayoutCount,    // Map<u32, u32> — (cycle, count) — emergency payouts per cycle
+    EmergencyPayoutApproved, // Map<(u32, Address), bool> — (round, requester) — track approved emergency payouts per cycle
+    // Group Dissolution
+    GroupStatus,             // GroupStatus
+    DissolutionConfig,       // DissolutionConfig
+    DissolutionVotes,        // Map<(u32, Address), bool> — (round, voter)
+    DissolutionVoteCount,    // Map<u32, i128> — (round, votes_for)
+    DissolutionDeadline,     // Map<u32, u64> — (round, deadline)
 }
 
 /// Persistent storage keys — kept separate because DataKey was hitting
@@ -256,4 +268,40 @@ pub struct CycleRecord {
     pub insurance_drawn: i128,
     pub cycle_start_timestamp: u64,
     pub cycle_end_timestamp: u64,
+}
+
+// --- Emergency Payout Types ---
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct EmergencyPayoutRequest {
+    pub requester: Address,
+    pub reason_hash: BytesN<32>,
+    pub created_at: u64,
+    pub deadline: u64,
+    pub votes_for: i128,
+    pub votes_against: i128,
+    pub executed: bool,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct EmergencyPayoutConfig {
+    pub emergency_quorum_bps: u32,      // e.g., 6667 = 66.67%
+    pub vote_window_seconds: u64,       // how long voting lasts
+    pub max_emergency_per_cycle: u32,   // max emergency payouts per cycle
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[contracttype]
+pub enum GroupStatus {
+    Active = 0,
+    Dissolved = 1,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DissolutionConfig {
+    pub dissolution_quorum_bps: u32,    // e.g., 7500 = 75%
+    pub dissolution_vote_window_seconds: u64,
 }

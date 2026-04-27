@@ -71,6 +71,30 @@ pub enum Error {
     InsufficientApprovals = 49,
     /// Not a co-admin.
     NotACoAdmin = 50,
+    /// Emergency payout already requested for this member in this cycle.
+    EmergencyPayoutAlreadyRequested = 51,
+    /// Emergency payout quorum not met.
+    EmergencyPayoutQuorumNotMet = 52,
+    /// Emergency payout vote window expired.
+    EmergencyPayoutVoteExpired = 53,
+    /// Emergency payout already executed for this member in this cycle.
+    EmergencyPayoutAlreadyExecuted = 54,
+    /// Maximum emergency payouts per cycle reached.
+    EmergencyPayoutLimitReached = 55,
+    /// Group is already dissolved.
+    GroupAlreadyDissolved = 56,
+    /// Dissolution vote already in progress.
+    DissolutionVoteInProgress = 57,
+    /// Dissolution quorum not met.
+    DissolutionQuorumNotMet = 58,
+    /// Dissolution vote window expired.
+    DissolutionVoteExpired = 59,
+    /// No funds to distribute during dissolution.
+    NoFundsToDistribute = 60,
+    /// Invalid emergency payout configuration.
+    InvalidEmergencyConfig = 61,
+    /// Invalid dissolution configuration.
+    InvalidDissolutionConfig = 62,
 }
 
 /// Extension error codes 51-56 — split from Error because #[contracterror]

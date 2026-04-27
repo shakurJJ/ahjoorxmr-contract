@@ -2140,6 +2140,773 @@ impl AhjoorContract {
             .extend_ttl(INSTANCE_LIFETIME_THRESHOLD, INSTANCE_BUMP_AMOUNT);
     }
 
+    // --- EMERGENCY PAYOUT FUNCTIONS ---
+
+    /// Configure emergency payout settings. Admin only.
+    pub fn set_emergency_payout_config(
+        env: Env,
+        admin: Address,
+        emergency_quorum_bps: u32,
+        vote_window_seconds: u64,
+        max_emergency_per_cycle: u32,
+    ) {
+        admin.require_auth();
+        let stored_admin: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .expect("Not initialized");
+        if admin != stored_admin {
+            panic!("Only admin can set emergency payout config");
+        }
+
+        if emergency_quorum_bps < 1000 || emergency_quorum_bps > 10000 {
+            panic_with_error!(&env, Error::InvalidEmergencyConfig);
+        }
+        if vote_window_seconds == 0 {
+            panic_with_error!(&env, Error::InvalidEmergencyConfig);
+        }
+        if max_emergency_per_cycle == 0 {
+            panic_with_error!(&env, Error::InvalidEmergencyConfig);
+        }
+
+        let config = EmergencyPayoutConfig {
+            emergency_quorum_bps,
+            vote_window_seconds,
+            max_emergency_per_cycle,
+        };
+        env.storage()
+            .instance()
+            .set(&DataKey2::EmergencyPayoutConfig, &config);
+
+        events::emit_emergency_payout_config_updated(
+            &env,
+            emergency_quorum_bps,
+            vote_window_seconds,
+            max_emergency_per_cycle,
+        );
+
+        env.storage()
+            .instance()
+            .extend_ttl(INSTANCE_LIFETIME_THRESHOLD, INSTANCE_BUMP_AMOUNT);
+    }
+
+    /// Request an emergency payout. Member must be in good standing.
+    pub fn request_emergency_payout(env: Env, member: Address, reason_hash: BytesN<32>) {
+        internals::check_not_paused(&env);
+        member.require_auth();
+
+        let group_status: GroupStatus = env
+            .storage()
+            .instance()
+            .get(&DataKey2::GroupStatus)
+            .unwrap_or(GroupStatus::Active);
+        if group_status == GroupStatus::Dissolved {
+            panic_with_error!(&env, Error::GroupAlreadyDissolved);
+        }
+
+        let members: Vec<Address> = env
+            .storage()
+            .instance()
+            .get(&DataKey::Members)
+            .expect("Not initialized");
+        if !members.contains(&member) {
+            panic_with_error!(&env, Error::NotAMember);
+        }
+
+        let current_round: u32 = env
+            .storage()
+            .instance()
+            .get(&DataKey::CurrentRound)
+            .unwrap_or(0);
+
+        // Check if already requested
+        let requests: Map<(u32, Address), EmergencyPayoutRequest> = env
+            .storage()
+            .instance()
+            .get(&DataKey2::EmergencyPayoutRequests)
+            .unwrap_or(Map::new(&env));
+        if requests.contains_key((current_round, member.clone())) {
+            panic_with_error!(&env, Error::EmergencyPayoutAlreadyRequested);
+        }
+
+        // Check if already executed in this cycle
+        let approved: Map<(u32, Address), bool> = env
+            .storage()
+            .instance()
+            .get(&DataKey2::EmergencyPayoutApproved)
+            .unwrap_or(Map::new(&env));
+        let payout_order: Vec<Address> = env
+            .storage()
+            .instance()
+            .get(&DataKey::PayoutOrder)
+            .expect("Not initialized");
+        let cycle_index = current_round / (payout_order.len() as u32);
+        if approved.get((cycle_index, member.clone())).unwrap_or(false) {
+            panic_with_error!(&env, Error::EmergencyPayoutAlreadyExecuted);
+        }
+
+        // Check max emergency payouts per cycle
+        let emergency_count: Map<u32, u32> = env
+            .storage()
+            .instance()
+            .get(&DataKey2::EmergencyPayoutCount)
+            .unwrap_or(Map::new(&env));
+        let current_count = emergency_count.get(cycle_index).unwrap_or(0);
+        let config: EmergencyPayoutConfig = env
+            .storage()
+            .instance()
+            .get(&DataKey2::EmergencyPayoutConfig)
+            .unwrap_or(EmergencyPayoutConfig {
+                emergency_quorum_bps: 6667, // default 66.67%
+                vote_window_seconds: 7 * 24 * 60 * 60, // default 7 days
+                max_emergency_per_cycle: 1,
+            });
+        if current_count >= config.max_emergency_per_cycle {
+            panic_with_error!(&env, Error::EmergencyPayoutLimitReached);
+        }
+
+        let now = env.ledger().timestamp();
+        let deadline = now + config.vote_window_seconds;
+
+        let request = EmergencyPayoutRequest {
+            requester: member.clone(),
+            reason_hash,
+            created_at: now,
+            deadline,
+            votes_for: 0,
+            votes_against: 0,
+            executed: false,
+        };
+
+        let mut new_requests = requests;
+        new_requests.set((current_round, member.clone()), request);
+        env.storage()
+            .instance()
+            .set(&DataKey2::EmergencyPayoutRequests, &new_requests);
+
+        events::emit_emergency_payout_requested(&env, member, current_round, reason_hash, deadline);
+
+        env.storage()
+            .instance()
+            .extend_ttl(INSTANCE_LIFETIME_THRESHOLD, INSTANCE_BUMP_AMOUNT);
+    }
+
+    /// Vote on an emergency payout request.
+    pub fn vote_emergency_payout(env: Env, voter: Address, requester: Address, approve: bool) {
+        internals::check_not_paused(&env);
+        voter.require_auth();
+
+        let group_status: GroupStatus = env
+            .storage()
+            .instance()
+            .get(&DataKey2::GroupStatus)
+            .unwrap_or(GroupStatus::Active);
+        if group_status == GroupStatus::Dissolved {
+            panic_with_error!(&env, Error::GroupAlreadyDissolved);
+        }
+
+        let members: Vec<Address> = env
+            .storage()
+            .instance()
+            .get(&DataKey::Members)
+            .expect("Not initialized");
+        if !members.contains(&voter) {
+            panic_with_error!(&env, Error::OnlyMembersAllowed);
+        }
+        if voter == requester {
+            panic!("Cannot vote on your own emergency payout request");
+        }
+
+        let current_round: u32 = env
+            .storage()
+            .instance()
+            .get(&DataKey::CurrentRound)
+            .unwrap_or(0);
+
+        let mut requests: Map<(u32, Address), EmergencyPayoutRequest> = env
+            .storage()
+            .instance()
+            .get(&DataKey2::EmergencyPayoutRequests)
+            .unwrap_or(Map::new(&env));
+        if !requests.contains_key((current_round, requester.clone())) {
+            panic!("Emergency payout request not found");
+        }
+
+        let mut request = requests.get((current_round, requester.clone())).unwrap();
+        if request.executed {
+            panic!("Emergency payout already executed");
+        }
+
+        let now = env.ledger().timestamp();
+        if now > request.deadline {
+            panic_with_error!(&env, Error::EmergencyPayoutVoteExpired);
+        }
+
+        // Check if voter already voted
+        let votes: Map<(u32, Address, Address), bool> = env
+            .storage()
+            .instance()
+            .get(&DataKey2::EmergencyPayoutVotes)
+            .unwrap_or(Map::new(&env));
+        if votes.get((current_round, requester.clone(), voter.clone())).unwrap_or(false) {
+            panic!("Already voted on this emergency payout request");
+        }
+
+        // Record vote
+        let mut new_votes = votes;
+        new_votes.set((current_round, requester.clone(), voter.clone()), true);
+        env.storage()
+            .instance()
+            .set(&DataKey2::EmergencyPayoutVotes, &new_votes);
+
+        // Update vote counts
+        let voter_weight = Self::get_member_voting_weight(env.clone(), voter.clone());
+        if approve {
+            request.votes_for += voter_weight;
+        } else {
+            request.votes_against += voter_weight;
+        }
+        requests.set((current_round, requester.clone()), request.clone());
+        env.storage()
+            .instance()
+            .set(&DataKey2::EmergencyPayoutRequests, &requests);
+
+        events::emit_emergency_payout_vote_cast(
+            &env,
+            requester.clone(),
+            current_round,
+            voter,
+            approve,
+            request.votes_for,
+            request.votes_against,
+        );
+
+        env.storage()
+            .instance()
+            .extend_ttl(INSTANCE_LIFETIME_THRESHOLD, INSTANCE_BUMP_AMOUNT);
+    }
+
+    /// Execute an approved emergency payout.
+    pub fn execute_emergency_payout(env: Env, requester: Address) {
+        internals::check_not_paused(&env);
+
+        let group_status: GroupStatus = env
+            .storage()
+            .instance()
+            .get(&DataKey2::GroupStatus)
+            .unwrap_or(GroupStatus::Active);
+        if group_status == GroupStatus::Dissolved {
+            panic_with_error!(&env, Error::GroupAlreadyDissolved);
+        }
+
+        let current_round: u32 = env
+            .storage()
+            .instance()
+            .get(&DataKey::CurrentRound)
+            .unwrap_or(0);
+
+        let mut requests: Map<(u32, Address), EmergencyPayoutRequest> = env
+            .storage()
+            .instance()
+            .get(&DataKey2::EmergencyPayoutRequests)
+            .unwrap_or(Map::new(&env));
+        if !requests.contains_key((current_round, requester.clone())) {
+            panic!("Emergency payout request not found");
+        }
+
+        let mut request = requests.get((current_round, requester.clone())).unwrap();
+        if request.executed {
+            panic_with_error!(&env, Error::EmergencyPayoutAlreadyExecuted);
+        }
+
+        let now = env.ledger().timestamp();
+        if now > request.deadline {
+            panic_with_error!(&env, Error::EmergencyPayoutVoteExpired);
+        }
+
+        // Check quorum
+        let config: EmergencyPayoutConfig = env
+            .storage()
+            .instance()
+            .get(&DataKey2::EmergencyPayoutConfig)
+            .unwrap_or(EmergencyPayoutConfig {
+                emergency_quorum_bps: 6667,
+                vote_window_seconds: 7 * 24 * 60 * 60,
+                max_emergency_per_cycle: 1,
+            });
+
+        let members: Vec<Address> = env
+            .storage()
+            .instance()
+            .get(&DataKey::Members)
+            .expect("Not initialized");
+        let voting_mode: VotingMode = env
+            .storage()
+            .instance()
+            .get(&DataKey2::VotingMode)
+            .unwrap_or(VotingMode::Equal);
+
+        let total_possible_votes = match voting_mode {
+            VotingMode::Equal => members.len() as i128,
+            VotingMode::WeightedByContributions => {
+                let contributions: Map<Address, i128> = env
+                    .storage()
+                    .instance()
+                    .get(&DataKey::MemberContributions)
+                    .unwrap_or(Map::new(&env));
+                let mut total = 0i128;
+                for member in members.iter() {
+                    total += contributions.get(member).unwrap_or(0);
+                }
+                total
+            }
+        };
+
+        let required_votes = ((total_possible_votes * config.emergency_quorum_bps as i128) + 9999) / 10000;
+        let total_votes = request.votes_for + request.votes_against;
+
+        if total_votes < required_votes {
+            panic_with_error!(&env, Error::EmergencyPayoutQuorumNotMet);
+        }
+
+        if request.votes_for <= request.votes_against {
+            events::emit_emergency_payout_rejected(
+                &env,
+                requester.clone(),
+                current_round,
+                Symbol::new(&env, "votes_failed"),
+            );
+            return;
+        }
+
+        // Execute the emergency payout
+        request.executed = true;
+        requests.set((current_round, requester.clone()), request);
+        env.storage()
+            .instance()
+            .set(&DataKey2::EmergencyPayoutRequests, &requests);
+
+        // Mark as approved for this cycle
+        let payout_order: Vec<Address> = env
+            .storage()
+            .instance()
+            .get(&DataKey::PayoutOrder)
+            .expect("Not initialized");
+        let cycle_index = current_round / (payout_order.len() as u32);
+        let mut approved: Map<(u32, Address), bool> = env
+            .storage()
+            .instance()
+            .get(&DataKey2::EmergencyPayoutApproved)
+            .unwrap_or(Map::new(&env));
+        approved.set((cycle_index, requester.clone()), true);
+        env.storage()
+            .instance()
+            .set(&DataKey2::EmergencyPayoutApproved, &approved);
+
+        // Increment emergency count for this cycle
+        let mut emergency_count: Map<u32, u32> = env
+            .storage()
+            .instance()
+            .get(&DataKey2::EmergencyPayoutCount)
+            .unwrap_or(Map::new(&env));
+        let current_count = emergency_count.get(cycle_index).unwrap_or(0);
+        emergency_count.set(cycle_index, current_count + 1);
+        env.storage()
+            .instance()
+            .set(&DataKey2::EmergencyPayoutCount, &emergency_count);
+
+        // Calculate payout amount (full contribution amount)
+        let contribution_amount: i128 = env
+            .storage()
+            .instance()
+            .get(&DataKey::ContributionAmt)
+            .unwrap_or(0);
+        let token_addr: Address = env.storage().instance().get(&DataKey::Token).unwrap();
+
+        // Transfer funds to requester
+        let client = token::Client::new(&env, &token_addr);
+        client.transfer(&env.current_contract_address(), &requester, &contribution_amount);
+
+        // Mark requester as paid for this round
+        let mut paid_members: Vec<Address> = env
+            .storage()
+            .instance()
+            .get(&DataKey::PaidMembers)
+            .expect("Not initialized");
+        if !paid_members.contains(&requester) {
+            paid_members.push_back(requester.clone());
+            env.storage()
+                .instance()
+                .set(&DataKey::PaidMembers, &paid_members);
+        }
+
+        events::emit_emergency_payout_executed(&env, requester.clone(), current_round, contribution_amount);
+
+        env.storage()
+            .instance()
+            .extend_ttl(INSTANCE_LIFETIME_THRESHOLD, INSTANCE_BUMP_AMOUNT);
+    }
+
+    // --- GROUP DISSOLUTION FUNCTIONS ---
+
+    /// Configure dissolution settings. Admin only.
+    pub fn set_dissolution_config(
+        env: Env,
+        admin: Address,
+        dissolution_quorum_bps: u32,
+        vote_window_seconds: u64,
+    ) {
+        admin.require_auth();
+        let stored_admin: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .expect("Not initialized");
+        if admin != stored_admin {
+            panic!("Only admin can set dissolution config");
+        }
+
+        if dissolution_quorum_bps < 1000 || dissolution_quorum_bps > 10000 {
+            panic_with_error!(&env, Error::InvalidDissolutionConfig);
+        }
+        if vote_window_seconds == 0 {
+            panic_with_error!(&env, Error::InvalidDissolutionConfig);
+        }
+
+        let config = DissolutionConfig {
+            dissolution_quorum_bps,
+            vote_window_seconds,
+        };
+        env.storage()
+            .instance()
+            .set(&DataKey2::DissolutionConfig, &config);
+
+        events::emit_dissolution_config_updated(&env, dissolution_quorum_bps, vote_window_seconds);
+
+        env.storage()
+            .instance()
+            .extend_ttl(INSTANCE_LIFETIME_THRESHOLD, INSTANCE_BUMP_AMOUNT);
+    }
+
+    /// Admin initiates group dissolution.
+    pub fn dissolve_group(env: Env, admin: Address, reason_hash: BytesN<32>) {
+        admin.require_auth();
+        let stored_admin: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .expect("Not initialized");
+        if admin != stored_admin {
+            panic!("Only admin can dissolve group");
+        }
+
+        let group_status: GroupStatus = env
+            .storage()
+            .instance()
+            .get(&DataKey2::GroupStatus)
+            .unwrap_or(GroupStatus::Active);
+        if group_status == GroupStatus::Dissolved {
+            panic_with_error!(&env, Error::GroupAlreadyDissolved);
+        }
+
+        let members: Vec<Address> = env
+            .storage()
+            .instance()
+            .get(&DataKey::Members)
+            .expect("Not initialized");
+
+        // Calculate total pool
+        let token_addr: Address = env.storage().instance().get(&DataKey::Token).unwrap();
+        let client = token::Client::new(&env, &token_addr);
+        let total_pool = client.balance(&env.current_contract_address());
+
+        if total_pool <= 0 {
+            panic_with_error!(&env, Error::NoFundsToDistribute);
+        }
+
+        // Get member contributions for pro-rata distribution
+        let member_collected: Map<Address, i128> = env
+            .storage()
+            .instance()
+            .get(&DataKey::MemberCollected)
+            .unwrap_or(Map::new(&env));
+
+        // Mark group as dissolved
+        env.storage()
+            .instance()
+            .set(&DataKey2::GroupStatus, &GroupStatus::Dissolved);
+
+        // Distribute funds pro-rata
+        let mut total_contributions: i128 = 0;
+        for member in members.iter() {
+            total_contributions += member_collected.get(member.clone()).unwrap_or(0);
+        }
+
+        if total_contributions > 0 {
+            for member in members.iter() {
+                let contribution = member_collected.get(member.clone()).unwrap_or(0);
+                let share = (contribution * total_pool) / total_contributions;
+                if share > 0 {
+                    client.transfer(&env.current_contract_address(), &member, &share);
+                    events::emit_member_refunded(&env, member.clone(), share, contribution, total_pool);
+                }
+            }
+        }
+
+        // Handle rounding dust - send to fee recipient or first member
+        let remaining = client.balance(&env.current_contract_address());
+        if remaining > 0 {
+            if let Some(fee_recipient) = env.storage().instance().get(&DataKey::FeeRecipient) {
+                client.transfer(&env.current_contract_address(), &fee_recipient, &remaining);
+            } else if let Some(first_member) = members.get(0) {
+                client.transfer(&env.current_contract_address(), &first_member, &remaining);
+            }
+        }
+
+        let current_round: u32 = env
+            .storage()
+            .instance()
+            .get(&DataKey::CurrentRound)
+            .unwrap_or(0);
+
+        events::emit_group_dissolved(&env, current_round, reason_hash, total_pool, members.len() as u32);
+
+        env.storage()
+            .instance()
+            .extend_ttl(INSTANCE_LIFETIME_THRESHOLD, INSTANCE_BUMP_AMOUNT);
+    }
+
+    /// Start a dissolution vote (member-initiated).
+    pub fn start_dissolution_vote(env: Env, member: Address) {
+        internals::check_not_paused(&env);
+        member.require_auth();
+
+        let group_status: GroupStatus = env
+            .storage()
+            .instance()
+            .get(&DataKey2::GroupStatus)
+            .unwrap_or(GroupStatus::Active);
+        if group_status == GroupStatus::Dissolved {
+            panic_with_error!(&env, Error::GroupAlreadyDissolved);
+        }
+
+        let members: Vec<Address> = env
+            .storage()
+            .instance()
+            .get(&DataKey::Members)
+            .expect("Not initialized");
+        if !members.contains(&member) {
+            panic_with_error!(&env, Error::NotAMember);
+        }
+
+        let current_round: u32 = env
+            .storage()
+            .instance()
+            .get(&DataKey::CurrentRound)
+            .unwrap_or(0);
+
+        // Check if vote already in progress
+        let deadline: u64 = env
+            .storage()
+            .instance()
+            .get(&DataKey2::DissolutionDeadline(current_round))
+            .unwrap_or(0);
+        if deadline > 0 && env.ledger().timestamp() < deadline {
+            panic_with_error!(&env, Error::DissolutionVoteInProgress);
+        }
+
+        let config: DissolutionConfig = env
+            .storage()
+            .instance()
+            .get(&DataKey2::DissolutionConfig)
+            .unwrap_or(DissolutionConfig {
+                dissolution_quorum_bps: 7500, // default 75%
+                vote_window_seconds: 14 * 24 * 60 * 60, // default 14 days
+            });
+
+        let new_deadline = env.ledger().timestamp() + config.vote_window_seconds;
+        env.storage()
+            .instance()
+            .set(&DataKey2::DissolutionDeadline(current_round), &new_deadline);
+        env.storage()
+            .instance()
+            .set(&DataKey2::DissolutionVoteCount(current_round), &0i128);
+
+        events::emit_dissolution_vote_started(&env, current_round, new_deadline);
+
+        env.storage()
+            .instance()
+            .extend_ttl(INSTANCE_LIFETIME_THRESHOLD, INSTANCE_BUMP_AMOUNT);
+    }
+
+    /// Vote on dissolution.
+    pub fn vote_dissolve_group(env: Env, voter: Address, approve: bool) {
+        internals::check_not_paused(&env);
+        voter.require_auth();
+
+        let group_status: GroupStatus = env
+            .storage()
+            .instance()
+            .get(&DataKey2::GroupStatus)
+            .unwrap_or(GroupStatus::Active);
+        if group_status == GroupStatus::Dissolved {
+            panic_with_error!(&env, Error::GroupAlreadyDissolved);
+        }
+
+        let members: Vec<Address> = env
+            .storage()
+            .instance()
+            .get(&DataKey::Members)
+            .expect("Not initialized");
+        if !members.contains(&voter) {
+            panic_with_error!(&env, Error::OnlyMembersAllowed);
+        }
+
+        let current_round: u32 = env
+            .storage()
+            .instance()
+            .get(&DataKey::CurrentRound)
+            .unwrap_or(0);
+
+        let deadline: u64 = env
+            .storage()
+            .instance()
+            .get(&DataKey2::DissolutionDeadline(current_round))
+            .unwrap_or(0);
+        if deadline == 0 {
+            panic!("No dissolution vote in progress");
+        }
+
+        if env.ledger().timestamp() > deadline {
+            panic_with_error!(&env, Error::DissolutionVoteExpired);
+        }
+
+        // Check if already voted
+        let votes: Map<(u32, Address), bool> = env
+            .storage()
+            .instance()
+            .get(&DataKey2::DissolutionVotes)
+            .unwrap_or(Map::new(&env));
+        if votes.get((current_round, voter.clone())).unwrap_or(false) {
+            panic!("Already voted on dissolution");
+        }
+
+        // Record vote
+        let mut new_votes = votes;
+        new_votes.set((current_round, voter.clone()), true);
+        env.storage()
+            .instance()
+            .set(&DataKey2::DissolutionVotes, &new_votes);
+
+        // Update vote count
+        let voter_weight = Self::get_member_voting_weight(env.clone(), voter.clone());
+        let mut votes_for: i128 = env
+            .storage()
+            .instance()
+            .get(&DataKey2::DissolutionVoteCount(current_round))
+            .unwrap_or(0);
+        if approve {
+            votes_for += voter_weight;
+        }
+        env.storage()
+            .instance()
+            .set(&DataKey2::DissolutionVoteCount(current_round), &votes_for);
+
+        events::emit_dissolution_vote_cast(&env, current_round, voter, approve, votes_for);
+
+        env.storage()
+            .instance()
+            .extend_ttl(INSTANCE_LIFETIME_THRESHOLD, INSTANCE_BUMP_AMOUNT);
+    }
+
+    /// Execute dissolution if quorum is met.
+    pub fn execute_dissolution(env: Env) {
+        internals::check_not_paused(&env);
+
+        let group_status: GroupStatus = env
+            .storage()
+            .instance()
+            .get(&DataKey2::GroupStatus)
+            .unwrap_or(GroupStatus::Active);
+        if group_status == GroupStatus::Dissolved {
+            panic_with_error!(&env, Error::GroupAlreadyDissolved);
+        }
+
+        let current_round: u32 = env
+            .storage()
+            .instance()
+            .get(&DataKey::CurrentRound)
+            .unwrap_or(0);
+
+        let deadline: u64 = env
+            .storage()
+            .instance()
+            .get(&DataKey2::DissolutionDeadline(current_round))
+            .unwrap_or(0);
+        if deadline == 0 {
+            panic!("No dissolution vote in progress");
+        }
+
+        if env.ledger().timestamp() <= deadline {
+            panic!("Voting period not ended");
+        }
+
+        let config: DissolutionConfig = env
+            .storage()
+            .instance()
+            .get(&DataKey2::DissolutionConfig)
+            .unwrap_or(DissolutionConfig {
+                dissolution_quorum_bps: 7500,
+                vote_window_seconds: 14 * 24 * 60 * 60,
+            });
+
+        let members: Vec<Address> = env
+            .storage()
+            .instance()
+            .get(&DataKey::Members)
+            .expect("Not initialized");
+        let voting_mode: VotingMode = env
+            .storage()
+            .instance()
+            .get(&DataKey2::VotingMode)
+            .unwrap_or(VotingMode::Equal);
+
+        let total_possible_votes = match voting_mode {
+            VotingMode::Equal => members.len() as i128,
+            VotingMode::WeightedByContributions => {
+                let contributions: Map<Address, i128> = env
+                    .storage()
+                    .instance()
+                    .get(&DataKey::MemberContributions)
+                    .unwrap_or(Map::new(&env));
+                let mut total = 0i128;
+                for member in members.iter() {
+                    total += contributions.get(member).unwrap_or(0);
+                }
+                total
+            }
+        };
+
+        let votes_for: i128 = env
+            .storage()
+            .instance()
+            .get(&DataKey2::DissolutionVoteCount(current_round))
+            .unwrap_or(0);
+
+        let required_votes = ((total_possible_votes * config.dissolution_quorum_bps as i128) + 9999) / 10000;
+
+        if votes_for < required_votes {
+            panic_with_error!(&env, Error::DissolutionQuorumNotMet);
+        }
+
+        events::emit_dissolution_quorum_reached(&env, current_round, votes_for);
+
+        // Execute dissolution with empty reason hash
+        let reason_hash = BytesN::<32>::from_array(&env, [0u8; 32]);
+        Self::dissolve_group(env, env.storage().instance().get(&DataKey::Admin).expect("Not initialized"), reason_hash);
+    }
+
     // --- READ INTERFACE ---
 
     pub fn get_group_info(env: Env) -> GroupInfo {

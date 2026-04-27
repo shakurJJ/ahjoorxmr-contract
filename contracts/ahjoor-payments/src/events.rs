@@ -882,3 +882,94 @@ pub fn emit_notification_key_registered(e: &Env, merchant: Address, key: soroban
 pub fn emit_notification_key_removed(e: &Env, merchant: Address) {
     NotificationKeyRemoved { merchant }.publish(e);
 }
+
+// --- Token Swap Events ---
+
+/// Event: Payment swapped and settled
+#[contractevent]
+#[derive(Clone, Debug)]
+pub struct PaymentSwappedAndSettled {
+    pub payment_id: u32,
+    pub customer: Address,
+    pub merchant: Address,
+    pub input_token: Address,
+    pub output_token: Address,
+    pub input_amount: i128,
+    pub output_amount: i128,
+}
+
+/// Event: Payment swap failed
+#[contractevent]
+#[derive(Clone, Debug)]
+pub struct PaymentSwapFailed {
+    pub payment_id: u32,
+    pub customer: Address,
+    pub token: Address,
+    pub amount: i128,
+    pub reason: Symbol,
+}
+
+/// Event: Merchant preferred token set
+#[contractevent]
+#[derive(Clone, Debug)]
+pub struct PreferredTokenSet {
+    pub merchant: Address,
+    pub token: Address,
+}
+
+/// Event: Swap router set
+#[contractevent]
+#[derive(Clone, Debug)]
+pub struct SwapRouterSet {
+    pub router: Address,
+}
+
+// --- Helper Emission Functions ---
+
+pub fn emit_payment_swapped_and_settled(
+    e: &Env,
+    payment_id: u32,
+    customer: Address,
+    merchant: Address,
+    input_token: Address,
+    output_token: Address,
+    input_amount: i128,
+    output_amount: i128,
+) {
+    PaymentSwappedAndSettled {
+        payment_id,
+        customer,
+        merchant,
+        input_token,
+        output_token,
+        input_amount,
+        output_amount,
+    }
+    .publish(e);
+}
+
+pub fn emit_payment_swap_failed(
+    e: &Env,
+    payment_id: u32,
+    customer: Address,
+    token: Address,
+    amount: i128,
+    reason: Symbol,
+) {
+    PaymentSwapFailed {
+        payment_id,
+        customer,
+        token,
+        amount,
+        reason,
+    }
+    .publish(e);
+}
+
+pub fn emit_preferred_token_set(e: &Env, merchant: Address, token: Address) {
+    PreferredTokenSet { merchant, token }.publish(e);
+}
+
+pub fn emit_swap_router_set(e: &Env, router: Address) {
+    SwapRouterSet { router }.publish(e);
+}
