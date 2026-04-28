@@ -571,3 +571,18 @@ pub fn emit_auto_approve_threshold_set(e: &Env, merchant: Address, amount: i128)
 pub fn emit_refund_auto_approved_by_threshold(e: &Env, refund_id: u32, amount: i128) {
     RefundAutoApprovedByThreshold { refund_id, amount }.publish(e);
 }
+
+// --- Issue #238: Refund Priority ---
+
+/// Event: Priority set or changed on a refund request
+#[contractevent]
+#[derive(Clone, Debug)]
+pub struct RefundPrioritySet {
+    pub refund_id: u32,
+    pub new_priority: u32, // 0=High, 1=Medium, 2=Low
+    pub set_by: Address,
+}
+
+pub fn emit_refund_priority_set(e: &Env, refund_id: u32, new_priority: u32, set_by: Address) {
+    RefundPrioritySet { refund_id, new_priority, set_by }.publish(e);
+}

@@ -72,6 +72,15 @@ pub enum RefundStatus {
     CounterOffered = 6,
 }
 
+/// #238: Priority label for refund requests.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[contracttype]
+pub enum Priority {
+    High = 0,
+    Medium = 1,
+    Low = 2,
+}
+
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Refund {
@@ -91,6 +100,8 @@ pub struct Refund {
     pub auto_approved_source: Option<String>, // "whitelist" or "dispute_window"
     pub escrow_id: Option<u32>,                // For cross-contract escrow refunds
     pub fee_amount: Option<i128>,              // Fee deducted on processing
+    /// #238: Priority label; defaults to Medium.
+    pub priority: Priority,
 }
 
 #[contracttype]
@@ -177,6 +188,8 @@ pub enum DataKey {
     AutoApproveThreshold(Address),
     /// Global fraud score cap for auto-approval (#228)
     AutoApproveFraudScoreCap,
+    /// #238: Sorted admin queue (Vec<u32> of refund IDs ordered by priority then timestamp)
+    AdminRefundQueue,
 }
 
 mod events;
@@ -527,14 +540,8 @@ impl AhjoorRefundContract {
             auto_approved_source: auto_source,
             escrow_id: None,
             fee_amount: None,
+            priority: Priority::Medium,
         };
-
-        env.storage()
-            .persistent()
-            .set(&DataKey::Refund(refund_id), &refund);
-        env.storage().persistent().extend_ttl(
-            &DataKey::Refund(refund_id),
-            PERSISTENT_LIFETIME_THRESHOLD,
             PERSISTENT_BUMP_AMOUNT,
         );
 
@@ -816,6 +823,7 @@ impl AhjoorRefundContract {
             auto_approved_source: Some(String::from_str(&env, "merchant_direct")),
             escrow_id: None,
             fee_amount: None,
+            priority: Priority::Medium,
         };
 
         env.storage()
@@ -1975,6 +1983,7 @@ impl AhjoorRefundContract {
             auto_approved_source: None,
             escrow_id: Some(escrow_id),
             fee_amount: None,
+            priority: Priority::Medium,
         };
 
         env.storage()
@@ -2888,6 +2897,97 @@ impl AhjoorRefundContract {
             PERSISTENT_LIFETIME_THRESHOLD,
             PERSISTENT_BUMP_AMOUNT,
         );
+    }
+
+    // --- Issue #238: Refund Priority Labelling ---
+
+    /// Admin overrides the priority of any pending refund request.
+    pub fn set_refund_priority(env: Env, admin: Address, refund_id: u32, priority: Priority) {
+        Self::require_not_paused(&env);
+        Self::require_admin(&env, &admin);
+        let mut refund: Refund = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Refund(refund_id))
+            .expect("Refund not found");
+        if refund.status != RefundStatus::Requested {
+            panic!("Can only set priority on Requested refunds");
+        }
+        refund.priority = priority;
+        env.storage()
+            .persistent()
+            .set(&DataKey::Refund(refund_id), &refund);
+        env.storage().persistent().extend_ttl(
+            &DataKey::Refund(refund_id),
+            PERSISTENT_LIFETIME_THRESHOLD,
+            PERSISTENT_BUMP_AMOUNT,
+        );
+        events::emit_refund_priority_set(&env, refund_id, priority as u32, admin);
+        env.storage()
+            .instance()
+            .extend_ttl(INSTANCE_LIFETIME_THRESHOLD, INSTANCE_BUMP_AMOUNT);
+    }
+
+    /// Returns pending refunds sorted: High first, then Medium, then Low; within same priority oldest first.
+    /// Returns (page_items, total_pending, has_more).
+    pub fn get_admin_refund_queue(env: Env, page: u32, page_size: u32) -> (Vec<Refund>, u32, bool) {
+        let effective_size = page_size.min(50);
+        let queue: Vec<u32> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::PendingRefundQueue)
+            .unwrap_or(Vec::new(&env));
+
+        // Collect (priority_ord, requested_at, refund_id) for sorting
+        // priority_ord: High=0, Medium=1, Low=2
+        let mut entries: Vec<(u32, u64, u32)> = Vec::new(&env);
+        for i in 0..queue.len() {
+            let rid = queue.get(i).unwrap();
+            if let Some(r) = env
+                .storage()
+                .persistent()
+                .get::<DataKey, Refund>(&DataKey::Refund(rid))
+            {
+                if r.status == RefundStatus::Requested {
+                    let pord = r.priority as u32;
+                    entries.push_back((pord, r.requested_at, rid));
+                }
+            }
+        }
+
+        // Insertion sort by (priority_ord ASC, requested_at ASC)
+        let n = entries.len();
+        for i in 1..n {
+            let mut j = i;
+            while j > 0 {
+                let a = entries.get(j - 1).unwrap();
+                let b = entries.get(j).unwrap();
+                if a.0 > b.0 || (a.0 == b.0 && a.1 > b.1) {
+                    entries.set(j - 1, b);
+                    entries.set(j, a);
+                    j -= 1;
+                } else {
+                    break;
+                }
+            }
+        }
+
+        let total = entries.len();
+        let start = (page * effective_size).min(total);
+        let end = (start + effective_size).min(total);
+        let mut result: Vec<Refund> = Vec::new(&env);
+        for i in start..end {
+            let (_, _, rid) = entries.get(i).unwrap();
+            if let Some(r) = env
+                .storage()
+                .persistent()
+                .get::<DataKey, Refund>(&DataKey::Refund(rid))
+            {
+                result.push_back(r);
+            }
+        }
+        let has_more = end < total;
+        (result, total, has_more)
     }
 }
 
