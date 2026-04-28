@@ -175,6 +175,14 @@ impl AhjoorContract {
             PERSISTENT_LIFETIME_THRESHOLD,
             PERSISTENT_BUMP_AMOUNT,
         );
+        env.storage()
+            .persistent()
+            .set(&PersistentKey::ReputationScores, &Map::<Address, i128>::new(&env));
+        env.storage().persistent().extend_ttl(
+            &PersistentKey::ReputationScores,
+            PERSISTENT_LIFETIME_THRESHOLD,
+            PERSISTENT_BUMP_AMOUNT,
+        );
         env.storage().instance().set(&DataKey::RewardPool, &0i128);
         env.storage()
             .instance()
@@ -912,6 +920,7 @@ impl AhjoorContract {
 
         // Only mark as fully paid (and track participation) when target is reached
         if new_total == member_required_amount {
+            Self::apply_reputation_delta(&env, contributor.clone(), 10, "on_time_full");
             paid_members.push_back(contributor.clone());
             env.storage()
                 .instance()
@@ -1512,6 +1521,10 @@ impl AhjoorContract {
             penalty_amount,
             new_default_count,
         );
+        // Confirmed default is applied here (not when merely pending).
+        Self::apply_reputation_delta(env, member.clone(), -20, "defaulted");
+        // Late-but-paid: member settled after defaulting.
+        Self::apply_reputation_delta(env, member.clone(), 5, "late_paid");
 
         let max_defaults: u32 = env
             .storage()
@@ -1534,6 +1547,75 @@ impl AhjoorContract {
                 Self::try_promote_from_waitlist(env, &member);
             }
         }
+    }
+
+    fn apply_reputation_delta(env: &Env, member: Address, delta: i128, reason: &str) {
+        let mut scores: Map<Address, i128> = env
+            .storage()
+            .persistent()
+            .get(&PersistentKey::ReputationScores)
+            .unwrap_or(Map::new(env));
+        let old_score = scores.get(member.clone()).unwrap_or(0);
+        let mut new_score = old_score + delta;
+        if new_score < 0 {
+            new_score = 0;
+        }
+        scores.set(member.clone(), new_score);
+        env.storage()
+            .persistent()
+            .set(&PersistentKey::ReputationScores, &scores);
+        env.storage().persistent().extend_ttl(
+            &PersistentKey::ReputationScores,
+            PERSISTENT_LIFETIME_THRESHOLD,
+            PERSISTENT_BUMP_AMOUNT,
+        );
+        events::emit_reputation_updated(
+            env,
+            member,
+            old_score,
+            new_score,
+            Symbol::new(env, reason),
+        );
+    }
+
+    pub fn get_reputation_score(env: Env, member: Address) -> i128 {
+        let scores: Map<Address, i128> = env
+            .storage()
+            .persistent()
+            .get(&PersistentKey::ReputationScores)
+            .unwrap_or(Map::new(&env));
+        env.storage().persistent().extend_ttl(
+            &PersistentKey::ReputationScores,
+            PERSISTENT_LIFETIME_THRESHOLD,
+            PERSISTENT_BUMP_AMOUNT,
+        );
+        scores.get(member).unwrap_or(0)
+    }
+
+    pub fn get_group_avg_reputation(env: Env) -> i128 {
+        let members: Vec<Address> = env
+            .storage()
+            .instance()
+            .get(&DataKey::Members)
+            .unwrap_or(Vec::new(&env));
+        if members.is_empty() {
+            return 0;
+        }
+        let scores: Map<Address, i128> = env
+            .storage()
+            .persistent()
+            .get(&PersistentKey::ReputationScores)
+            .unwrap_or(Map::new(&env));
+        let mut total = 0i128;
+        for member in members.iter() {
+            total += scores.get(member).unwrap_or(0);
+        }
+        env.storage().persistent().extend_ttl(
+            &PersistentKey::ReputationScores,
+            PERSISTENT_LIFETIME_THRESHOLD,
+            PERSISTENT_BUMP_AMOUNT,
+        );
+        total / (members.len() as i128)
     }
 
     pub fn add_member(env: Env, new_member: Address) {

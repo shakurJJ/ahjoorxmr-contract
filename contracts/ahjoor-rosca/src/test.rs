@@ -629,6 +629,77 @@ fn test_penalty_applied_after_grace_boundary() {
 }
 
 #[test]
+fn test_reputation_score_lifecycle_and_bounds() {
+    let setup = setup_with_members(2, 2000);
+    let user1 = setup.members.get(0).unwrap();
+    let user2 = setup.members.get(1).unwrap();
+
+    setup.client.init(
+        &setup.admin,
+        &setup.members,
+        &100,
+        &setup.token_admin,
+        &3600,
+        &RoscaConfig {
+            strategy: PayoutStrategy::RoundRobin,
+            custom_order: None,
+            penalty_amount: 50,
+            exit_penalty_bps: 0,
+            collective_goal: None,
+            member_goals: None,
+            fee_bps: 0,
+            fee_recipient: None,
+            max_defaults: 3,
+            grace_period_ledgers: 2,
+            use_timestamp_schedule: false,
+            round_duration_seconds: 0,
+            max_members: None,
+            skip_fee: 0,
+            max_skips_per_cycle: 0,
+            voting_mode: VotingMode::Equal,
+        },
+        &None,
+    );
+
+    // Round 0: both members contribute fully and on-time (+10 each).
+    setup.client.contribute(&user1, &setup.token_admin, &100);
+    setup.client.contribute(&user2, &setup.token_admin, &100);
+    assert_eq!(setup.client.get_reputation_score(&user1), 10);
+    assert_eq!(setup.client.get_reputation_score(&user2), 10);
+    assert_eq!(setup.client.get_group_avg_reputation(), 10);
+
+    // Round 1: user2 defaults; penalty attempt during grace should not change score.
+    setup.client.contribute(&user1, &setup.token_admin, &100);
+    setup.env.ledger().set_timestamp(3601); // Just past round-1 deadline.
+    setup.client.close_round();
+    setup.client.penalise_defaulter(&user2);
+    assert_eq!(setup.client.get_reputation_score(&user2), 10);
+
+    // After grace: confirmed default then late-paid adjustment.
+    setup.env.ledger().set_timestamp(3603);
+    setup.client.penalise_defaulter(&user2);
+    assert_eq!(setup.client.get_reputation_score(&user2), 5);
+    assert_eq!(setup.client.get_reputation_score(&user1), 20);
+    assert_eq!(setup.client.get_group_avg_reputation(), 12);
+}
+
+#[test]
+fn test_reputation_persists_after_migrate() {
+    let setup = setup_with_members(2, 1500);
+    let user1 = setup.members.get(0).unwrap();
+    let user2 = setup.members.get(1).unwrap();
+
+    default_init(&setup);
+    setup.client.contribute(&user1, &setup.token_admin, &100);
+    setup.client.contribute(&user2, &setup.token_admin, &100);
+    assert_eq!(setup.client.get_reputation_score(&user1), 10);
+
+    setup.client.migrate(&setup.admin);
+    assert_eq!(setup.client.get_reputation_score(&user1), 10);
+    assert_eq!(setup.client.get_reputation_score(&user2), 10);
+}
+
+#[test]
 fn test_multiple_defaulters_penalty() {
     let setup = setup_with_members(3, 1000);
 

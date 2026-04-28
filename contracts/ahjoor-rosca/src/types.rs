@@ -263,6 +263,7 @@ pub enum DataKey2 {
 #[contracttype]
 pub enum PersistentKey {
     RoundHistory, // Vec<PayoutRecord> — grows every round
+    ReputationScores, // Map<Address, i128> — cumulative member reliability score
 }
 
 // ── Audit Trail ────────────────────────────────────────────────────────────────

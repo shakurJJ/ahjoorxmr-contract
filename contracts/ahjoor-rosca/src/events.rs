@@ -323,6 +323,16 @@ pub struct GracePeriodWarning {
     pub expires_at_ledger: u64,
 }
 
+/// Event: Member reputation score changed by protocol logic.
+#[contractevent]
+#[derive(Clone, Debug)]
+pub struct ReputationUpdated {
+    pub member: Address,
+    pub old_score: i128,
+    pub new_score: i128,
+    pub reason: Symbol,
+}
+
 /// Event: Round state reset for next round
 #[contractevent]
 #[derive(Clone, Debug)]
@@ -695,6 +705,22 @@ pub fn emit_grace_period_warning(e: &Env, member: Address, round: u32, expires_a
         member,
         round,
         expires_at_ledger,
+    }
+    .publish(e);
+}
+
+pub fn emit_reputation_updated(
+    e: &Env,
+    member: Address,
+    old_score: i128,
+    new_score: i128,
+    reason: Symbol,
+) {
+    ReputationUpdated {
+        member,
+        old_score,
+        new_score,
+        reason,
     }
     .publish(e);
 }
