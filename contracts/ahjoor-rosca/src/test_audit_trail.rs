@@ -33,7 +33,8 @@ fn create_test_contract(env: &Env) -> (AhjoorContractClient, Address, Vec<Addres
         fee_bps: 100u32, // 1%
         fee_recipient: Some(admin.clone()),
         max_defaults: 3u32,
-        use_timestamp_schedule: false,
+            grace_period_ledgers: 0,
+            use_timestamp_schedule: false,
         round_duration_seconds: 0u64,
         max_members: Some(10u32),
         skip_fee: 10i128,
@@ -417,3 +418,5 @@ fn test_cycle_record_total_pool_amount() {
     // Verify total pool amount (3 members * 1000 = 3000)
     assert_eq!(cycle_record.total_pool_amount, 3000i128);
 }
+
+

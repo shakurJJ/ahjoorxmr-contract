@@ -314,6 +314,15 @@ pub struct SuspensionThresholdSet {
     pub max_defaults: u32,
 }
 
+/// Event: Defaulter penalty deferred due to grace period
+#[contractevent]
+#[derive(Clone, Debug)]
+pub struct GracePeriodWarning {
+    pub member: Address,
+    pub round: u32,
+    pub expires_at_ledger: u64,
+}
+
 /// Event: Round state reset for next round
 #[contractevent]
 #[derive(Clone, Debug)]
@@ -679,6 +688,15 @@ pub fn emit_partial_contribution(e: &Env, member: Address, round: u32, amount: i
 
 pub fn emit_suspension_threshold_set(e: &Env, max_defaults: u32) {
     SuspensionThresholdSet { max_defaults }.publish(e);
+}
+
+pub fn emit_grace_period_warning(e: &Env, member: Address, round: u32, expires_at_ledger: u64) {
+    GracePeriodWarning {
+        member,
+        round,
+        expires_at_ledger,
+    }
+    .publish(e);
 }
 
 // --- Delegated Voting Events ---
@@ -1077,3 +1095,5 @@ pub fn emit_reinstatement_approved(e: &Env, member: Address) {
 pub fn emit_reinstatement_fee_collected(e: &Env, member: Address, amount: i128) {
     e.events().publish((Symbol::new(e, "ReinFee"),), (member, amount));
 }
+
+

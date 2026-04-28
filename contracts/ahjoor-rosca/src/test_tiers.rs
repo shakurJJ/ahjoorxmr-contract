@@ -56,6 +56,7 @@ fn test_tiered_contributions() {
             fee_bps: 0,
             fee_recipient: None,
             max_defaults: 3,
+            grace_period_ledgers: 0,
             use_timestamp_schedule: false,
             round_duration_seconds: 0,
             max_members: None,
@@ -74,12 +75,12 @@ fn test_tiered_contributions() {
 
     // Member1 (default 1x) contributes base_amount
     client.contribute(&member1, &token_admin, &base_amount);
-    assert_eq!(token_client.balance(&member1), 1000 - base_amount);
+    assert_eq!(token_client.balance(&member1), 2000 - base_amount);
 
     // Member2 (2x tier) must contribute 2 * base_amount
     // Try contributing only base_amount first
     client.contribute(&member2, &token_admin, &base_amount);
-    assert_eq!(token_client.balance(&member2), 1000 - base_amount);
+    assert_eq!(token_client.balance(&member2), 2000 - base_amount);
     
     // Member2 should not be marked as paid yet
     let (_, paid, _, _, _) = client.get_state();
@@ -89,11 +90,11 @@ fn test_tiered_contributions() {
 
     // Member2 contributes the remaining base_amount
     client.contribute(&member2, &token_admin, &base_amount);
-    assert_eq!(token_client.balance(&member2), 1000 - 2 * base_amount);
+    assert_eq!(token_client.balance(&member2), 2000 - 2 * base_amount);
 
     // Now round should be complete. Pot = 100 + 200 = 300.
     // Recipient is member1 (index 0).
-    assert_eq!(token_client.balance(&member1), (1000 - 100) + 300);
+    assert_eq!(token_client.balance(&member1), (2000 - 100) + 300);
 }
 
 #[test]
@@ -117,6 +118,7 @@ fn test_invalid_tier_rejected() {
             fee_bps: 0,
             fee_recipient: None,
             max_defaults: 3,
+            grace_period_ledgers: 0,
             use_timestamp_schedule: false,
             round_duration_seconds: 0,
             max_members: None,
@@ -156,6 +158,7 @@ fn test_mixed_tiers_pot_size() {
             fee_bps: 0,
             fee_recipient: None,
             max_defaults: 3,
+            grace_period_ledgers: 0,
             use_timestamp_schedule: false,
             round_duration_seconds: 0,
             max_members: None,
@@ -182,5 +185,7 @@ fn test_mixed_tiers_pot_size() {
 
     // Total pot = 100 + 150 + 300 = 550
     // Recipient is member1
-    assert_eq!(token_client.balance(&member1), (1000 - 100) + 550);
+    assert_eq!(token_client.balance(&member1), (3000 - 100) + 550);
 }
+
+

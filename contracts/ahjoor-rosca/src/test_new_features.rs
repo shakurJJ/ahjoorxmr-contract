@@ -63,6 +63,7 @@ fn test_protocol_fee_deducted_from_payout() {
             fee_bps: 200, // 2%
             fee_recipient: Some(fee_recipient.clone()),
             max_defaults: 3,
+            grace_period_ledgers: 0,
             use_timestamp_schedule: false,
             round_duration_seconds: 0,
             max_members: None,
@@ -113,6 +114,7 @@ fn test_protocol_fee_max_cap_enforced() {
             fee_bps: 600, // 6% - exceeds max
             fee_recipient: Some(fee_recipient),
             max_defaults: 3,
+            grace_period_ledgers: 0,
             use_timestamp_schedule: false,
             round_duration_seconds: 0,
             max_members: None,
@@ -149,6 +151,7 @@ fn test_update_fee_function() {
             fee_bps: 100, // 1%
             fee_recipient: Some(fee_recipient),
             max_defaults: 3,
+            grace_period_ledgers: 0,
             use_timestamp_schedule: false,
             round_duration_seconds: 0,
             max_members: None,
@@ -191,6 +194,7 @@ fn test_no_fee_when_fee_bps_zero() {
             fee_bps: 0, // No fee
             fee_recipient: None,
             max_defaults: 3,
+            grace_period_ledgers: 0,
             use_timestamp_schedule: false,
             round_duration_seconds: 0,
             max_members: None,
@@ -236,6 +240,7 @@ fn test_partial_contribution_installments() {
             fee_bps: 0,
             fee_recipient: None,
             max_defaults: 3,
+            grace_period_ledgers: 0,
             use_timestamp_schedule: false,
             round_duration_seconds: 0,
             max_members: None,
@@ -301,6 +306,7 @@ fn test_partial_contribution_events_emitted() {
             fee_bps: 0,
             fee_recipient: None,
             max_defaults: 3,
+            grace_period_ledgers: 0,
             use_timestamp_schedule: false,
             round_duration_seconds: 0,
             max_members: None,
@@ -339,6 +345,7 @@ fn test_cannot_exceed_remaining_contribution() {
             fee_bps: 0,
             fee_recipient: None,
             max_defaults: 3,
+            grace_period_ledgers: 0,
             use_timestamp_schedule: false,
             round_duration_seconds: 0,
             max_members: None,
@@ -381,6 +388,7 @@ fn test_get_member_contribution_status() {
             fee_bps: 0,
             fee_recipient: None,
             max_defaults: 3,
+            grace_period_ledgers: 0,
             use_timestamp_schedule: false,
             round_duration_seconds: 0,
             max_members: None,
@@ -435,9 +443,13 @@ fn test_timestamp_based_scheduling() {
             fee_bps: 0,
             fee_recipient: None,
             max_defaults: 3,
+            grace_period_ledgers: 0,
             use_timestamp_schedule: true,
             round_duration_seconds,
-        },
+            max_members: None,
+            skip_fee: 0,
+            max_skips_per_cycle: 0,
+            voting_mode: VotingMode::Equal,},
         &None,
     );
 
@@ -494,10 +506,14 @@ fn test_max_members_enforcement() {
             fee_bps: 0,
             fee_recipient: None,
             max_defaults: 3,
+            grace_period_ledgers: 0,
             use_timestamp_schedule: false,
             round_duration_seconds: 0,
             max_members: Some(2),
-        },
+        
+            skip_fee: 0,
+            max_skips_per_cycle: 0,
+            voting_mode: VotingMode::Equal,},
         &None,
     );
 
@@ -531,10 +547,14 @@ fn test_update_max_members() {
             fee_bps: 0,
             fee_recipient: None,
             max_defaults: 3,
+            grace_period_ledgers: 0,
             use_timestamp_schedule: false,
             round_duration_seconds: 0,
             max_members: None,
-        },
+        
+            skip_fee: 0,
+            max_skips_per_cycle: 0,
+            voting_mode: VotingMode::Equal,},
         &None,
     );
 
@@ -575,10 +595,14 @@ fn test_max_members_boundary() {
             fee_bps: 0,
             fee_recipient: None,
             max_defaults: 3,
+            grace_period_ledgers: 0,
             use_timestamp_schedule: false,
             round_duration_seconds: 0,
             max_members: Some(3),
-        },
+        
+            skip_fee: 0,
+            max_skips_per_cycle: 0,
+            voting_mode: VotingMode::Equal,},
         &None,
     );
 
@@ -614,10 +638,14 @@ fn test_max_members_proposal() {
             fee_bps: 0,
             fee_recipient: None,
             max_defaults: 3,
+            grace_period_ledgers: 0,
             use_timestamp_schedule: false,
             round_duration_seconds: 0,
             max_members: Some(5),
-        },
+        
+            skip_fee: 0,
+            max_skips_per_cycle: 0,
+            voting_mode: VotingMode::Equal,},
         &None,
     );
 
@@ -628,14 +656,15 @@ fn test_max_members_proposal() {
     client.create_proposal(
         &user1,
         &ProposalType::MaxMembersUpdate,
-        &user1, // target doesn't matter much here
         &soroban_sdk::String::from_str(&env, "Increase max members"),
+        &user1, // target doesn't matter much here
+        &86400,
         &Some(10),
     );
 
     let proposal_id = 0;
-    client.vote(&user1, &proposal_id, &true);
-    client.vote(&user2, &proposal_id, &true);
+    client.vote_on_proposal(&user1, &proposal_id, &true);
+    client.vote_on_proposal(&user2, &proposal_id, &true);
 
     // Advance time to end voting
     env.ledger().set_timestamp(env.ledger().timestamp() + 86400 * 8); // > 7 days default
@@ -667,7 +696,14 @@ fn test_configurable_max_defaults() {
             fee_bps: 0,
             fee_recipient: None,
             max_defaults: 2, // Custom threshold
-        },
+        
+            grace_period_ledgers: 0,
+            use_timestamp_schedule: false,
+            round_duration_seconds: 0,
+            max_members: None,
+            skip_fee: 0,
+            max_skips_per_cycle: 0,
+            voting_mode: VotingMode::Equal,},
         &None,
     );
 
@@ -715,6 +751,7 @@ fn test_suspension_threshold_set_event() {
             fee_bps: 0,
             fee_recipient: None,
             max_defaults: 5,
+            grace_period_ledgers: 0,
             use_timestamp_schedule: false,
             round_duration_seconds: 0,
             max_members: None,
@@ -748,7 +785,14 @@ fn test_max_defaults_must_be_at_least_one() {
             fee_bps: 0,
             fee_recipient: None,
             max_defaults: 0, // Invalid
-        },
+        
+            grace_period_ledgers: 0,
+            use_timestamp_schedule: false,
+            round_duration_seconds: 0,
+            max_members: None,
+            skip_fee: 0,
+            max_skips_per_cycle: 0,
+            voting_mode: VotingMode::Equal,},
         &None,
     );
 
@@ -776,7 +820,15 @@ fn test_penalise_defaulter_uses_max_defaults() {
             fee_bps: 0,
             fee_recipient: None,
             max_defaults: 2,
-        },
+
+            grace_period_ledgers: 0,
+        
+            use_timestamp_schedule: false,
+            round_duration_seconds: 0,
+            max_members: None,
+            skip_fee: 0,
+            max_skips_per_cycle: 0,
+            voting_mode: VotingMode::Equal,},
         &None,
     );
 
@@ -837,7 +889,14 @@ fn test_all_features_integrated() {
             fee_bps: 250, // 2.5% fee
             fee_recipient: Some(fee_recipient.clone()),
             max_defaults: 2, // Suspend after 2 defaults
-        },
+        
+            grace_period_ledgers: 0,
+            use_timestamp_schedule: false,
+            round_duration_seconds: 0,
+            max_members: None,
+            skip_fee: 0,
+            max_skips_per_cycle: 0,
+            voting_mode: VotingMode::Equal,},
         &None,
     );
 
@@ -869,3 +928,8 @@ fn test_all_features_integrated() {
     assert_eq!(client.get_fee_recipient(), Some(fee_recipient));
     assert_eq!(client.get_max_defaults(), 2);
 }
+
+
+
+
+

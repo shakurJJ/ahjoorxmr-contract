@@ -147,6 +147,9 @@ impl AhjoorContract {
             .set(&DataKey::RoundDeadline, &deadline);
         env.storage()
             .instance()
+            .set(&DataKey2::LastRoundDeadline, &deadline);
+        env.storage()
+            .instance()
             .set(&DataKey2::StartAt, &resolved_start_at);
         env.storage()
             .instance()
@@ -228,6 +231,12 @@ impl AhjoorContract {
             .instance()
             .set(&DataKey::MaxDefaults, &config.max_defaults);
         events::emit_suspension_threshold_set(&env, config.max_defaults);
+        env.storage()
+            .instance()
+            .set(&DataKey2::GracePeriodLedgers, &config.grace_period_ledgers);
+        env.storage()
+            .instance()
+            .set(&DataKey2::PendingPenalties, &Map::<Address, u32>::new(&env));
 
         env.storage()
             .instance()
@@ -1204,6 +1213,9 @@ impl AhjoorContract {
             .get(&DataKey::CurrentRound)
             .unwrap();
         events::emit_closed(&env, current_round, defaulters);
+        env.storage()
+            .instance()
+            .set(&DataKey2::LastRoundDeadline, &deadline);
 
         internals::reset_round_state(&env, current_round);
     }
@@ -1224,6 +1236,7 @@ impl AhjoorContract {
             .get(&DataKey::Admin)
             .expect("Admin not set");
         admin.require_auth();
+        Self::process_pending_penalties(&env);
 
         let use_timestamp: bool = env
             .storage()
@@ -1297,6 +1310,9 @@ impl AhjoorContract {
             .set(&DataKey::Defaulters, &defaulters);
 
         events::emit_round_finalized(&env, current_round, defaulters.clone());
+        env.storage()
+            .instance()
+            .set(&DataKey2::LastRoundDeadline, &deadline);
 
         // Execute payout BEFORE applying new suspensions so the recipient selection
         // uses the pre-round suspension state (newly delinquent members don't affect
@@ -1344,6 +1360,7 @@ impl AhjoorContract {
             .get(&DataKey::Admin)
             .expect("Admin not set");
         admin.require_auth();
+        Self::process_pending_penalties(&env);
 
         let penalty_amount: i128 = env
             .storage()
@@ -1363,8 +1380,115 @@ impl AhjoorContract {
             panic_with_error!(&env, Error::NotADefaulter);
         }
 
+        let current_round: u32 = env
+            .storage()
+            .instance()
+            .get(&DataKey::CurrentRound)
+            .unwrap_or(0);
+        let round_deadline: u64 = env
+            .storage()
+            .instance()
+            .get(&DataKey2::LastRoundDeadline)
+            .or(env.storage().instance().get(&DataKey::RoundDeadline))
+            .unwrap_or(0);
+        let grace_period_ledgers: u32 = env
+            .storage()
+            .instance()
+            .get(&DataKey2::GracePeriodLedgers)
+            .unwrap_or(0);
+        let grace_expires_at = round_deadline.saturating_add(grace_period_ledgers as u64);
+        let current_ledger = env.ledger().timestamp();
+        if current_ledger <= grace_expires_at {
+            let mut pending_penalties: Map<Address, u32> = env
+                .storage()
+                .instance()
+                .get(&DataKey2::PendingPenalties)
+                .unwrap_or(Map::new(&env));
+            pending_penalties.set(member.clone(), current_round);
+            env.storage()
+                .instance()
+                .set(&DataKey2::PendingPenalties, &pending_penalties);
+            events::emit_grace_period_warning(
+                &env,
+                member,
+                current_round,
+                grace_expires_at,
+            );
+            return;
+        }
+
+        let mut pending_penalties: Map<Address, u32> = env
+            .storage()
+            .instance()
+            .get(&DataKey2::PendingPenalties)
+            .unwrap_or(Map::new(&env));
+        pending_penalties.remove(member.clone());
+        env.storage()
+            .instance()
+            .set(&DataKey2::PendingPenalties, &pending_penalties);
+
+        Self::apply_penalty(&env, member, penalty_amount, current_round);
+    }
+
+    fn process_pending_penalties(env: &Env) {
+        let mut pending_penalties: Map<Address, u32> = env
+            .storage()
+            .instance()
+            .get(&DataKey2::PendingPenalties)
+            .unwrap_or(Map::new(env));
+        if pending_penalties.len() == 0 {
+            return;
+        }
+
+        let penalty_amount: i128 = env
+            .storage()
+            .instance()
+            .get(&DataKey::PenaltyAmount)
+            .unwrap_or(0);
+        if penalty_amount == 0 {
+            pending_penalties = Map::new(env);
+            env.storage()
+                .instance()
+                .set(&DataKey2::PendingPenalties, &pending_penalties);
+            return;
+        }
+
+        let grace_period_ledgers: u32 = env
+            .storage()
+            .instance()
+            .get(&DataKey2::GracePeriodLedgers)
+            .unwrap_or(0);
+        let round_deadline: u64 = env
+            .storage()
+            .instance()
+            .get(&DataKey2::LastRoundDeadline)
+            .or(env.storage().instance().get(&DataKey::RoundDeadline))
+            .unwrap_or(0);
+        let grace_expires_at = round_deadline.saturating_add(grace_period_ledgers as u64);
+        let current_ledger = env.ledger().timestamp();
+        let current_round: u32 = env
+            .storage()
+            .instance()
+            .get(&DataKey::CurrentRound)
+            .unwrap_or(0);
+
+        let mut still_pending: Map<Address, u32> = Map::new(env);
+        for (member, pending_round) in pending_penalties.iter() {
+            if current_ledger > grace_expires_at || current_round > pending_round {
+                Self::apply_penalty(env, member, penalty_amount, current_round);
+            } else {
+                still_pending.set(member, pending_round);
+            }
+        }
+
+        env.storage()
+            .instance()
+            .set(&DataKey2::PendingPenalties, &still_pending);
+    }
+
+    fn apply_penalty(env: &Env, member: Address, penalty_amount: i128, round: u32) {
         let token_addr: Address = env.storage().instance().get(&DataKey::Token).unwrap();
-        let client = token::Client::new(&env, &token_addr);
+        let client = token::Client::new(env, &token_addr);
 
         member.require_auth();
         client.transfer(&member, &env.current_contract_address(), &penalty_amount);
@@ -1373,7 +1497,7 @@ impl AhjoorContract {
             .storage()
             .instance()
             .get(&DataKey::DefaultCount)
-            .unwrap_or(Map::new(&env));
+            .unwrap_or(Map::new(env));
         let current_defaults = default_count.get(member.clone()).unwrap_or(0);
         let new_default_count = current_defaults + 1;
         default_count.set(member.clone(), new_default_count);
@@ -1381,15 +1505,10 @@ impl AhjoorContract {
             .instance()
             .set(&DataKey::DefaultCount, &default_count);
 
-        let current_round: u32 = env
-            .storage()
-            .instance()
-            .get(&DataKey::CurrentRound)
-            .unwrap();
         events::emit_defaulted(
-            &env,
+            env,
             member.clone(),
-            current_round,
+            round,
             penalty_amount,
             new_default_count,
         );
@@ -1405,14 +1524,14 @@ impl AhjoorContract {
                 .storage()
                 .instance()
                 .get(&DataKey::SuspendedMembers)
-                .unwrap_or(Vec::new(&env));
+                .unwrap_or(Vec::new(env));
             if !suspended_members.contains(&member) {
                 suspended_members.push_back(member.clone());
                 env.storage()
                     .instance()
                     .set(&DataKey::SuspendedMembers, &suspended_members);
-                events::emit_suspended(&env, member.clone(), new_default_count);
-                Self::try_promote_from_waitlist(&env, &member);
+                events::emit_suspended(env, member.clone(), new_default_count);
+                Self::try_promote_from_waitlist(env, &member);
             }
         }
     }

@@ -45,6 +45,7 @@ fn test_per_type_quorum_enforced() {
             fee_bps: 0,
             fee_recipient: None,
             max_defaults: 3,
+            grace_period_ledgers: 0,
             use_timestamp_schedule: false,
             round_duration_seconds: 0,
             max_members: None,
@@ -70,8 +71,8 @@ fn test_per_type_quorum_enforced() {
     client.create_proposal(
         &creator,
         &ProposalType::PenaltyAppeal,
-        &members.get(1).unwrap(),
         &soroban_sdk::String::from_str(&env, "appeal"),
+        &members.get(1).unwrap(),
         &86400,
         &None,
     );
@@ -82,7 +83,7 @@ fn test_per_type_quorum_enforced() {
     env.ledger().set_timestamp(90000); // Past deadline
     client.execute_proposal(&prop_id_appeal);
     
-    let prop_appeal = client.get_proposals().get(prop_id_appeal).unwrap();
+    let prop_appeal = client.get_proposal(&prop_id_appeal).unwrap();
     assert_eq!(prop_appeal.status, ProposalStatus::Executed); // 10% was enough
 
     // Test MemberRemoval Quorum (needs 67% = 7 votes for 10 members)
@@ -90,8 +91,8 @@ fn test_per_type_quorum_enforced() {
     client.create_proposal(
         &creator,
         &ProposalType::MemberRemoval,
-        &members.get(2).unwrap(),
         &soroban_sdk::String::from_str(&env, "remove"),
+        &members.get(2).unwrap(),
         &86400,
         &None,
     );
@@ -105,7 +106,7 @@ fn test_per_type_quorum_enforced() {
     env.ledger().set_timestamp(100000);
     client.execute_proposal(&prop_id_removal);
 
-    let prop_removal = client.get_proposals().get(prop_id_removal).unwrap();
+    let prop_removal = client.get_proposal(&prop_id_removal).unwrap();
     assert_eq!(prop_removal.status, ProposalStatus::Rejected); // 60% < 67%
 
     // Create another one and vote 7 times
@@ -113,8 +114,8 @@ fn test_per_type_quorum_enforced() {
     client.create_proposal(
         &creator,
         &ProposalType::MemberRemoval,
-        &members.get(3).unwrap(),
         &soroban_sdk::String::from_str(&env, "remove 2"),
+        &members.get(3).unwrap(),
         &86400,
         &None,
     );
@@ -124,7 +125,7 @@ fn test_per_type_quorum_enforced() {
     }
     env.ledger().set_timestamp(200000);
     client.execute_proposal(&prop_id_removal_2);
-    let prop_removal_2 = client.get_proposals().get(prop_id_removal_2).unwrap();
+    let prop_removal_2 = client.get_proposal(&prop_id_removal_2).unwrap();
     assert_eq!(prop_removal_2.status, ProposalStatus::Executed); // 70% >= 67%
 }
 
@@ -135,18 +136,19 @@ fn test_proposal_respects_quorum_at_creation() {
     client.init(&admin, &members, &100, &token_admin, &3600, &RoscaConfig {
         strategy: PayoutStrategy::RoundRobin,
         custom_order: None, penalty_amount: 0, exit_penalty_bps: 0, collective_goal: None, member_goals: None, fee_bps: 0, fee_recipient: None, max_defaults: 3,
+            grace_period_ledgers: 0,
             use_timestamp_schedule: false,
             round_duration_seconds: 0,
             max_members: None,
             skip_fee: 0,
             max_skips_per_cycle: 0,
             voting_mode: VotingMode::Equal,
-        });
+        }, &None);
 
     let creator = members.get(0).unwrap();
 
     // 1. Create proposal with default 51% quorum
-    client.create_proposal(&creator, &ProposalType::RuleChange, &creator, &soroban_sdk::String::from_str(&env, "rule"), &86400, &None);
+    client.create_proposal(&creator, &ProposalType::RuleChange, &soroban_sdk::String::from_str(&env, "rule"), &creator, &86400, &None);
     let prop_id = 0;
 
     // 2. Update quorum to 80%
@@ -160,6 +162,8 @@ fn test_proposal_respects_quorum_at_creation() {
     env.ledger().set_timestamp(100000);
     client.execute_proposal(&prop_id);
 
-    let prop = client.get_proposals().get(prop_id).unwrap();
+    let prop = client.get_proposal(&prop_id).unwrap();
     assert_eq!(prop.status, ProposalStatus::Executed); // Still used 51% from creation time
 }
+
+

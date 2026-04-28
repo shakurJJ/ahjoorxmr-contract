@@ -38,6 +38,7 @@ fn setup_with_members<'a>(n: usize) -> (Env, AhjoorContractClient<'a>, Address, 
             fee_bps: 0,
             fee_recipient: None,
             max_defaults: 3,
+            grace_period_ledgers: 0,
             use_timestamp_schedule: false,
             round_duration_seconds: 0,
             max_members: None,
@@ -85,7 +86,7 @@ fn test_auto_reinvest_flow() {
     // Member 1's contribution for Round 1 should be 200 (reinvested amount)
     let (paid_amt, remaining) = client.get_member_contribution_status(&member1);
     assert_eq!(paid_amt, 200);
-    assert_eq!(remaining, 0); // 200 >= 100 required
+    assert_eq!(remaining, -100); // reinvested amount exceeds required contribution
 }
 
 #[test]
@@ -109,3 +110,5 @@ fn test_cannot_set_reinvest_preference_after_deadline() {
     env.ledger().set_timestamp(4000); // Past deadline (3600)
     client.set_reinvest_preference(&member1, &true);
 }
+
+

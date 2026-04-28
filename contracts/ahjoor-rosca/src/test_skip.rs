@@ -57,6 +57,7 @@ fn test_skip_success_pays_fee_and_excludes_defaulter() {
             fee_bps: 0,
             fee_recipient: None,
             max_defaults: 3,
+            grace_period_ledgers: 0,
             use_timestamp_schedule: false,
             round_duration_seconds: 0,
             max_members: None,
@@ -122,11 +123,15 @@ fn test_skip_limit_enforced() {
             fee_bps: 0,
             fee_recipient: None,
             max_defaults: 3,
+
+            grace_period_ledgers: 0,
             max_members: None,
             skip_fee: 10,
             max_skips_per_cycle: 1,
             voting_mode: VotingMode::Equal,
-        },
+        
+            use_timestamp_schedule: false,
+            round_duration_seconds: 0,},
         &None,
     );
 
@@ -162,13 +167,13 @@ fn test_skip_deadline_enforced() {
             fee_bps: 0,
             fee_recipient: None,
             max_defaults: 3,
+
+            grace_period_ledgers: 0,
             skip_fee: 10,
             max_skips_per_cycle: 5,
             use_timestamp_schedule: false,
             round_duration_seconds: 0,
             max_members: None,
-            skip_fee: 10,
-            max_skips_per_cycle: 5,
             voting_mode: VotingMode::Equal,
         },
         &None,
@@ -204,13 +209,13 @@ fn test_cannot_skip_after_contribution() {
             fee_bps: 0,
             fee_recipient: None,
             max_defaults: 3,
+
+            grace_period_ledgers: 0,
             skip_fee: 10,
             max_skips_per_cycle: 5,
             use_timestamp_schedule: false,
             round_duration_seconds: 0,
             max_members: None,
-            skip_fee: 10,
-            max_skips_per_cycle: 5,
             voting_mode: VotingMode::Equal,
         },
         &None,
@@ -224,3 +229,8 @@ fn test_cannot_skip_after_contribution() {
     let result = client.try_request_skip(&member, &0);
     assert_eq!(result.unwrap_err().unwrap(), Error::AlreadyContributed.into());
 }
+
+
+
+
+
