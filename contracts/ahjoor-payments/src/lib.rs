@@ -111,6 +111,8 @@ pub enum Error {
     OracleNotWhitelisted = 16,
     /// Dynamic payment has expired (#246)
     DynamicPaymentExpired = 17,
+    /// Customer cumulative spend would exceed the merchant-configured cap (#235)
+    CustomerSpendLimitExceeded = 15,
 }
 
 /// Per-merchant withdrawal rate limit config (#231).
@@ -127,6 +129,22 @@ pub struct WithdrawalLimit {
 pub struct WithdrawalWindowState {
     pub window_start: u64,
     pub withdrawn: i128,
+}
+
+/// Per-customer (or default) spend cap config (#235).
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SpendLimit {
+    pub amount: i128,
+    pub window_seconds: u64,
+}
+
+/// Tracks cumulative spend within the current rolling window (#235).
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CustomerSpendWindow {
+    pub window_start: u64,
+    pub spent: i128,
 }
 
 /// Direction for oracle price condition (#125)
@@ -536,9 +554,36 @@ pub enum DataKey {
     DynamicPayment(u32),
     /// Instance: admin-maintained oracle whitelist (#246)
     OracleWhitelist,
+    /// Persistent: per-(merchant,customer) spend limit override (#235)
+    CustomerSpendLimit(Address, Address),
+    /// Persistent: merchant-level default spend limit (#235)
+    DefaultSpendLimit(Address),
+    /// Persistent: per-(merchant,customer) rolling spend window state (#235)
+    CustomerSpendWindowState(Address, Address),
+    /// #216: recurring invoice counter
+    RecurringInvoiceCounter,
+    /// #216: recurring invoice record
+    RecurringInvoice(u32),
 }
 
 mod events;
+
+/// #216: Recurring invoice schedule.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RecurringInvoice {
+    pub id: u32,
+    pub merchant: Address,
+    pub customer: Address,
+    pub amount: i128,
+    pub token: Address,
+    pub interval_seconds: u64,
+    pub max_cycles: u32,
+    pub cycles_triggered: u32,
+    pub next_due_at: u64,
+    pub reference_hash: Option<BytesN<32>>,
+    pub active: bool,
+}
 
 #[contract]
 pub struct AhjoorPaymentsContract;
@@ -4289,6 +4334,8 @@ impl AhjoorPaymentsContract {
 
         // #246: Recompute token amount at current oracle rate for dynamic payments
         Self::settle_dynamic_payment_if_needed(env, &mut payment);
+        // #235: Check customer spend limit before finalizing
+        Self::check_and_update_customer_spend_limit(env, &payment.merchant, &payment.customer, payment.amount);
 
         Self::finalize_payment(env, payment_id, &mut payment);
     }
@@ -5742,211 +5789,288 @@ impl AhjoorPaymentsContract {
     }
 
     // =========================================================================
-    // #246: Dynamic Settlement via Oracle Price Feed
+    // #235: Merchant-Level Customer Spending Limits
     // =========================================================================
 
-    /// Admin adds an oracle address to the whitelist.
-    pub fn add_oracle_to_whitelist(env: Env, admin: Address, oracle: Address) {
-        Self::require_not_paused(&env);
-        admin.require_auth();
-        let stored_admin: Address = env.storage().instance().get(&DataKey::Admin).expect("Not initialized");
-        if admin != stored_admin { panic!("Only admin can manage oracle whitelist"); }
+    /// Merchant sets a per-customer spend cap within a rolling window.
+    pub fn set_customer_spend_limit(
+    // ─── #216: Recurring Invoice Scheduling ──────────────────────────────────
 
-        let mut whitelist: Vec<Address> = env.storage().instance().get(&DataKey::OracleWhitelist).unwrap_or(Vec::new(&env));
-        if !whitelist.contains(&oracle) {
-            whitelist.push_back(oracle);
-            env.storage().instance().set(&DataKey::OracleWhitelist, &whitelist);
-        }
-        env.storage().instance().extend_ttl(INSTANCE_LIFETIME_THRESHOLD, INSTANCE_BUMP_AMOUNT);
-    }
-
-    /// Admin removes an oracle address from the whitelist.
-    pub fn remove_oracle_from_whitelist(env: Env, admin: Address, oracle: Address) {
-        Self::require_not_paused(&env);
-        admin.require_auth();
-        let stored_admin: Address = env.storage().instance().get(&DataKey::Admin).expect("Not initialized");
-        if admin != stored_admin { panic!("Only admin can manage oracle whitelist"); }
-
-        let whitelist: Vec<Address> = env.storage().instance().get(&DataKey::OracleWhitelist).unwrap_or(Vec::new(&env));
-        let mut new_list = Vec::new(&env);
-        for addr in whitelist.iter() {
-            if addr != oracle { new_list.push_back(addr); }
-        }
-        env.storage().instance().set(&DataKey::OracleWhitelist, &new_list);
-        env.storage().instance().extend_ttl(INSTANCE_LIFETIME_THRESHOLD, INSTANCE_BUMP_AMOUNT);
-    }
-
-    /// Get the oracle whitelist.
-    pub fn get_oracle_whitelist(env: Env) -> Vec<Address> {
-        env.storage().instance().get(&DataKey::OracleWhitelist).unwrap_or(Vec::new(&env))
-    }
-
-    /// Merchant creates a fiat-denominated invoice backed by an oracle price feed.
-    /// The token amount is computed at settlement time using the oracle rate.
-    #[allow(clippy::too_many_arguments)]
-    pub fn create_dynamic_payment(
+    /// Merchant creates a recurring invoice schedule.
+    /// `max_cycles` = 0 means unlimited.
+    pub fn create_recurring_invoice(
         env: Env,
-        customer: Address,
         merchant: Address,
-        fiat_amount: i128,
-        fiat_currency: Symbol,
-        oracle_address: Address,
+        customer: Address,
+        amount: i128,
+        window_seconds: u64,
+    ) {
+        Self::require_not_paused(&env);
+        merchant.require_auth();
+        if amount <= 0 {
+            panic!("Spend limit amount must be positive");
+        }
+        if window_seconds == 0 {
+            panic!("Window seconds must be positive");
+        }
+        let key = DataKey::CustomerSpendLimit(merchant.clone(), customer.clone());
+        let limit = SpendLimit { amount, window_seconds };
+        env.storage().persistent().set(&key, &limit);
+        env.storage().persistent().extend_ttl(&key, PERSISTENT_LIFETIME_THRESHOLD, PERSISTENT_BUMP_AMOUNT);
+        events::emit_customer_spend_limit_set(&env, merchant, customer, amount, window_seconds);
+        env.storage().instance().extend_ttl(INSTANCE_LIFETIME_THRESHOLD, INSTANCE_BUMP_AMOUNT);
+    }
+
+    /// Merchant removes a per-customer spend cap.
+    pub fn remove_customer_spend_limit(env: Env, merchant: Address, customer: Address) {
+        Self::require_not_paused(&env);
+        merchant.require_auth();
+        let key = DataKey::CustomerSpendLimit(merchant.clone(), customer.clone());
+        env.storage().persistent().remove(&key);
+        events::emit_customer_spend_limit_removed(&env, merchant, customer);
+        env.storage().instance().extend_ttl(INSTANCE_LIFETIME_THRESHOLD, INSTANCE_BUMP_AMOUNT);
+    }
+
+    /// Merchant sets a global default spend cap applied to all customers without an individual override.
+    pub fn set_default_spend_limit(
+        env: Env,
+        merchant: Address,
+        amount: i128,
+        window_seconds: u64,
+    ) {
+        Self::require_not_paused(&env);
+        merchant.require_auth();
+        if amount <= 0 {
+            panic!("Spend limit amount must be positive");
+        }
+        if window_seconds == 0 {
+            panic!("Window seconds must be positive");
+        }
+        let key = DataKey::DefaultSpendLimit(merchant.clone());
+        let limit = SpendLimit { amount, window_seconds };
+        env.storage().persistent().set(&key, &limit);
+        env.storage().persistent().extend_ttl(&key, PERSISTENT_LIFETIME_THRESHOLD, PERSISTENT_BUMP_AMOUNT);
+        events::emit_default_spend_limit_set(&env, merchant, amount, window_seconds);
+        env.storage().instance().extend_ttl(INSTANCE_LIFETIME_THRESHOLD, INSTANCE_BUMP_AMOUNT);
+    }
+
+    /// Get the per-customer spend limit for a merchant+customer pair.
+    pub fn get_customer_spend_limit(env: Env, merchant: Address, customer: Address) -> Option<SpendLimit> {
+        env.storage().persistent().get(&DataKey::CustomerSpendLimit(merchant, customer))
+    }
+
+    /// Get the default spend limit for a merchant.
+    pub fn get_default_spend_limit(env: Env, merchant: Address) -> Option<SpendLimit> {
+        env.storage().persistent().get(&DataKey::DefaultSpendLimit(merchant))
+    }
+
+    /// Check and update the customer spend window. Panics with CustomerSpendLimitExceeded if cap would be breached.
+    fn check_and_update_customer_spend_limit(env: &Env, merchant: &Address, customer: &Address, amount: i128) {
+        // Individual override takes priority over default
+        let limit_opt: Option<SpendLimit> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::CustomerSpendLimit(merchant.clone(), customer.clone()))
+            .or_else(|| env.storage().persistent().get(&DataKey::DefaultSpendLimit(merchant.clone())));
+
+        let limit = match limit_opt {
+            Some(l) => l,
+            None => return, // No limit configured
+        };
+
+        let state_key = DataKey::CustomerSpendWindowState(merchant.clone(), customer.clone());
+        let now = env.ledger().timestamp();
+
+        let mut state: CustomerSpendWindow = env
+            .storage()
+            .persistent()
+            .get(&state_key)
+            .unwrap_or(CustomerSpendWindow { window_start: now, spent: 0 });
+
+        // Reset window if expired
+        if now >= state.window_start + limit.window_seconds {
+            state = CustomerSpendWindow { window_start: now, spent: 0 };
+        }
+
+        let new_total = state.spent.checked_add(amount).expect("Spend overflow");
+        if new_total > limit.amount {
+            events::emit_customer_spend_limit_exceeded(env, merchant.clone(), customer.clone(), new_total, limit.amount);
+            panic_with_error!(env, Error::CustomerSpendLimitExceeded);
+        }
+
+        state.spent = new_total;
+        env.storage().persistent().set(&state_key, &state);
+        env.storage().persistent().extend_ttl(&state_key, PERSISTENT_LIFETIME_THRESHOLD, PERSISTENT_BUMP_AMOUNT);
         token: Address,
-        slippage_bps: u32,
-        expiry: u64,
+        interval_seconds: u64,
+        max_cycles: u32,
+        reference_hash: Option<BytesN<32>>,
     ) -> u32 {
         Self::require_not_paused(&env);
-        customer.require_auth();
+        merchant.require_auth();
 
-        if fiat_amount <= 0 { panic!("fiat_amount must be positive"); }
-
-        // Validate oracle is whitelisted
-        let whitelist: Vec<Address> = env.storage().instance().get(&DataKey::OracleWhitelist).unwrap_or(Vec::new(&env));
-        if !whitelist.contains(&oracle_address) {
-            panic_with_error!(&env, Error::OracleNotWhitelisted);
+        if amount <= 0 {
+            panic!("Amount must be positive");
+        }
+        if interval_seconds == 0 {
+            panic!("Interval must be positive");
         }
 
         Self::require_token_allowed(&env, &token);
         Self::require_merchant_approved(&env, &merchant);
 
-        // Fetch oracle rate at creation time for slippage baseline
-        let usdc_token: Address = env.storage().instance().get(&DataKey::UsdcToken).expect("Oracle not configured");
-        let max_oracle_age: u64 = env.storage().instance().get(&DataKey::MaxOracleAge).expect("Oracle not configured");
-        let oracle_client = oracle::OracleClient::new(&env, &oracle_address);
-        let price_data = oracle_client.lastprice(&token, &usdc_token).expect("Oracle returned no price");
+        let mut counter: u32 = env
+            .storage()
+            .instance()
+            .get(&DataKey::RecurringInvoiceCounter)
+            .unwrap_or(0);
+        let invoice_id = counter;
+        counter += 1;
+        env.storage()
+            .instance()
+            .set(&DataKey::RecurringInvoiceCounter, &counter);
+
         let now = env.ledger().timestamp();
-        if now.saturating_sub(price_data.timestamp) > max_oracle_age {
-            panic!("Oracle price is stale");
-        }
-        if price_data.price <= 0 { panic!("Invalid oracle price"); }
-
-        // Compute token amount at creation rate: token_amount = fiat_amount * 10^7 / price
-        let creation_token_amount = (fiat_amount * ORACLE_PRICE_PRECISION) / price_data.price;
-        if creation_token_amount <= 0 { panic!("Computed token amount is zero"); }
-
-        // Transfer token from customer to escrow
-        let token_client = token::Client::new(&env, &token);
-        token_client.transfer(&customer, &env.current_contract_address(), &creation_token_amount);
-
-        let timeout: u64 = env.storage().instance().get(&DataKey::PaymentTimeout).unwrap_or(DEFAULT_PAYMENT_TIMEOUT);
-        let payment_expiry = if expiry > 0 { expiry } else { now + timeout };
-
-        let payment_id = Self::next_payment_id(&env);
-        let payment = Payment {
-            id: payment_id,
-            customer: customer.clone(),
+        let invoice = RecurringInvoice {
+            id: invoice_id,
             merchant: merchant.clone(),
-            amount: creation_token_amount,
-            token: token.clone(),
-            status: PaymentStatus::Pending,
-            created_at: now,
-            expires_at: payment_expiry,
-            refunded_amount: 0,
-            reference: None,
-            metadata: None,
-            split_recipients: None,
-            execute_after: 0,
-            category: None,
-            tags: None,
-            capture_deadline: 0,
-            external_id: None,
+            customer: customer.clone(),
+            amount,
+            token,
+            interval_seconds,
+            max_cycles,
+            cycles_triggered: 0,
+            next_due_at: now,
+            reference_hash,
+            active: true,
         };
 
-        env.storage().persistent().set(&DataKey::Payment(payment_id), &payment);
-        env.storage().persistent().extend_ttl(&DataKey::Payment(payment_id), PERSISTENT_LIFETIME_THRESHOLD, PERSISTENT_BUMP_AMOUNT);
+        env.storage()
+            .persistent()
+            .set(&DataKey::RecurringInvoice(invoice_id), &invoice);
+        env.storage().persistent().extend_ttl(
+            &DataKey::RecurringInvoice(invoice_id),
+            PERSISTENT_LIFETIME_THRESHOLD,
+            PERSISTENT_BUMP_AMOUNT,
+        );
 
-        // Store dynamic payment metadata
-        let dynamic = DynamicPayment {
-            payment_id,
-            fiat_amount,
-            fiat_currency: fiat_currency.clone(),
-            oracle_address: oracle_address.clone(),
-            token: token.clone(),
-            slippage_bps,
-            creation_rate: price_data.price,
-            expiry: payment_expiry,
-        };
-        env.storage().persistent().set(&DataKey::DynamicPayment(payment_id), &dynamic);
-        env.storage().persistent().extend_ttl(&DataKey::DynamicPayment(payment_id), PERSISTENT_LIFETIME_THRESHOLD, PERSISTENT_BUMP_AMOUNT);
+        events::emit_recurring_invoice_created(&env, invoice_id, merchant, customer, amount);
 
-        Self::add_customer_payment(&env, &customer, payment_id);
-        Self::inc_global_created(&env);
-        Self::inc_merchant_created(&env, &merchant);
+        env.storage()
+            .instance()
+            .extend_ttl(INSTANCE_LIFETIME_THRESHOLD, INSTANCE_BUMP_AMOUNT);
 
-        events::emit_dynamic_payment_created(&env, payment_id, fiat_amount, fiat_currency, oracle_address);
-        events::emit_payment_created(&env, payment_id, customer, merchant, creation_token_amount, token);
+        invoice_id
+    }
 
-        env.storage().instance().extend_ttl(INSTANCE_LIFETIME_THRESHOLD, INSTANCE_BUMP_AMOUNT);
+    /// Trigger the next invoice cycle, creating a standard Payment entry.
+    /// Callable by anyone (merchant, keeper, etc.) when the interval has elapsed.
+    /// Returns the new payment_id.
+    pub fn trigger_invoice_cycle(env: Env, invoice_id: u32) -> u32 {
+        Self::require_not_paused(&env);
+
+        let mut invoice: RecurringInvoice = env
+            .storage()
+            .persistent()
+            .get(&DataKey::RecurringInvoice(invoice_id))
+            .expect("Recurring invoice not found");
+
+        if !invoice.active {
+            panic!("Recurring invoice is cancelled");
+        }
+
+        let now = env.ledger().timestamp();
+        if now < invoice.next_due_at {
+            panic!("Invoice interval has not elapsed");
+        }
+
+        if invoice.max_cycles > 0 && invoice.cycles_triggered >= invoice.max_cycles {
+            panic!("Max cycles reached");
+        }
+
+        // Create a standard Payment entry (funds transferred from customer)
+        let payment_id = Self::create_payment_with_options(
+            env.clone(),
+            invoice.customer.clone(),
+            invoice.merchant.clone(),
+            invoice.amount,
+            invoice.token.clone(),
+            None,
+            None,
+            None,
+            None,
+            None,
+        );
+
+        invoice.cycles_triggered += 1;
+        invoice.next_due_at = now + invoice.interval_seconds;
+
+        // Auto-complete if max_cycles reached
+        if invoice.max_cycles > 0 && invoice.cycles_triggered >= invoice.max_cycles {
+            invoice.active = false;
+            events::emit_recurring_invoice_completed(&env, invoice_id);
+        }
+
+        env.storage()
+            .persistent()
+            .set(&DataKey::RecurringInvoice(invoice_id), &invoice);
+        env.storage().persistent().extend_ttl(
+            &DataKey::RecurringInvoice(invoice_id),
+            PERSISTENT_LIFETIME_THRESHOLD,
+            PERSISTENT_BUMP_AMOUNT,
+        );
+
+        events::emit_invoice_cycle_triggered(&env, invoice_id, payment_id, invoice.cycles_triggered);
+
+        env.storage()
+            .instance()
+            .extend_ttl(INSTANCE_LIFETIME_THRESHOLD, INSTANCE_BUMP_AMOUNT);
+
         payment_id
     }
 
-    /// Get the dynamic payment metadata for a payment ID.
-    pub fn get_dynamic_payment(env: Env, payment_id: u32) -> DynamicPayment {
-        env.storage().persistent().get(&DataKey::DynamicPayment(payment_id)).expect("Not a dynamic payment")
+    /// Cancel a recurring invoice. Callable by merchant or customer.
+    pub fn cancel_recurring_invoice(env: Env, caller: Address, invoice_id: u32) {
+        Self::require_not_paused(&env);
+        caller.require_auth();
+
+        let mut invoice: RecurringInvoice = env
+            .storage()
+            .persistent()
+            .get(&DataKey::RecurringInvoice(invoice_id))
+            .expect("Recurring invoice not found");
+
+        if caller != invoice.merchant && caller != invoice.customer {
+            panic!("Only merchant or customer can cancel");
+        }
+
+        if !invoice.active {
+            panic!("Recurring invoice is already cancelled");
+        }
+
+        invoice.active = false;
+        env.storage()
+            .persistent()
+            .set(&DataKey::RecurringInvoice(invoice_id), &invoice);
+        env.storage().persistent().extend_ttl(
+            &DataKey::RecurringInvoice(invoice_id),
+            PERSISTENT_LIFETIME_THRESHOLD,
+            PERSISTENT_BUMP_AMOUNT,
+        );
+
+        events::emit_recurring_invoice_cancelled(&env, invoice_id, caller);
+
+        env.storage()
+            .instance()
+            .extend_ttl(INSTANCE_LIFETIME_THRESHOLD, INSTANCE_BUMP_AMOUNT);
     }
 
-    /// Internal: if payment_id has a DynamicPayment record, recompute token amount at current oracle rate,
-    /// apply slippage check, adjust payment.amount, and return the settlement rate.
-    fn settle_dynamic_payment_if_needed(env: &Env, payment: &mut Payment) {
-        let dynamic_opt: Option<DynamicPayment> = env.storage().persistent().get(&DataKey::DynamicPayment(payment.id));
-        let dynamic = match dynamic_opt {
-            Some(d) => d,
-            None => return, // Not a dynamic payment
-        };
-
-        let now = env.ledger().timestamp();
-        if now >= dynamic.expiry {
-            panic_with_error!(env, Error::DynamicPaymentExpired);
-        }
-
-        // Validate oracle still whitelisted
-        let whitelist: Vec<Address> = env.storage().instance().get(&DataKey::OracleWhitelist).unwrap_or(Vec::new(env));
-        if !whitelist.contains(&dynamic.oracle_address) {
-            panic_with_error!(env, Error::OracleNotWhitelisted);
-        }
-
-        let usdc_token: Address = env.storage().instance().get(&DataKey::UsdcToken).expect("Oracle not configured");
-        let max_oracle_age: u64 = env.storage().instance().get(&DataKey::MaxOracleAge).expect("Oracle not configured");
-        let oracle_client = oracle::OracleClient::new(env, &dynamic.oracle_address);
-        let price_data = oracle_client.lastprice(&dynamic.token, &usdc_token).expect("Oracle returned no price");
-
-        if now.saturating_sub(price_data.timestamp) > max_oracle_age {
-            panic!("Oracle price is stale at settlement");
-        }
-        if price_data.price <= 0 { panic!("Invalid oracle price at settlement"); }
-
-        // Compute settlement token amount: token_amount = fiat_amount * 10^7 / current_rate
-        let settlement_token_amount = (dynamic.fiat_amount * ORACLE_PRICE_PRECISION) / price_data.price;
-        if settlement_token_amount <= 0 { panic!("Computed settlement token amount is zero"); }
-
-        // Slippage check: compare settlement rate vs creation rate
-        let rate_deviation = if price_data.price >= dynamic.creation_rate {
-            price_data.price - dynamic.creation_rate
-        } else {
-            dynamic.creation_rate - price_data.price
-        };
-        let deviation_bps = (rate_deviation * 10_000) / dynamic.creation_rate;
-        if deviation_bps > dynamic.slippage_bps as i128 {
-            panic_with_error!(env, Error::SlippageExceeded);
-        }
-
-        // Adjust escrowed amount: refund or collect difference
-        let escrowed = payment.amount;
-        let token_client = token::Client::new(env, &dynamic.token);
-        if settlement_token_amount < escrowed {
-            // Refund excess to customer
-            let refund = escrowed - settlement_token_amount;
-            token_client.transfer(&env.current_contract_address(), &payment.customer, &refund);
-        } else if settlement_token_amount > escrowed {
-            // Collect additional from customer
-            let extra = settlement_token_amount - escrowed;
-            token_client.transfer(&payment.customer, &env.current_contract_address(), &extra);
-        }
-
-        events::emit_dynamic_payment_settled(env, payment.id, dynamic.fiat_amount, settlement_token_amount, price_data.price);
-
-        // Update payment amount to settlement amount
-        payment.amount = settlement_token_amount;
+    /// Get a recurring invoice by ID.
+    pub fn get_recurring_invoice(env: Env, invoice_id: u32) -> RecurringInvoice {
+        env.storage()
+            .persistent()
+            .get(&DataKey::RecurringInvoice(invoice_id))
+            .expect("Recurring invoice not found")
     }
 
 }
@@ -5971,5 +6095,6 @@ mod test_merchant_ban;
 
 #[cfg(test)]
 mod test_dynamic_settlement;
+mod test_spending_limit;
 
 pub use events::*;

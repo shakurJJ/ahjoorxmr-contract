@@ -173,6 +173,8 @@ pub enum DataKey {
     CounterOffer(u32),
     /// Configurable counter-offer expiry window in seconds
     CounterOfferExpirySeconds,
+    /// #217: admin-configurable max batch size for batch refund operations
+    MaxBatchSize,
     /// Per-merchant auto-approval threshold amount (#228)
     AutoApproveThreshold(Address),
     /// Global fraud score cap for auto-approval (#228)
@@ -191,6 +193,16 @@ pub struct CounterOffer {
 }
 
 const DEFAULT_COUNTER_OFFER_EXPIRY_SECONDS: u64 = 48 * 60 * 60; // 48 hours
+
+const DEFAULT_MAX_BATCH_SIZE: u32 = 20;
+
+/// Result of a batch refund operation (#217).
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BatchRefundResult {
+    pub processed: Vec<u32>,
+    pub skipped: Vec<u32>,
+}
 
 /// Optional extended configuration for `initialize`.
 /// Groups the extra parameters that would otherwise exceed Soroban's 10-parameter limit.
@@ -2888,6 +2900,184 @@ impl AhjoorRefundContract {
             PERSISTENT_LIFETIME_THRESHOLD,
             PERSISTENT_BUMP_AMOUNT,
         );
+    }
+
+    // ─── #217: Batch Refund Processing ───────────────────────────────────────
+
+    /// Admin sets the maximum batch size for batch refund operations.
+    pub fn set_max_batch_size(env: Env, admin: Address, max_batch_size: u32) {
+        Self::require_not_paused(&env);
+        admin.require_auth();
+        let stored_admin: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .expect("Not initialized");
+        if admin != stored_admin {
+            panic!("Only admin can set max batch size");
+        }
+        if max_batch_size == 0 {
+            panic!("Max batch size must be positive");
+        }
+        env.storage()
+            .instance()
+            .set(&DataKey::MaxBatchSize, &max_batch_size);
+        env.storage()
+            .instance()
+            .extend_ttl(INSTANCE_LIFETIME_THRESHOLD, INSTANCE_BUMP_AMOUNT);
+    }
+
+    /// Approve multiple pending refund requests in a single transaction.
+    /// Skips IDs that are not in Requested status rather than reverting.
+    /// Returns a BatchRefundResult with processed and skipped IDs.
+    pub fn batch_approve_refunds(env: Env, admin: Address, refund_ids: Vec<u32>) -> BatchRefundResult {
+        Self::require_not_paused(&env);
+        admin.require_auth();
+
+        let stored_admin: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .expect("Not initialized");
+        if admin != stored_admin {
+            panic!("Only admin can batch approve refunds");
+        }
+
+        let max_batch: u32 = env
+            .storage()
+            .instance()
+            .get(&DataKey::MaxBatchSize)
+            .unwrap_or(DEFAULT_MAX_BATCH_SIZE);
+
+        if refund_ids.len() > max_batch {
+            panic!("Batch size exceeds maximum allowed");
+        }
+
+        let mut processed = Vec::new(&env);
+        let mut skipped = Vec::new(&env);
+        let now = env.ledger().timestamp();
+
+        for i in 0..refund_ids.len() {
+            let refund_id = refund_ids.get(i).unwrap();
+            let maybe_refund: Option<Refund> = env
+                .storage()
+                .persistent()
+                .get(&DataKey::Refund(refund_id));
+
+            match maybe_refund {
+                Some(mut refund) if refund.status == RefundStatus::Requested => {
+                    refund.status = RefundStatus::Approved;
+                    refund.approved_at = Some(now);
+                    env.storage()
+                        .persistent()
+                        .set(&DataKey::Refund(refund_id), &refund);
+                    env.storage().persistent().extend_ttl(
+                        &DataKey::Refund(refund_id),
+                        PERSISTENT_LIFETIME_THRESHOLD,
+                        PERSISTENT_BUMP_AMOUNT,
+                    );
+                    Self::remove_from_pending_queue(&env, refund_id);
+                    Self::decrement_fraud_score(&env, &refund.customer);
+                    Self::update_stats_on_approve(&env, &refund.merchant);
+                    events::emit_refund_approved(&env, refund_id, admin.clone(), now);
+                    processed.push_back(refund_id);
+                }
+                _ => {
+                    skipped.push_back(refund_id);
+                }
+            }
+        }
+
+        env.storage()
+            .instance()
+            .extend_ttl(INSTANCE_LIFETIME_THRESHOLD, INSTANCE_BUMP_AMOUNT);
+
+        BatchRefundResult { processed, skipped }
+    }
+
+    /// Reject multiple pending refund requests in a single transaction.
+    /// Skips IDs that are not in Requested status rather than reverting.
+    /// Returns a BatchRefundResult with processed and skipped IDs.
+    pub fn batch_reject_refunds(
+        env: Env,
+        admin: Address,
+        refund_ids: Vec<u32>,
+        reason_hash: BytesN<32>,
+    ) -> BatchRefundResult {
+        Self::require_not_paused(&env);
+        admin.require_auth();
+
+        let stored_admin: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .expect("Not initialized");
+        if admin != stored_admin {
+            panic!("Only admin can batch reject refunds");
+        }
+
+        let max_batch: u32 = env
+            .storage()
+            .instance()
+            .get(&DataKey::MaxBatchSize)
+            .unwrap_or(DEFAULT_MAX_BATCH_SIZE);
+
+        if refund_ids.len() > max_batch {
+            panic!("Batch size exceeds maximum allowed");
+        }
+
+        let mut processed = Vec::new(&env);
+        let mut skipped = Vec::new(&env);
+        let now = env.ledger().timestamp();
+
+        for i in 0..refund_ids.len() {
+            let refund_id = refund_ids.get(i).unwrap();
+            let maybe_refund: Option<Refund> = env
+                .storage()
+                .persistent()
+                .get(&DataKey::Refund(refund_id));
+
+            match maybe_refund {
+                Some(mut refund) if refund.status == RefundStatus::Requested => {
+                    refund.status = RefundStatus::Rejected;
+                    refund.rejected_at = Some(now);
+                    env.storage()
+                        .persistent()
+                        .set(&DataKey::Refund(refund_id), &refund);
+                    env.storage().persistent().extend_ttl(
+                        &DataKey::Refund(refund_id),
+                        PERSISTENT_LIFETIME_THRESHOLD,
+                        PERSISTENT_BUMP_AMOUNT,
+                    );
+                    Self::remove_from_pending_queue(&env, refund_id);
+                    Self::increment_fraud_score(&env, &refund.customer, Symbol::new(&env, "admin_rejected"));
+                    Self::update_stats_on_reject(&env, &refund.merchant);
+                    events::emit_refund_rejected(
+                        &env,
+                        refund_id,
+                        admin.clone(),
+                        String::from_str(&env, "batch_reject"),
+                        now,
+                    );
+                    processed.push_back(refund_id);
+                }
+                _ => {
+                    skipped.push_back(refund_id);
+                }
+            }
+        }
+
+        // Store reason_hash for audit (emit as event)
+        env.events().publish(
+            (Symbol::new(&env, "BatchRejectReason"),),
+            (admin.clone(), reason_hash),
+        );
+
+        env.storage()
+            .instance()
+            .extend_ttl(INSTANCE_LIFETIME_THRESHOLD, INSTANCE_BUMP_AMOUNT);
+
+        BatchRefundResult { processed, skipped }
     }
 }
 
