@@ -104,6 +104,58 @@ pub enum Error {
     VoucherExhausted = 11,
     VoucherRevoked = 12,
     VoucherNotFound = 13,
+    WithdrawalRateLimitExceeded = 14,
+    /// Referred merchant already has a merchant record (#242)
+    ReferralAlreadyExists = 15,
+    /// No pending commission to claim (#242)
+    NoCommissionToClaim = 16,
+    /// Slippage tolerance exceeded on dynamic payment settlement (#246)
+    SlippageExceeded = 15,
+    /// Oracle address is not on the admin whitelist (#246)
+    OracleNotWhitelisted = 16,
+    /// Dynamic payment has expired (#246)
+    DynamicPaymentExpired = 17,
+    /// Customer cumulative spend would exceed the merchant-configured cap (#235)
+    CustomerSpendLimitExceeded = 15,
+}
+
+/// Per-merchant withdrawal rate limit config (#231).
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct WithdrawalLimit {
+    pub window_seconds: u64,
+    pub cap: i128,
+}
+
+/// Tracks cumulative withdrawals within the current window (#231).
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct WithdrawalWindowState {
+    pub window_start: u64,
+    pub withdrawn: i128,
+}
+
+/// Referral record: tracks referrer, registration ledger, and accrual window (#242).
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ReferralRecord {
+    pub referrer: Address,
+    pub registered_at_ledger: u32,
+    pub window_ledgers: u32,
+/// Per-customer (or default) spend cap config (#235).
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SpendLimit {
+    pub amount: i128,
+    pub window_seconds: u64,
+}
+
+/// Tracks cumulative spend within the current rolling window (#235).
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CustomerSpendWindow {
+    pub window_start: u64,
+    pub spent: i128,
 }
 
 /// Direction for oracle price condition (#125)
@@ -263,6 +315,17 @@ pub struct MerchantStats {
     pub volume_completed: Map<Address, i128>,
 }
 
+/// Per-merchant revenue dashboard summary (#226).
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MerchantSummary {
+    pub total_volume: i128,
+    pub completed_count: u32,
+    pub failed_count: u32,
+    pub pending_count: u32,
+    pub volume_by_token: Map<Address, i128>,
+}
+
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Dispute {
@@ -328,6 +391,22 @@ pub struct SlippageConfig {
     pub default_bps: u32,
     pub min_bps: u32,
     pub max_bps: u32,
+}
+
+/// Oracle-backed dynamic payment record (#246).
+/// The settlement amount is computed at complete_payment time using the oracle rate.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DynamicPayment {
+    pub payment_id: u32,
+    pub fiat_amount: i128,
+    pub fiat_currency: Symbol,
+    pub oracle_address: Address,
+    pub token: Address,
+    pub slippage_bps: u32,
+    /// Oracle price at creation time (scaled by 10^7), used for slippage check at settlement
+    pub creation_rate: i128,
+    pub expiry: u64,
 }
 
 /// Per-merchant volume cap configuration (#131)
@@ -472,9 +551,71 @@ pub enum DataKey {
     AppealCooldownUntil(Address),
     /// Instance: appeal rejection cooldown in seconds
     AppealRejectionCooldownSeconds,
+    /// Instance: global default withdrawal window in seconds (#231)
+    WithdrawalWindowSeconds,
+    /// Instance: global default withdrawal cap per window (#231)
+    WithdrawalWindowCap,
+    /// Persistent: per-merchant withdrawal limit override (#231)
+    MerchantWithdrawalLimit(Address),
+    /// Persistent: per-merchant withdrawal tracker for current window (#231)
+    MerchantWithdrawalWindow(Address),
+    /// Persistent: per-merchant revenue dashboard summary (#226)
+    MerchantSummary(Address),
+    // --- #239: Loyalty Points ---
+    /// Instance: points earned per 1_000_000 units of payment token
+    LoyaltyPointsPerUnit,
+    /// Instance: discount in basis points per 1 point redeemed
+    LoyaltyRedemptionRateBps,
+    /// Instance: minimum payment floor after discount (in token units)
+    LoyaltyMinPaymentFloor,
+    /// Instance: ledgers after which unspent points expire (0 = no expiry)
+    LoyaltyExpiryLedgers,
+    /// Persistent: customer loyalty points balance
+    LoyaltyBalance(Address),
+    /// Persistent: ledger at which customer's points were last accrued (for expiry)
+    LoyaltyLastAccrualLedger(Address),
+    /// Instance: global referral commission in basis points (#242)
+    ReferralCommissionBps,
+    /// Instance: global referral window in ledgers (#242)
+    ReferralWindowLedgers,
+    /// Persistent: referral record for a referred merchant (#242)
+    ReferralRecord(Address),
+    /// Persistent: pending commission balance for a referrer (#242)
+    PendingCommission(Address),
+    /// Persistent: dynamic payment record (#246)
+    DynamicPayment(u32),
+    /// Instance: admin-maintained oracle whitelist (#246)
+    OracleWhitelist,
+    /// Persistent: per-(merchant,customer) spend limit override (#235)
+    CustomerSpendLimit(Address, Address),
+    /// Persistent: merchant-level default spend limit (#235)
+    DefaultSpendLimit(Address),
+    /// Persistent: per-(merchant,customer) rolling spend window state (#235)
+    CustomerSpendWindowState(Address, Address),
+    /// #216: recurring invoice counter
+    RecurringInvoiceCounter,
+    /// #216: recurring invoice record
+    RecurringInvoice(u32),
 }
 
 mod events;
+
+/// #216: Recurring invoice schedule.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RecurringInvoice {
+    pub id: u32,
+    pub merchant: Address,
+    pub customer: Address,
+    pub amount: i128,
+    pub token: Address,
+    pub interval_seconds: u64,
+    pub max_cycles: u32,
+    pub cycles_triggered: u32,
+    pub next_due_at: u64,
+    pub reference_hash: Option<BytesN<32>>,
+    pub active: bool,
+}
 
 #[contract]
 pub struct AhjoorPaymentsContract;
@@ -1028,6 +1169,9 @@ impl AhjoorPaymentsContract {
         let net_amount = total_amount
             .checked_sub(fee_collected)
             .expect("Settlement fee exceeds amount");
+
+        // #231: Enforce withdrawal rate limit
+        Self::check_and_update_withdrawal_rate_limit(&env, &merchant, net_amount);
 
         let token_client = token::Client::new(&env, &settlement_token);
         token_client.transfer(&env.current_contract_address(), &merchant, &net_amount);
@@ -4014,6 +4158,163 @@ impl AhjoorPaymentsContract {
         }
     }
 
+    // -------------------------------------------------------------------------
+    // #231: Merchant Withdrawal Rate Limiting
+    // -------------------------------------------------------------------------
+
+    /// Admin sets global default withdrawal window and cap.
+    pub fn set_withdrawal_window(env: Env, admin: Address, window_seconds: u64, cap: i128) {
+        Self::require_not_paused(&env);
+        admin.require_auth();
+        let stored_admin: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .expect("Not initialized");
+        if admin != stored_admin {
+            panic!("Only admin can set withdrawal window");
+        }
+        if window_seconds == 0 {
+            panic!("Window must be positive");
+        }
+        if cap <= 0 {
+            panic!("Cap must be positive");
+        }
+        env.storage()
+            .instance()
+            .set(&DataKey::WithdrawalWindowSeconds, &window_seconds);
+        env.storage()
+            .instance()
+            .set(&DataKey::WithdrawalWindowCap, &cap);
+        env.storage()
+            .instance()
+            .extend_ttl(INSTANCE_LIFETIME_THRESHOLD, INSTANCE_BUMP_AMOUNT);
+    }
+
+    /// Merchant sets a personal (stricter) withdrawal limit.
+    pub fn set_withdrawal_limit(env: Env, merchant: Address, window_seconds: u64, cap: i128) {
+        Self::require_not_paused(&env);
+        merchant.require_auth();
+        if window_seconds == 0 {
+            panic!("Window must be positive");
+        }
+        if cap <= 0 {
+            panic!("Cap must be positive");
+        }
+        let limit = WithdrawalLimit { window_seconds, cap };
+        env.storage()
+            .persistent()
+            .set(&DataKey::MerchantWithdrawalLimit(merchant.clone()), &limit);
+        env.storage().persistent().extend_ttl(
+            &DataKey::MerchantWithdrawalLimit(merchant.clone()),
+            PERSISTENT_LIFETIME_THRESHOLD,
+            PERSISTENT_BUMP_AMOUNT,
+        );
+        events::emit_withdrawal_rate_limit_set(&env, merchant, window_seconds, cap);
+        env.storage()
+            .instance()
+            .extend_ttl(INSTANCE_LIFETIME_THRESHOLD, INSTANCE_BUMP_AMOUNT);
+    }
+
+    /// Admin overrides a merchant's withdrawal cap (emergency override).
+    pub fn override_withdrawal_limit(env: Env, admin: Address, merchant: Address, cap: i128) {
+        Self::require_not_paused(&env);
+        admin.require_auth();
+        let stored_admin: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .expect("Not initialized");
+        if admin != stored_admin {
+            panic!("Only admin can override withdrawal limit");
+        }
+        if cap <= 0 {
+            panic!("Cap must be positive");
+        }
+        // Preserve existing window or use global default
+        let window_seconds: u64 = env
+            .storage()
+            .persistent()
+            .get::<DataKey, WithdrawalLimit>(&DataKey::MerchantWithdrawalLimit(merchant.clone()))
+            .map(|l| l.window_seconds)
+            .unwrap_or_else(|| {
+                env.storage()
+                    .instance()
+                    .get(&DataKey::WithdrawalWindowSeconds)
+                    .unwrap_or(24 * 60 * 60)
+            });
+        let limit = WithdrawalLimit { window_seconds, cap };
+        env.storage()
+            .persistent()
+            .set(&DataKey::MerchantWithdrawalLimit(merchant.clone()), &limit);
+        env.storage().persistent().extend_ttl(
+            &DataKey::MerchantWithdrawalLimit(merchant.clone()),
+            PERSISTENT_LIFETIME_THRESHOLD,
+            PERSISTENT_BUMP_AMOUNT,
+        );
+        events::emit_withdrawal_rate_limit_set(&env, merchant, window_seconds, cap);
+        env.storage()
+            .instance()
+            .extend_ttl(INSTANCE_LIFETIME_THRESHOLD, INSTANCE_BUMP_AMOUNT);
+    }
+
+    /// Internal: check and update the rolling withdrawal window for a merchant.
+    /// Panics with WithdrawalRateLimitExceeded if the cap would be exceeded.
+    fn check_and_update_withdrawal_rate_limit(env: &Env, merchant: &Address, amount: i128) {
+        // Determine effective limit: merchant-specific > global default > no limit
+        let (window_seconds, cap) = if let Some(limit) = env
+            .storage()
+            .persistent()
+            .get::<DataKey, WithdrawalLimit>(&DataKey::MerchantWithdrawalLimit(merchant.clone()))
+        {
+            (limit.window_seconds, limit.cap)
+        } else if let (Some(w), Some(c)) = (
+            env.storage()
+                .instance()
+                .get::<DataKey, u64>(&DataKey::WithdrawalWindowSeconds),
+            env.storage()
+                .instance()
+                .get::<DataKey, i128>(&DataKey::WithdrawalWindowCap),
+        ) {
+            (w, c)
+        } else {
+            // No rate limit configured — allow
+            return;
+        };
+
+        let now = env.ledger().timestamp();
+        let state_key = DataKey::MerchantWithdrawalWindow(merchant.clone());
+
+        let mut state: WithdrawalWindowState = env
+            .storage()
+            .persistent()
+            .get(&state_key)
+            .unwrap_or(WithdrawalWindowState {
+                window_start: now,
+                withdrawn: 0,
+            });
+
+        // Reset window if it has elapsed
+        if now >= state.window_start + window_seconds {
+            state.window_start = now;
+            state.withdrawn = 0;
+        }
+
+        let new_total = state.withdrawn.checked_add(amount).expect("Overflow");
+        if new_total > cap {
+            events::emit_withdrawal_rate_limit_exceeded(env, merchant.clone(), new_total, cap);
+            panic_with_error!(env, Error::WithdrawalRateLimitExceeded);
+        }
+
+        state.withdrawn = new_total;
+        env.storage().persistent().set(&state_key, &state);
+        env.storage().persistent().extend_ttl(
+            &state_key,
+            PERSISTENT_LIFETIME_THRESHOLD,
+            PERSISTENT_BUMP_AMOUNT,
+        );
+    }
+
     fn require_admin(env: &Env, admin: &Address) {
         admin.require_auth();
         let stored_admin: Address = env
@@ -4062,6 +4363,11 @@ impl AhjoorPaymentsContract {
         if payment.expires_at > 0 && env.ledger().timestamp() >= payment.expires_at {
             panic!("Payment has expired");
         }
+
+        // #246: Recompute token amount at current oracle rate for dynamic payments
+        Self::settle_dynamic_payment_if_needed(env, &mut payment);
+        // #235: Check customer spend limit before finalizing
+        Self::check_and_update_customer_spend_limit(env, &payment.merchant, &payment.customer, payment.amount);
 
         Self::finalize_payment(env, payment_id, &mut payment);
     }
@@ -4300,6 +4606,7 @@ impl AhjoorPaymentsContract {
                             
                             Self::inc_global_refunded(env, &payment.token, payment.amount);
                             Self::inc_merchant_refunded(env, &payment.merchant, &payment.token, payment.amount);
+                            Self::inc_merchant_failed(env, &payment.merchant); // #226
                             
                             events::emit_payment_swap_failed(
                                 env,
@@ -4348,6 +4655,8 @@ impl AhjoorPaymentsContract {
                 fee_recipient,
                 final_token.clone(),
             );
+            // #242: Accrue referral commission on the fee collected for referred merchants
+            Self::accrue_referral_commission(env, &payment.merchant, payment_id, fee_amount);
         }
 
         let split_transfers = Self::distribute_net_payment(env, payment, net_amount);
@@ -4436,6 +4745,9 @@ impl AhjoorPaymentsContract {
         );
         events::emit_payment_status_changed(env, payment_id, old_status, PaymentStatus::Completed);
         events::emit_payment_receipt_issued(env, payment_id, receipt_hash);
+
+        // #239: Accrue loyalty points to customer
+        Self::accrue_loyalty_points(env, payment_id, &payment.customer, payment.amount);
 
         env.storage()
             .instance()
@@ -4869,6 +5181,23 @@ impl AhjoorPaymentsContract {
         let mut s = Self::load_merchant_stats(env, merchant);
         s.payments_created += 1;
         Self::save_merchant_stats(env, merchant, &s);
+
+        // #226: Track pending count in MerchantSummary
+        let key = DataKey::MerchantSummary(merchant.clone());
+        let mut summary: MerchantSummary = env
+            .storage()
+            .persistent()
+            .get(&key)
+            .unwrap_or(MerchantSummary {
+                total_volume: 0,
+                completed_count: 0,
+                failed_count: 0,
+                pending_count: 0,
+                volume_by_token: Map::new(env),
+            });
+        summary.pending_count += 1;
+        env.storage().persistent().set(&key, &summary);
+        env.storage().persistent().extend_ttl(&key, PERSISTENT_LIFETIME_THRESHOLD, PERSISTENT_BUMP_AMOUNT);
     }
 
     fn inc_merchant_completed(env: &Env, merchant: &Address, token: &Address, amount: i128) {
@@ -4877,6 +5206,62 @@ impl AhjoorPaymentsContract {
         let prev = s.volume_completed.get(token.clone()).unwrap_or(0);
         s.volume_completed.set(token.clone(), prev + amount);
         Self::save_merchant_stats(env, merchant, &s);
+
+        // #226: Update MerchantSummary
+        let key = DataKey::MerchantSummary(merchant.clone());
+        let mut summary: MerchantSummary = env
+            .storage()
+            .persistent()
+            .get(&key)
+            .unwrap_or(MerchantSummary {
+                total_volume: 0,
+                completed_count: 0,
+                failed_count: 0,
+                pending_count: 0,
+                volume_by_token: Map::new(env),
+            });
+        summary.completed_count += 1;
+        if summary.pending_count > 0 { summary.pending_count -= 1; }
+        summary.total_volume += amount;
+        let prev_token = summary.volume_by_token.get(token.clone()).unwrap_or(0);
+        summary.volume_by_token.set(token.clone(), prev_token + amount);
+        env.storage().persistent().set(&key, &summary);
+        env.storage().persistent().extend_ttl(&key, PERSISTENT_LIFETIME_THRESHOLD, PERSISTENT_BUMP_AMOUNT);
+    }
+
+    fn inc_merchant_failed(env: &Env, merchant: &Address) {
+        let key = DataKey::MerchantSummary(merchant.clone());
+        let mut summary: MerchantSummary = env
+            .storage()
+            .persistent()
+            .get(&key)
+            .unwrap_or(MerchantSummary {
+                total_volume: 0,
+                completed_count: 0,
+                failed_count: 0,
+                pending_count: 0,
+                volume_by_token: Map::new(env),
+            });
+        summary.failed_count += 1;
+        if summary.pending_count > 0 { summary.pending_count -= 1; }
+        env.storage().persistent().set(&key, &summary);
+        env.storage().persistent().extend_ttl(&key, PERSISTENT_LIFETIME_THRESHOLD, PERSISTENT_BUMP_AMOUNT);
+    }
+        let key = DataKey::MerchantSummary(merchant.clone());
+        let mut summary: MerchantSummary = env
+            .storage()
+            .persistent()
+            .get(&key)
+            .unwrap_or(MerchantSummary {
+                total_volume: 0,
+                completed_count: 0,
+                failed_count: 0,
+                pending_count: 0,
+                volume_by_token: Map::new(env),
+            });
+        summary.failed_count += 1;
+        env.storage().persistent().set(&key, &summary);
+        env.storage().persistent().extend_ttl(&key, PERSISTENT_LIFETIME_THRESHOLD, PERSISTENT_BUMP_AMOUNT);
     }
 
     fn inc_merchant_refunded(env: &Env, merchant: &Address, token: &Address, amount: i128) {
@@ -5365,10 +5750,656 @@ impl AhjoorPaymentsContract {
             .get(&DataKey::MerchantAppeal(merchant))
     }
 
+    // ─── #226: Merchant Revenue Dashboard ────────────────────────────────────
+
+    /// Returns the full merchant revenue summary.
+    pub fn get_merchant_summary(env: Env, merchant: Address) -> MerchantSummary {
+        env.storage()
+            .persistent()
+            .get(&DataKey::MerchantSummary(merchant))
+            .unwrap_or(MerchantSummary {
+                total_volume: 0,
+                completed_count: 0,
+                failed_count: 0,
+                pending_count: 0,
+                volume_by_token: Map::new(&env),
+            })
+    }
+
+    /// Returns the completed volume for a specific token for a merchant.
+    pub fn get_merchant_volume_by_token(env: Env, merchant: Address, token: Address) -> i128 {
+        let summary: MerchantSummary = env
+            .storage()
+            .persistent()
+            .get(&DataKey::MerchantSummary(merchant))
+            .unwrap_or(MerchantSummary {
+                total_volume: 0,
+                completed_count: 0,
+                failed_count: 0,
+                pending_count: 0,
+                volume_by_token: Map::new(&env),
+            });
+        summary.volume_by_token.get(token).unwrap_or(0)
+    }
+
+    /// Returns (completed_count, failed_count, pending_count) for a merchant.
+    pub fn get_merchant_payment_counts(env: Env, merchant: Address) -> (u32, u32, u32) {
+        let summary: MerchantSummary = env
+            .storage()
+            .persistent()
+            .get(&DataKey::MerchantSummary(merchant))
+            .unwrap_or(MerchantSummary {
+                total_volume: 0,
+                completed_count: 0,
+                failed_count: 0,
+                pending_count: 0,
+                volume_by_token: Map::new(&env),
+            });
+        (summary.completed_count, summary.failed_count, summary.pending_count)
+    }
+
+    /// Admin resets a merchant's dashboard counters.
+    pub fn reset_merchant_stats(env: Env, merchant: Address) {
+        Self::require_not_paused(&env);
+        let admin: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .expect("Not initialized");
+        admin.require_auth();
+
+        let empty = MerchantSummary {
+            total_volume: 0,
+            completed_count: 0,
+            failed_count: 0,
+            pending_count: 0,
+            volume_by_token: Map::new(&env),
+        };
+        let key = DataKey::MerchantSummary(merchant);
+        env.storage().persistent().set(&key, &empty);
+        env.storage().persistent().extend_ttl(
+            &key,
+            PERSISTENT_LIFETIME_THRESHOLD,
+            PERSISTENT_BUMP_AMOUNT,
+        );
+        env.storage().instance().extend_ttl(INSTANCE_LIFETIME_THRESHOLD, INSTANCE_BUMP_AMOUNT);
+    }
+
+    // ── #239: Customer Loyalty Points ─────────────────────────────────────────
+
+    /// Admin configures the loyalty points system.
+    /// points_per_unit: points earned per 1_000_000 units of payment token.
+    /// redemption_rate_bps: discount in basis points per 1 point redeemed.
+    /// min_payment_floor: minimum payment amount after discount.
+    /// expiry_ledgers: ledgers after which unspent points expire (0 = no expiry).
+    pub fn configure_loyalty(
+        env: Env,
+        admin: Address,
+        points_per_unit: u32,
+        redemption_rate_bps: u32,
+        min_payment_floor: i128,
+        expiry_ledgers: u32,
+    ) {
+        admin.require_auth();
+        let stored_admin: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .expect("Not initialized");
+        if admin != stored_admin {
+            panic!("Only admin");
+        }
+        env.storage().instance().set(&DataKey::LoyaltyPointsPerUnit, &points_per_unit);
+        env.storage().instance().set(&DataKey::LoyaltyRedemptionRateBps, &redemption_rate_bps);
+        env.storage().instance().set(&DataKey::LoyaltyMinPaymentFloor, &min_payment_floor);
+        env.storage().instance().set(&DataKey::LoyaltyExpiryLedgers, &expiry_ledgers);
+        env.storage().instance().extend_ttl(INSTANCE_LIFETIME_THRESHOLD, INSTANCE_BUMP_AMOUNT);
+    }
+
+    /// Customer redeems loyalty points as a discount on a pending payment.
+    /// Discount = points_to_redeem * redemption_rate_bps / 10_000.
+    /// Payment amount cannot drop below min_payment_floor.
+    /// Points are non-transferable (tied to customer address).
+    pub fn redeem_points(env: Env, customer: Address, payment_id: u32, points_to_redeem: i128) {
+        customer.require_auth();
+
+        // Expire stale points first
+        Self::maybe_expire_points(&env, &customer);
+
+        let balance: i128 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::LoyaltyBalance(customer.clone()))
+            .unwrap_or(0);
+        if points_to_redeem <= 0 || points_to_redeem > balance {
+            panic!("Insufficient loyalty points");
+        }
+
+        let redemption_rate_bps: u32 = env
+            .storage()
+            .instance()
+            .get(&DataKey::LoyaltyRedemptionRateBps)
+            .unwrap_or(0);
+        let min_floor: i128 = env
+            .storage()
+            .instance()
+            .get(&DataKey::LoyaltyMinPaymentFloor)
+            .unwrap_or(0);
+
+        let mut payment: Payment = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Payment(payment_id))
+            .expect("Payment not found");
+        if payment.customer != customer {
+            panic!("Not your payment");
+        }
+        if payment.status != PaymentStatus::Pending {
+            panic!("Payment not pending");
+        }
+
+        let discount = (points_to_redeem * redemption_rate_bps as i128) / 10_000;
+        let new_amount = (payment.amount - discount).max(min_floor);
+        let actual_discount = payment.amount - new_amount;
+        let actual_points_used = if actual_discount == discount {
+            points_to_redeem
+        } else {
+            // Recalculate points consumed when floor was hit
+            if redemption_rate_bps == 0 { points_to_redeem } else {
+                (actual_discount * 10_000) / redemption_rate_bps as i128
+            }
+        };
+
+        // Burn points
+        let new_balance = balance - actual_points_used;
+        env.storage().persistent().set(&DataKey::LoyaltyBalance(customer.clone()), &new_balance);
+        env.storage().persistent().extend_ttl(
+            &DataKey::LoyaltyBalance(customer.clone()),
+            PERSISTENT_LIFETIME_THRESHOLD,
+            PERSISTENT_BUMP_AMOUNT,
+        );
+
+        // Apply discount to payment
+        payment.amount = new_amount;
+        env.storage().persistent().set(&DataKey::Payment(payment_id), &payment);
+        env.storage().persistent().extend_ttl(
+            &DataKey::Payment(payment_id),
+    // =========================================================================
+    // #242: Merchant Referral Commission Tracking
+    // =========================================================================
+    // #235: Merchant-Level Customer Spending Limits
+    // =========================================================================
+
+    /// Merchant sets a per-customer spend cap within a rolling window.
+    pub fn set_customer_spend_limit(
+    // ─── #216: Recurring Invoice Scheduling ──────────────────────────────────
+
+    /// Merchant creates a recurring invoice schedule.
+    /// `max_cycles` = 0 means unlimited.
+    pub fn create_recurring_invoice(
+        env: Env,
+        merchant: Address,
+        customer: Address,
+        amount: i128,
+        window_seconds: u64,
+    ) {
+        Self::require_not_paused(&env);
+        merchant.require_auth();
+        if amount <= 0 {
+            panic!("Spend limit amount must be positive");
+        }
+        if window_seconds == 0 {
+            panic!("Window seconds must be positive");
+        }
+        let key = DataKey::CustomerSpendLimit(merchant.clone(), customer.clone());
+        let limit = SpendLimit { amount, window_seconds };
+        env.storage().persistent().set(&key, &limit);
+        env.storage().persistent().extend_ttl(&key, PERSISTENT_LIFETIME_THRESHOLD, PERSISTENT_BUMP_AMOUNT);
+        events::emit_customer_spend_limit_set(&env, merchant, customer, amount, window_seconds);
+        env.storage().instance().extend_ttl(INSTANCE_LIFETIME_THRESHOLD, INSTANCE_BUMP_AMOUNT);
+    }
+
+    /// Merchant removes a per-customer spend cap.
+    pub fn remove_customer_spend_limit(env: Env, merchant: Address, customer: Address) {
+        Self::require_not_paused(&env);
+        merchant.require_auth();
+        let key = DataKey::CustomerSpendLimit(merchant.clone(), customer.clone());
+        env.storage().persistent().remove(&key);
+        events::emit_customer_spend_limit_removed(&env, merchant, customer);
+        env.storage().instance().extend_ttl(INSTANCE_LIFETIME_THRESHOLD, INSTANCE_BUMP_AMOUNT);
+    }
+
+    /// Merchant sets a global default spend cap applied to all customers without an individual override.
+    pub fn set_default_spend_limit(
+        env: Env,
+        merchant: Address,
+        amount: i128,
+        window_seconds: u64,
+    ) {
+        Self::require_not_paused(&env);
+        merchant.require_auth();
+        if amount <= 0 {
+            panic!("Spend limit amount must be positive");
+        }
+        if window_seconds == 0 {
+            panic!("Window seconds must be positive");
+        }
+        let key = DataKey::DefaultSpendLimit(merchant.clone());
+        let limit = SpendLimit { amount, window_seconds };
+        env.storage().persistent().set(&key, &limit);
+        env.storage().persistent().extend_ttl(&key, PERSISTENT_LIFETIME_THRESHOLD, PERSISTENT_BUMP_AMOUNT);
+        events::emit_default_spend_limit_set(&env, merchant, amount, window_seconds);
+        env.storage().instance().extend_ttl(INSTANCE_LIFETIME_THRESHOLD, INSTANCE_BUMP_AMOUNT);
+    }
+
+    /// Get the per-customer spend limit for a merchant+customer pair.
+    pub fn get_customer_spend_limit(env: Env, merchant: Address, customer: Address) -> Option<SpendLimit> {
+        env.storage().persistent().get(&DataKey::CustomerSpendLimit(merchant, customer))
+    }
+
+    /// Get the default spend limit for a merchant.
+    pub fn get_default_spend_limit(env: Env, merchant: Address) -> Option<SpendLimit> {
+        env.storage().persistent().get(&DataKey::DefaultSpendLimit(merchant))
+    }
+
+    /// Check and update the customer spend window. Panics with CustomerSpendLimitExceeded if cap would be breached.
+    fn check_and_update_customer_spend_limit(env: &Env, merchant: &Address, customer: &Address, amount: i128) {
+        // Individual override takes priority over default
+        let limit_opt: Option<SpendLimit> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::CustomerSpendLimit(merchant.clone(), customer.clone()))
+            .or_else(|| env.storage().persistent().get(&DataKey::DefaultSpendLimit(merchant.clone())));
+
+        let limit = match limit_opt {
+            Some(l) => l,
+            None => return, // No limit configured
+        };
+
+        let state_key = DataKey::CustomerSpendWindowState(merchant.clone(), customer.clone());
+        let now = env.ledger().timestamp();
+
+        let mut state: CustomerSpendWindow = env
+            .storage()
+            .persistent()
+            .get(&state_key)
+            .unwrap_or(CustomerSpendWindow { window_start: now, spent: 0 });
+
+        // Reset window if expired
+        if now >= state.window_start + limit.window_seconds {
+            state = CustomerSpendWindow { window_start: now, spent: 0 };
+        }
+
+        let new_total = state.spent.checked_add(amount).expect("Spend overflow");
+        if new_total > limit.amount {
+            events::emit_customer_spend_limit_exceeded(env, merchant.clone(), customer.clone(), new_total, limit.amount);
+            panic_with_error!(env, Error::CustomerSpendLimitExceeded);
+        }
+
+        state.spent = new_total;
+        env.storage().persistent().set(&state_key, &state);
+        env.storage().persistent().extend_ttl(&state_key, PERSISTENT_LIFETIME_THRESHOLD, PERSISTENT_BUMP_AMOUNT);
+        token: Address,
+        interval_seconds: u64,
+        max_cycles: u32,
+        reference_hash: Option<BytesN<32>>,
+    ) -> u32 {
+        Self::require_not_paused(&env);
+        merchant.require_auth();
+
+        if amount <= 0 {
+            panic!("Amount must be positive");
+        }
+        if interval_seconds == 0 {
+            panic!("Interval must be positive");
+        }
+
+        Self::require_token_allowed(&env, &token);
+        Self::require_merchant_approved(&env, &merchant);
+
+        let mut counter: u32 = env
+            .storage()
+            .instance()
+            .get(&DataKey::RecurringInvoiceCounter)
+            .unwrap_or(0);
+        let invoice_id = counter;
+        counter += 1;
+        env.storage()
+            .instance()
+            .set(&DataKey::RecurringInvoiceCounter, &counter);
+
+        let now = env.ledger().timestamp();
+        let invoice = RecurringInvoice {
+            id: invoice_id,
+            merchant: merchant.clone(),
+            customer: customer.clone(),
+            amount,
+            token,
+            interval_seconds,
+            max_cycles,
+            cycles_triggered: 0,
+            next_due_at: now,
+            reference_hash,
+            active: true,
+        };
+
+        env.storage()
+            .persistent()
+            .set(&DataKey::RecurringInvoice(invoice_id), &invoice);
+        env.storage().persistent().extend_ttl(
+            &DataKey::RecurringInvoice(invoice_id),
+            PERSISTENT_LIFETIME_THRESHOLD,
+            PERSISTENT_BUMP_AMOUNT,
+        );
+
+        events::emit_recurring_invoice_created(&env, invoice_id, merchant, customer, amount);
+
+        env.storage()
+            .instance()
+            .extend_ttl(INSTANCE_LIFETIME_THRESHOLD, INSTANCE_BUMP_AMOUNT);
+
+        invoice_id
+    }
+
+    /// Trigger the next invoice cycle, creating a standard Payment entry.
+    /// Callable by anyone (merchant, keeper, etc.) when the interval has elapsed.
+    /// Returns the new payment_id.
+    pub fn trigger_invoice_cycle(env: Env, invoice_id: u32) -> u32 {
+        Self::require_not_paused(&env);
+
+        let mut invoice: RecurringInvoice = env
+            .storage()
+            .persistent()
+            .get(&DataKey::RecurringInvoice(invoice_id))
+            .expect("Recurring invoice not found");
+
+        if !invoice.active {
+            panic!("Recurring invoice is cancelled");
+        }
+
+        let now = env.ledger().timestamp();
+        if now < invoice.next_due_at {
+            panic!("Invoice interval has not elapsed");
+        }
+
+        if invoice.max_cycles > 0 && invoice.cycles_triggered >= invoice.max_cycles {
+            panic!("Max cycles reached");
+        }
+
+        // Create a standard Payment entry (funds transferred from customer)
+        let payment_id = Self::create_payment_with_options(
+            env.clone(),
+            invoice.customer.clone(),
+            invoice.merchant.clone(),
+            invoice.amount,
+            invoice.token.clone(),
+            None,
+            None,
+            None,
+            None,
+            None,
+        );
+
+        invoice.cycles_triggered += 1;
+        invoice.next_due_at = now + invoice.interval_seconds;
+
+        // Auto-complete if max_cycles reached
+        if invoice.max_cycles > 0 && invoice.cycles_triggered >= invoice.max_cycles {
+            invoice.active = false;
+            events::emit_recurring_invoice_completed(&env, invoice_id);
+        }
+
+        env.storage()
+            .persistent()
+            .set(&DataKey::RecurringInvoice(invoice_id), &invoice);
+        env.storage().persistent().extend_ttl(
+            &DataKey::RecurringInvoice(invoice_id),
+            PERSISTENT_LIFETIME_THRESHOLD,
+            PERSISTENT_BUMP_AMOUNT,
+        );
+
+        events::emit_points_redeemed(&env, customer, payment_id, actual_points_used, actual_discount);
+        env.storage().instance().extend_ttl(INSTANCE_LIFETIME_THRESHOLD, INSTANCE_BUMP_AMOUNT);
+    }
+
+    /// Returns the loyalty points balance for a customer (after expiry check).
+    pub fn get_loyalty_balance(env: Env, customer: Address) -> i128 {
+        Self::maybe_expire_points(&env, &customer);
+        env.storage()
+            .persistent()
+            .get(&DataKey::LoyaltyBalance(customer))
+            .unwrap_or(0)
+    }
+
+    /// Internal: mint points to customer after a completed payment.
+    fn accrue_loyalty_points(env: &Env, payment_id: u32, customer: &Address, payment_amount: i128) {
+        let points_per_unit: u32 = match env
+            .storage()
+            .instance()
+            .get(&DataKey::LoyaltyPointsPerUnit)
+        {
+            Some(v) => v,
+            None => return, // loyalty not configured
+        };
+        if points_per_unit == 0 {
+            return;
+        }
+
+        // Expire stale points before accruing
+        Self::maybe_expire_points(env, customer);
+
+        let points_earned = payment_amount * points_per_unit as i128 / 1_000_000;
+        if points_earned <= 0 {
+            return;
+        }
+
+        let old_balance: i128 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::LoyaltyBalance(customer.clone()))
+            .unwrap_or(0);
+        let new_balance = old_balance + points_earned;
+
+        env.storage().persistent().set(&DataKey::LoyaltyBalance(customer.clone()), &new_balance);
+        env.storage().persistent().extend_ttl(
+            &DataKey::LoyaltyBalance(customer.clone()),
+            PERSISTENT_LIFETIME_THRESHOLD,
+            PERSISTENT_BUMP_AMOUNT,
+        );
+        env.storage().persistent().set(
+            &DataKey::LoyaltyLastAccrualLedger(customer.clone()),
+            &env.ledger().sequence(),
+        );
+        env.storage().persistent().extend_ttl(
+            &DataKey::LoyaltyLastAccrualLedger(customer.clone()),
+        events::emit_invoice_cycle_triggered(&env, invoice_id, payment_id, invoice.cycles_triggered);
+
+        env.storage()
+            .instance()
+            .extend_ttl(INSTANCE_LIFETIME_THRESHOLD, INSTANCE_BUMP_AMOUNT);
+
+        payment_id
+    }
+
+    /// Cancel a recurring invoice. Callable by merchant or customer.
+    pub fn cancel_recurring_invoice(env: Env, caller: Address, invoice_id: u32) {
+        Self::require_not_paused(&env);
+        caller.require_auth();
+
+        let mut invoice: RecurringInvoice = env
+            .storage()
+            .persistent()
+            .get(&DataKey::RecurringInvoice(invoice_id))
+            .expect("Recurring invoice not found");
+
+        if caller != invoice.merchant && caller != invoice.customer {
+            panic!("Only merchant or customer can cancel");
+        }
+
+        if !invoice.active {
+            panic!("Recurring invoice is already cancelled");
+        }
+
+        invoice.active = false;
+        env.storage()
+            .persistent()
+            .set(&DataKey::RecurringInvoice(invoice_id), &invoice);
+        env.storage().persistent().extend_ttl(
+            &DataKey::RecurringInvoice(invoice_id),
+            PERSISTENT_LIFETIME_THRESHOLD,
+            PERSISTENT_BUMP_AMOUNT,
+        );
+
+        events::emit_points_accrued(env, customer.clone(), payment_id, points_earned, new_balance);
+    }
+
+    /// Internal: burn expired points if expiry window has passed.
+    fn maybe_expire_points(env: &Env, customer: &Address) {
+        let expiry_ledgers: u32 = env
+            .storage()
+            .instance()
+            .get(&DataKey::LoyaltyExpiryLedgers)
+            .unwrap_or(0);
+        if expiry_ledgers == 0 {
+            return;
+        }
+        let last_accrual: u32 = match env
+            .storage()
+            .persistent()
+            .get(&DataKey::LoyaltyLastAccrualLedger(customer.clone()))
+        {
+            Some(v) => v,
+            None => return,
+        };
+        let current = env.ledger().sequence();
+        if current >= last_accrual + expiry_ledgers {
+            let balance: i128 = env
+                .storage()
+                .persistent()
+                .get(&DataKey::LoyaltyBalance(customer.clone()))
+                .unwrap_or(0);
+            if balance > 0 {
+                env.storage().persistent().set(&DataKey::LoyaltyBalance(customer.clone()), &0i128);
+                events::emit_points_expired(env, customer.clone(), balance);
+            }
+        }
+        events::emit_recurring_invoice_cancelled(&env, invoice_id, caller);
+
+        env.storage()
+            .instance()
+            .extend_ttl(INSTANCE_LIFETIME_THRESHOLD, INSTANCE_BUMP_AMOUNT);
+    }
+
+    /// Get a recurring invoice by ID.
+    pub fn get_recurring_invoice(env: Env, invoice_id: u32) -> RecurringInvoice {
+        env.storage()
+            .persistent()
+            .get(&DataKey::RecurringInvoice(invoice_id))
+            .expect("Recurring invoice not found")
+    }
+
 }
 
-#[cfg(test)]
-mod test;
+    /// Admin sets global referral terms.
+    pub fn set_referral_config(env: Env, admin: Address, commission_bps: u32, window_ledgers: u32) {
+        Self::require_not_paused(&env);
+        admin.require_auth();
+        let stored_admin: Address = env.storage().instance().get(&DataKey::Admin).expect("Not initialized");
+        if admin != stored_admin { panic!("Only admin can set referral config"); }
+        env.storage().instance().set(&DataKey::ReferralCommissionBps, &commission_bps);
+        env.storage().instance().set(&DataKey::ReferralWindowLedgers, &window_ledgers);
+        env.storage().instance().extend_ttl(INSTANCE_LIFETIME_THRESHOLD, INSTANCE_BUMP_AMOUNT);
+    }
+
+    /// Existing merchant registers a referral for a new merchant.
+    /// Fails if the referred address already has a merchant record.
+    pub fn register_referral(env: Env, referrer: Address, referred_merchant: Address) {
+        Self::require_not_paused(&env);
+        referrer.require_auth();
+
+        // Referrer must be an approved merchant
+        let referrer_approved: bool = env.storage().persistent().get(&DataKey::MerchantApproved(referrer.clone())).unwrap_or(false);
+        if !referrer_approved { panic!("Referrer is not an approved merchant"); }
+
+        // Referred must not already have a merchant record
+        let already_exists: bool = env.storage().persistent().get(&DataKey::MerchantApproved(referred_merchant.clone())).unwrap_or(false);
+        if already_exists { panic_with_error!(&env, Error::ReferralAlreadyExists); }
+
+        let window_ledgers: u32 = env.storage().instance().get(&DataKey::ReferralWindowLedgers).unwrap_or(0);
+        let record = ReferralRecord {
+            referrer: referrer.clone(),
+            registered_at_ledger: env.ledger().sequence(),
+            window_ledgers,
+        };
+        let key = DataKey::ReferralRecord(referred_merchant.clone());
+        env.storage().persistent().set(&key, &record);
+        env.storage().persistent().extend_ttl(&key, PERSISTENT_LIFETIME_THRESHOLD, PERSISTENT_BUMP_AMOUNT);
+
+        events::emit_referral_registered(&env, referrer, referred_merchant);
+        env.storage().instance().extend_ttl(INSTANCE_LIFETIME_THRESHOLD, INSTANCE_BUMP_AMOUNT);
+    }
+
+    /// Referrer withdraws accumulated commission to their address.
+    pub fn claim_referral_commission(env: Env, referrer: Address, token: Address) {
+        Self::require_not_paused(&env);
+        referrer.require_auth();
+
+        let key = DataKey::PendingCommission(referrer.clone());
+        let pending: i128 = env.storage().persistent().get(&key).unwrap_or(0);
+        if pending <= 0 { panic_with_error!(&env, Error::NoCommissionToClaim); }
+
+        env.storage().persistent().set(&key, &0i128);
+        env.storage().persistent().extend_ttl(&key, PERSISTENT_LIFETIME_THRESHOLD, PERSISTENT_BUMP_AMOUNT);
+
+        let token_client = token::Client::new(&env, &token);
+        token_client.transfer(&env.current_contract_address(), &referrer, &pending);
+
+        events::emit_commission_claimed(&env, referrer, pending);
+        env.storage().instance().extend_ttl(INSTANCE_LIFETIME_THRESHOLD, INSTANCE_BUMP_AMOUNT);
+    }
+
+    /// Get pending commission balance for a referrer.
+    pub fn get_pending_commission(env: Env, referrer: Address) -> i128 {
+        env.storage().persistent().get(&DataKey::PendingCommission(referrer)).unwrap_or(0)
+    }
+
+    /// Get the referral record for a referred merchant.
+    pub fn get_referral_record(env: Env, referred_merchant: Address) -> Option<ReferralRecord> {
+        env.storage().persistent().get(&DataKey::ReferralRecord(referred_merchant))
+    }
+
+    /// Internal: accrue referral commission when a referred merchant's payment is finalized.
+    fn accrue_referral_commission(env: &Env, merchant: &Address, payment_id: u32, fee_amount: i128) {
+        if fee_amount <= 0 { return; }
+
+        let record_opt: Option<ReferralRecord> = env.storage().persistent().get(&DataKey::ReferralRecord(merchant.clone()));
+        let record = match record_opt {
+            Some(r) => r,
+            None => return,
+        };
+
+        // Check window has not expired
+        let current_ledger = env.ledger().sequence();
+        if record.window_ledgers > 0 && current_ledger > record.registered_at_ledger.saturating_add(record.window_ledgers) {
+            return;
+        }
+
+        let commission_bps: u32 = env.storage().instance().get(&DataKey::ReferralCommissionBps).unwrap_or(0);
+        if commission_bps == 0 { return; }
+
+        let commission = (fee_amount * commission_bps as i128) / 10_000;
+        if commission <= 0 { return; }
+
+        let pending_key = DataKey::PendingCommission(record.referrer.clone());
+        let current: i128 = env.storage().persistent().get(&pending_key).unwrap_or(0);
+        let new_total = current.saturating_add(commission);
+        env.storage().persistent().set(&pending_key, &new_total);
+        env.storage().persistent().extend_ttl(&pending_key, PERSISTENT_LIFETIME_THRESHOLD, PERSISTENT_BUMP_AMOUNT);
+
+        events::emit_commission_accrued(env, record.referrer, merchant.clone(), payment_id, commission);
+    }
+
+}
 
 #[cfg(test)]
 mod test_token_whitelist;
@@ -5384,5 +6415,11 @@ mod test_external_id_multisig_voucher;
 
 #[cfg(test)]
 mod test_merchant_ban;
+
+#[cfg(test)]
+mod test_loyalty_points;
+mod test_referral;
+mod test_dynamic_settlement;
+mod test_spending_limit;
 
 pub use events::*;

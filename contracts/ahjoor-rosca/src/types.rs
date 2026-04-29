@@ -248,6 +248,22 @@ pub enum DataKey2 {
     ReinstatementFee,        // i128
     PendingReinstatementFee, // Vec<Address>
     ActiveReinstatementProposal, // Map<Address, u32>
+    // Waitlist (#219)
+    Waitlist,                // Vec<(Address, u64)> — (address, joined_at)
+    CatchUpDebt,             // Map<Address, i128> — catch-up contributions owed
+    // #230: Group Merge
+    MergeProposalCounter,    // u32
+    MergeProposals,          // Map<u32, MergeProposal>
+    GroupMergedInto,         // u32 — target group_id this group was merged into
+    // #224: Cycle Completion Bonus
+    CycleBonusAmount,        // i128 — bonus per qualifying member per cycle
+    // #227: Round Duration Update
+    PendingRoundDuration,    // u64 — new duration to apply at next round start
+    MinRoundDuration,        // u64 — lower bound for round duration
+    MaxRoundDuration,        // u64 — upper bound for round duration
+    // Waitlist
+    Waitlist,                // Vec<(Address, u64)> — (address, joined_at)
+    CatchUpDebt,             // Map<Address, i128> — catch-up contributions owed
     StartAt,                 // u64
     GroupActivationEmitted,  // bool
     Waitlist,                // Vec<(Address, u64)>
@@ -255,6 +271,12 @@ pub enum DataKey2 {
     GracePeriodLedgers,      // u32
     PendingPenalties,        // Map<Address, u32> (member -> round)
     LastRoundDeadline,       // u64
+    // #240: Co-Signer Guarantee
+    CoSigners,               // Map<Address, CoSignerRecord> — member → co-signer record
+    CoSignerWindowLedgers,   // u32 — grace period ledgers before penalty applied
+    CoSignerWindowStart,     // Map<Address, u32> — member → ledger when window opened
+    // #236: Group Activity Freeze
+    IsFrozen,                // bool — group is frozen by contract-level admin
 }
 
 /// Persistent storage keys — kept separate because DataKey was hitting
@@ -264,6 +286,54 @@ pub enum DataKey2 {
 pub enum PersistentKey {
     RoundHistory, // Vec<PayoutRecord> — grows every round
     ReputationScores, // Map<Address, i128> — cumulative member reliability score
+    FreezeLog,    // Vec<FreezeRecord> — append-only freeze audit log
+}
+
+/// Record of a single freeze/unfreeze cycle for a group.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct FreezeRecord {
+    pub frozen_at_ledger: u32,
+    pub frozen_by: Address,
+    pub reason_hash: BytesN<32>,
+    pub unfrozen_at_ledger: Option<u32>,
+    pub resolution_hash: Option<BytesN<32>>,
+    /// Append-only snapshot log (#243)
+    SnapshotLog,  // Vec<GroupSnapshot>
+    /// Last snapshot ledger for spam guard (#243)
+    LastSnapshotLedger, // u32
+    /// Min interval between snapshots in ledgers (#243)
+    MinSnapshotIntervalLedgers, // u32
+}
+
+/// On-chain group state snapshot for immutable audit (#243).
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct GroupSnapshot {
+    pub snapshot_id: u32,
+    pub taken_at_ledger: u32,
+    pub taken_by: Address,
+    pub round_number: u32,
+    pub pooled_balance: i128,
+    pub member_statuses: Vec<MemberStatus>,
+    pub payout_order: Vec<Address>,
+    pub state_hash: BytesN<32>,
+}
+
+// #240: Co-Signer Guarantee
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[contracttype]
+pub enum CoSignerStatus {
+    Pending = 0,   // set by member, not yet accepted
+    Active = 1,    // accepted by co-signer
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CoSignerRecord {
+    pub co_signer: Address,
+    pub status: CoSignerStatus,
 }
 
 // ── Audit Trail ────────────────────────────────────────────────────────────────
@@ -320,6 +390,8 @@ pub struct EmergencyPayoutConfig {
 pub enum GroupStatus {
     Active = 0,
     Dissolved = 1,
+    /// Group was merged into another group; all further interactions are rejected.
+    Merged = 2,
 }
 
 #[contracttype]
@@ -327,6 +399,17 @@ pub enum GroupStatus {
 pub struct DissolutionConfig {
     pub dissolution_quorum_bps: u32,    // e.g., 7500 = 75%
     pub vote_window_seconds: u64,
+}
+
+/// #230: Merge proposal between two ROSCA groups.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MergeProposal {
+    pub id: u32,
+    pub group_a_admin: Address,
+    pub group_b_id: u32,
+    pub proposed_at: u64,
+    pub accepted: bool,
 }
 
 // #213: Payout Slot Swap

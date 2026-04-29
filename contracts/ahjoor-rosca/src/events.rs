@@ -1123,3 +1123,136 @@ pub fn emit_reinstatement_fee_collected(e: &Env, member: Address, amount: i128) 
 }
 
 
+// #230: Group Merge Events
+pub fn emit_merge_proposed(e: &Env, proposal_id: u32, group_a_admin: Address, group_b_id: u32) {
+    e.events().publish((Symbol::new(e, "MergeProposed"),), (proposal_id, group_a_admin, group_b_id));
+}
+pub fn emit_merge_accepted(e: &Env, proposal_id: u32) {
+    e.events().publish((Symbol::new(e, "MergeAccepted"),), (proposal_id,));
+}
+pub fn emit_merge_completed(e: &Env, proposal_id: u32, members_added: u32) {
+    e.events().publish((Symbol::new(e, "MergeCompleted"),), (proposal_id, members_added));
+}
+pub fn emit_group_marked_merged(e: &Env, group_b_id: u32) {
+    e.events().publish((Symbol::new(e, "GroupMerged"),), (group_b_id,));
+// #224: Cycle Completion Bonus Events
+
+/// Event: Cycle bonus amount configured by admin
+#[contractevent]
+#[derive(Clone, Debug)]
+pub struct CycleBonusConfigured {
+    pub amount: i128,
+}
+
+/// Event: Cycle bonus paid to a qualifying member
+#[contractevent]
+#[derive(Clone, Debug)]
+pub struct CycleBonusPaid {
+    pub member: Address,
+    pub amount: i128,
+    pub cycle: u32,
+}
+
+/// Event: Cycle bonus prorated due to insufficient reward pool
+#[contractevent]
+#[derive(Clone, Debug)]
+pub struct CycleBonusProrated {
+    pub cycle: u32,
+    pub shortfall: i128,
+}
+
+pub fn emit_cycle_bonus_configured(e: &Env, amount: i128) {
+    CycleBonusConfigured { amount }.publish(e);
+}
+
+pub fn emit_cycle_bonus_paid(e: &Env, member: Address, amount: i128, cycle: u32) {
+    CycleBonusPaid { member, amount, cycle }.publish(e);
+}
+
+pub fn emit_cycle_bonus_prorated(e: &Env, cycle: u32, shortfall: i128) {
+    CycleBonusProrated { cycle, shortfall }.publish(e);
+}
+
+// #227: Round Duration Update Events
+
+/// Event: Round duration update scheduled (pending, takes effect next round)
+#[contractevent]
+#[derive(Clone, Debug)]
+pub struct RoundDurationUpdateScheduled {
+    pub old_duration: u64,
+    pub new_duration: u64,
+    pub effective_from_round: u32,
+}
+
+/// Event: Pending round duration applied at round start
+#[contractevent]
+#[derive(Clone, Debug)]
+pub struct RoundDurationApplied {
+    pub round: u32,
+    pub duration: u64,
+}
+
+pub fn emit_round_duration_update_scheduled(e: &Env, old_duration: u64, new_duration: u64, effective_from_round: u32) {
+    RoundDurationUpdateScheduled { old_duration, new_duration, effective_from_round }.publish(e);
+}
+
+pub fn emit_round_duration_applied(e: &Env, round: u32, duration: u64) {
+    RoundDurationApplied { round, duration }.publish(e);
+}
+
+// #240: Co-Signer Guarantee Events
+
+pub fn emit_co_signer_set(e: &Env, group_id: u32, member: Address, co_signer: Address) {
+    e.events().publish((soroban_sdk::Symbol::new(e, "CoSignerSet"),), (group_id, member, co_signer));
+}
+
+pub fn emit_co_signer_accepted(e: &Env, group_id: u32, member: Address, co_signer: Address) {
+    e.events().publish((soroban_sdk::Symbol::new(e, "CoSignerAccepted"),), (group_id, member, co_signer));
+}
+
+pub fn emit_co_signer_contributed(e: &Env, group_id: u32, member: Address, co_signer: Address, amount: i128) {
+    e.events().publish((soroban_sdk::Symbol::new(e, "CoSignerContributed"),), (group_id, member, co_signer, amount));
+}
+
+pub fn emit_co_signer_window_expired(e: &Env, group_id: u32, member: Address) {
+    e.events().publish((soroban_sdk::Symbol::new(e, "CoSignerWinExpired"),), (group_id, member));
+// #236: Group Activity Freeze Events
+
+/// Event: Group frozen by contract-level admin
+#[contractevent]
+#[derive(Clone, Debug)]
+pub struct GroupFrozen {
+    pub group_id: u32,
+    pub reason_hash: BytesN<32>,
+    pub frozen_at: u32,
+}
+
+/// Event: Group unfrozen by contract-level admin
+#[contractevent]
+#[derive(Clone, Debug)]
+pub struct GroupUnfrozen {
+    pub group_id: u32,
+    pub resolution_hash: BytesN<32>,
+    pub unfrozen_at: u32,
+}
+
+pub fn emit_group_frozen(e: &Env, group_id: u32, reason_hash: BytesN<32>, frozen_at: u32) {
+    GroupFrozen { group_id, reason_hash, frozen_at }.publish(e);
+}
+
+pub fn emit_group_unfrozen(e: &Env, group_id: u32, resolution_hash: BytesN<32>, unfrozen_at: u32) {
+    GroupUnfrozen { group_id, resolution_hash, unfrozen_at }.publish(e);
+// #243: Group State Snapshot Events
+
+/// Event: Group state snapshot taken
+#[contractevent]
+#[derive(Clone, Debug)]
+pub struct SnapshotTaken {
+    pub snapshot_id: u32,
+    pub taken_by: Address,
+    pub state_hash: BytesN<32>,
+}
+
+pub fn emit_snapshot_taken(e: &Env, snapshot_id: u32, taken_by: Address, state_hash: BytesN<32>) {
+    SnapshotTaken { snapshot_id, taken_by, state_hash }.publish(e);
+}

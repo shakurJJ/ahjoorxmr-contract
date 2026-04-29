@@ -773,3 +773,112 @@ pub fn emit_timelocked_funds_claimed(e: &Env, escrow_id: u32, beneficiary: Addre
 pub fn emit_timelocked_escrow_cancelled(e: &Env, escrow_id: u32, buyer: Address) {
     e.events().publish((Symbol::new(e, "TLEscrowCancelled"),), (escrow_id, buyer));
 }
+
+// #229: Mutual Cancellation events
+pub fn emit_cancellation_requested(e: &Env, escrow_id: u32, initiator: Address, expires_at: u64) {
+    e.events().publish((Symbol::new(e, "CancelRequested"),), (escrow_id, initiator, expires_at));
+}
+pub fn emit_cancellation_accepted(e: &Env, escrow_id: u32, buyer: Address, amount_returned: i128, penalty: i128) {
+    e.events().publish((Symbol::new(e, "CancelAccepted"),), (escrow_id, buyer, amount_returned, penalty));
+}
+pub fn emit_cancellation_rejected(e: &Env, escrow_id: u32, rejector: Address) {
+    e.events().publish((Symbol::new(e, "CancelRejected"),), (escrow_id, rejector));
+}
+pub fn emit_cancellation_expired(e: &Env, escrow_id: u32) {
+    e.events().publish((Symbol::new(e, "CancelExpired"),), (escrow_id,));
+// #225: Escrow Top-Up Event
+
+/// Event: Buyer topped up an active escrow with additional funds
+#[contractevent]
+#[derive(Clone, Debug)]
+pub struct EscrowToppedUp {
+    pub escrow_id: u32,
+    pub added_amount: i128,
+    pub new_total: i128,
+    pub buyer: Address,
+}
+
+pub fn emit_escrow_topped_up(e: &Env, escrow_id: u32, added_amount: i128, new_total: i128, buyer: Address) {
+    EscrowToppedUp { escrow_id, added_amount, new_total, buyer }.publish(e);
+}
+
+// #244: Seller Role Transfer Veto Events
+
+pub fn emit_seller_transfer_proposed(e: &Env, escrow_id: u32, original_seller: Address, new_seller: Address, veto_deadline: u32) {
+    e.events().publish(
+        (soroban_sdk::Symbol::new(e, "SellerTransferProposed"),),
+        (escrow_id, original_seller, new_seller, veto_deadline),
+    );
+}
+
+pub fn emit_seller_transfer_vetoed(e: &Env, escrow_id: u32, buyer: Address, refund_amount: i128) {
+    e.events().publish(
+        (soroban_sdk::Symbol::new(e, "SellerTransferVetoed"),),
+        (escrow_id, buyer, refund_amount),
+    );
+}
+
+pub fn emit_seller_transfer_approved(e: &Env, escrow_id: u32, new_seller: Address) {
+    e.events().publish(
+        (soroban_sdk::Symbol::new(e, "SellerTransferApproved"),),
+        (escrow_id, new_seller),
+    );
+}
+
+pub fn emit_seller_transfer_expired_approved(e: &Env, escrow_id: u32, new_seller: Address) {
+    e.events().publish(
+        (soroban_sdk::Symbol::new(e, "SellerTransferExpired"),),
+        (escrow_id, new_seller),
+    );
+// --- Issue #146: Post-Resolution Rating System ---
+
+/// Event: Rating submitted after escrow completion
+#[contractevent]
+#[derive(Clone, Debug)]
+pub struct RatingSubmitted {
+    pub escrow_id: u32,
+    pub rater: Address,
+    pub ratee: Address,
+    pub rating: u32,
+    pub comment_hash: Option<BytesN<32>>,
+}
+
+pub fn emit_rating_submitted(
+    e: &Env,
+    escrow_id: u32,
+    rater: Address,
+    ratee: Address,
+    rating: u32,
+    comment_hash: Option<BytesN<32>>,
+) {
+    RatingSubmitted {
+        escrow_id,
+        rater,
+        ratee,
+        rating,
+        comment_hash,
+    }
+    .publish(e);
+}
+
+// --- Issue #219: Multi-Party Split Release ---
+
+/// Event: Multi-seller escrow created with explicit payee list and shares
+#[contractevent]
+#[derive(Clone, Debug)]
+pub struct MultiSellerEscrowCreated {
+    pub escrow_id: u32,
+    pub sellers_count: u32,
+}
+
+pub fn emit_multi_seller_escrow_created(
+    e: &Env,
+    escrow_id: u32,
+    sellers: soroban_sdk::Vec<(Address, u32)>,
+) {
+    MultiSellerEscrowCreated {
+        escrow_id,
+        sellers_count: sellers.len(),
+    }
+    .publish(e);
+}

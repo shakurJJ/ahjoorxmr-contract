@@ -71,6 +71,36 @@ pub enum Error {
     InsufficientApprovals = 49,
     /// Not a co-admin.
     NotACoAdmin = 50,
+    /// Emergency payout already requested for this member in this cycle.
+    EmergencyPayoutAlreadyRequested = 51,
+    /// Emergency payout quorum not met.
+    EmergencyPayoutQuorumNotMet = 52,
+    /// Emergency payout vote window expired.
+    EmergencyPayoutVoteExpired = 53,
+    /// Emergency payout already executed for this member in this cycle.
+    EmergencyPayoutAlreadyExecuted = 54,
+    /// Maximum emergency payouts per cycle reached.
+    EmergencyPayoutLimitReached = 55,
+    /// Group is already dissolved.
+    GroupAlreadyDissolved = 56,
+    /// Dissolution vote already in progress.
+    DissolutionVoteInProgress = 57,
+    /// Dissolution quorum not met.
+    DissolutionQuorumNotMet = 58,
+    /// Dissolution vote window expired.
+    DissolutionVoteExpired = 59,
+    /// No funds to distribute during dissolution.
+    NoFundsToDistribute = 60,
+    /// Invalid emergency payout configuration.
+    InvalidEmergencyConfig = 61,
+    /// Invalid dissolution configuration.
+    InvalidDissolutionConfig = 62,
+    /// Only admin is allowed to perform this action.
+    OnlyAdminAllowed = 63,
+    /// Invalid amount provided.
+    InvalidAmount = 64,
+    /// Round duration is out of the configured bounds.
+    RoundDurationOutOfBounds = 65,
 }
 
 /// Extension error codes 51-56 — split from Error because #[contracterror]
@@ -120,4 +150,22 @@ pub enum ExtError {
     InvalidDissolutionConfig = 68,
     /// Group start time is in the future.
     GroupNotYetActive = 69,
+    /// Co-signer already set for this member.
+    CoSignerAlreadySet = 72,
+    /// No co-signer found for this member.
+    NoCoSignerFound = 73,
+    /// Co-signer has not accepted the designation.
+    CoSignerNotAccepted = 74,
+    /// Not the designated co-signer for this member.
+    NotTheCoSigner = 75,
+    /// Co-signer window has not opened (member has not defaulted).
+    CoSignerWindowNotOpen = 76,
+    /// Co-signer window has expired.
+    CoSignerWindowExpired = 77,
+    /// Group is frozen by contract-level admin pending investigation.
+    GroupFrozen = 72,
+    /// Group is not currently frozen.
+    GroupNotFrozen = 73,
+    /// Snapshot taken too soon; min_snapshot_interval_ledgers not elapsed (#243).
+    SnapshotTooSoon = 72,
 }

@@ -1,4 +1,4 @@
-use crate::{errors::Error, events, audit_trail, ContributionEntry, DataKey, DataKey2, PersistentKey, PayoutRecord, types::{InsuranceClaim, InsuranceCoverageMode}};
+use crate::{errors::{Error, ExtError}, events, audit_trail, ContributionEntry, DataKey, DataKey2, PersistentKey, PayoutRecord, types::{InsuranceClaim, InsuranceCoverageMode}};
 use soroban_sdk::{panic_with_error, token, Address, Env, Map, Vec};
 
 const PERSISTENT_LIFETIME_THRESHOLD: u32 = 100_000;
@@ -14,6 +14,18 @@ pub(crate) fn check_not_paused(env: &Env) {
         .unwrap_or(false);
     if is_paused {
         panic_with_error!(env, Error::ContractPaused);
+    }
+}
+
+/// Panics if the group is currently frozen by the contract-level admin.
+pub(crate) fn check_not_frozen(env: &Env) {
+    let is_frozen: bool = env
+        .storage()
+        .instance()
+        .get(&DataKey2::IsFrozen)
+        .unwrap_or(false);
+    if is_frozen {
+        panic_with_error!(env, ExtError::GroupFrozen);
     }
 }
 
@@ -318,11 +330,18 @@ pub(crate) fn complete_round_payout(env: &Env, _paid_members: &Vec<Address>) {
 /// Advances the round counter, clears paid-members and per-round contributions,
 /// and sets a new deadline.
 pub(crate) fn reset_round_state(env: &Env, current_round: u32) {
-    let duration: u64 = env
-        .storage()
-        .instance()
-        .get(&DataKey::RoundDuration)
-        .unwrap();
+    // #227: Apply pending round duration if one was scheduled
+    let pending_duration: Option<u64> = env.storage().instance().get(&DataKey2::PendingRoundDuration);
+    let duration: u64 = if let Some(pending) = pending_duration {
+        env.storage().instance().set(&DataKey::RoundDuration, &pending);
+        env.storage().instance().remove(&DataKey2::PendingRoundDuration);
+        // Also update RoundDurationSeconds for timestamp-based scheduling
+        env.storage().instance().set(&DataKey::RoundDurationSeconds, &pending);
+        events::emit_round_duration_applied(env, current_round + 1, pending);
+        pending
+    } else {
+        env.storage().instance().get(&DataKey::RoundDuration).unwrap()
+    };
     env.storage()
         .instance()
         .set(&DataKey::CurrentRound, &(current_round + 1));

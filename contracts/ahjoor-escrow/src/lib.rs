@@ -27,6 +27,10 @@ pub enum EscrowStatus {
     PartiallyDisputed = 6,
     /// Arbiter has recorded a verdict; funds held pending cooling-off window.
     CoolingOff = 7,
+    /// Mutual cancellation requested; awaiting counterparty response (#229).
+    CancellationPending = 8,
+    /// Seller has proposed a role transfer; buyer has a veto window (#244).
+    AwaitingBuyerVetoDecision = 9,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -144,6 +148,16 @@ pub struct TimeLockData {
     pub claimed: bool,
 }
 
+/// #229: Mutual cancellation request record.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CancellationRequest {
+    pub initiator: Address,
+    pub reason_hash: BytesN<32>,
+    pub requested_at: u64,
+    pub expires_at: u64,
+}
+
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct DeadlineProposal {
@@ -249,11 +263,39 @@ pub enum DataKey {
     TokenWhitelistContract,
     /// #215: time-lock metadata per escrow
     TimeLockData(u32),
+    /// #229: cancellation request per escrow
+    CancellationRequest(u32),
+    /// #229: admin-configurable cancellation penalty in basis points
+    CancellationPenaltyBps,
+    /// #229: admin-configurable cancellation response window in seconds
+    CancellationResponseWindow,
+    /// #225: max top-up as basis points of original escrow amount (e.g. 5000 = 50%)
+    MaxTopUpBps,
+    /// #225: cumulative top-up amount per escrow
+    EscrowToppedUpAmount(u32),
+    /// #244: seller transfer proposal per escrow
+    SellerTransferProposal(u32),
+    /// #244: admin-configurable veto window in ledgers (default: 100)
+    SellerTransferVetoWindow,
+    /// #146: (ratee) → (total_score: u64, count: u32) for reputation
+    RatingScore(Address),
+    /// #146: (escrow_id, rater) → bool — prevents double-rating
+    RatingSubmitted(u32, Address),
 }
 
 const MAX_PROTOCOL_FEE_BPS: u32 = 200; // 2%
 const MAX_ARBITER_FEE_BPS: u32 = 1_000; // 10%
 const DEFAULT_RESOLUTION_COOLING_OFF_SECONDS: u64 = 24 * 60 * 60; // 24 hours
+const DEFAULT_SELLER_TRANSFER_VETO_WINDOW: u32 = 100; // ledgers
+
+/// #244: Pending seller role transfer proposal.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SellerTransferProposal {
+    pub original_seller: Address,
+    pub new_seller: Address,
+    pub veto_deadline: u32, // ledger sequence
+}
 
 /// Verdict recorded by arbiter during cooling-off period.
 #[contracttype]
@@ -3204,6 +3246,310 @@ impl AhjoorEscrowContract {
             .extend_ttl(INSTANCE_LIFETIME_THRESHOLD, INSTANCE_BUMP_AMOUNT);
     }
 
+    // -------------------------------------------------------------------------
+    // #229: Escrow Mutual Cancellation with Configurable Penalty
+    // -------------------------------------------------------------------------
+
+    /// Admin sets the cancellation penalty in basis points (applied to initiator's share).
+    pub fn set_cancellation_penalty_bps(env: Env, admin: Address, penalty_bps: u32) {
+        Self::require_not_paused(&env);
+        Self::require_or_bootstrap_admin(&env, &admin);
+        if penalty_bps > 10_000 {
+            panic!("Penalty cannot exceed 10000 bps");
+        }
+        env.storage()
+            .instance()
+            .set(&DataKey::CancellationPenaltyBps, &penalty_bps);
+        env.storage()
+            .instance()
+            .extend_ttl(INSTANCE_LIFETIME_THRESHOLD, INSTANCE_BUMP_AMOUNT);
+    }
+
+    /// Admin sets the response window in seconds for cancellation requests.
+    pub fn set_cancellation_response_window(env: Env, admin: Address, window_seconds: u64) {
+        Self::require_not_paused(&env);
+        Self::require_or_bootstrap_admin(&env, &admin);
+        if window_seconds == 0 {
+            panic!("Response window must be positive");
+        }
+        env.storage()
+            .instance()
+            .set(&DataKey::CancellationResponseWindow, &window_seconds);
+        env.storage()
+            .instance()
+            .extend_ttl(INSTANCE_LIFETIME_THRESHOLD, INSTANCE_BUMP_AMOUNT);
+    }
+
+    /// Either party (buyer or seller) requests mutual cancellation of an active escrow.
+    pub fn request_cancellation(env: Env, caller: Address, escrow_id: u32, reason_hash: BytesN<32>) {
+        Self::require_not_paused(&env);
+        caller.require_auth();
+
+        let mut escrow: Escrow = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Escrow(escrow_id))
+            .expect("Escrow not found");
+
+        if !Self::is_open_escrow_status(escrow.status) {
+            panic!("Escrow is not active");
+        }
+
+        if caller != escrow.buyer && caller != escrow.seller {
+            panic!("Only buyer or seller can request cancellation");
+        }
+
+        let window: u64 = env
+            .storage()
+            .instance()
+            .get(&DataKey::CancellationResponseWindow)
+            .unwrap_or(7 * 24 * 60 * 60); // default 7 days
+
+        let now = env.ledger().timestamp();
+        let expires_at = now + window;
+
+        let request = CancellationRequest {
+            initiator: caller.clone(),
+            reason_hash,
+            requested_at: now,
+            expires_at,
+        };
+
+        env.storage()
+            .persistent()
+            .set(&DataKey::CancellationRequest(escrow_id), &request);
+        env.storage().persistent().extend_ttl(
+            &DataKey::CancellationRequest(escrow_id),
+            PERSISTENT_LIFETIME_THRESHOLD,
+            PERSISTENT_BUMP_AMOUNT,
+        );
+
+        escrow.status = EscrowStatus::CancellationPending;
+        env.storage()
+            .persistent()
+            .set(&DataKey::Escrow(escrow_id), &escrow);
+        env.storage().persistent().extend_ttl(
+            &DataKey::Escrow(escrow_id),
+            PERSISTENT_LIFETIME_THRESHOLD,
+            PERSISTENT_BUMP_AMOUNT,
+        );
+
+        events::emit_cancellation_requested(&env, escrow_id, caller, expires_at);
+
+        env.storage()
+            .instance()
+            .extend_ttl(INSTANCE_LIFETIME_THRESHOLD, INSTANCE_BUMP_AMOUNT);
+    }
+
+    /// The counterparty accepts the cancellation request.
+    /// Full escrow amount minus penalty (applied to initiator) is returned to buyer.
+    /// Penalty goes to fee collector.
+    pub fn accept_cancellation(env: Env, caller: Address, escrow_id: u32) {
+        Self::require_not_paused(&env);
+        caller.require_auth();
+
+        let mut escrow: Escrow = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Escrow(escrow_id))
+            .expect("Escrow not found");
+
+        if escrow.status != EscrowStatus::CancellationPending {
+            panic!("No pending cancellation for this escrow");
+        }
+
+        let request: CancellationRequest = env
+            .storage()
+            .persistent()
+            .get(&DataKey::CancellationRequest(escrow_id))
+            .expect("Cancellation request not found");
+
+        let now = env.ledger().timestamp();
+
+        // Check if request has expired — auto-restore Active
+        if now > request.expires_at {
+            escrow.status = EscrowStatus::Active;
+            env.storage()
+                .persistent()
+                .set(&DataKey::Escrow(escrow_id), &escrow);
+            env.storage().persistent().extend_ttl(
+                &DataKey::Escrow(escrow_id),
+                PERSISTENT_LIFETIME_THRESHOLD,
+                PERSISTENT_BUMP_AMOUNT,
+            );
+            env.storage()
+                .persistent()
+                .remove(&DataKey::CancellationRequest(escrow_id));
+            events::emit_cancellation_expired(&env, escrow_id);
+            return;
+        }
+
+        // Caller must be the counterparty (not the initiator)
+        if caller == request.initiator {
+            panic!("Initiator cannot accept their own cancellation request");
+        }
+        if caller != escrow.buyer && caller != escrow.seller {
+            panic!("Only buyer or seller can accept cancellation");
+        }
+
+        let penalty_bps: u32 = env
+            .storage()
+            .instance()
+            .get(&DataKey::CancellationPenaltyBps)
+            .unwrap_or(0);
+
+        let penalty_amount = if penalty_bps > 0 {
+            (escrow.amount as u128 * penalty_bps as u128 / 10_000) as i128
+        } else {
+            0
+        };
+
+        let return_amount = escrow.amount - penalty_amount;
+
+        let token_client = token::Client::new(&env, &escrow.token);
+
+        // Return funds to buyer
+        if return_amount > 0 {
+            token_client.transfer(
+                &env.current_contract_address(),
+                &escrow.buyer,
+                &return_amount,
+            );
+        }
+
+        // Send penalty to fee collector if configured
+        if penalty_amount > 0 {
+            if let Some(fee_recipient) = env
+                .storage()
+                .instance()
+                .get::<DataKey, Address>(&DataKey::FeeRecipient)
+            {
+                token_client.transfer(
+                    &env.current_contract_address(),
+                    &fee_recipient,
+                    &penalty_amount,
+                );
+            } else {
+                // No fee recipient — return penalty to buyer too
+                token_client.transfer(
+                    &env.current_contract_address(),
+                    &escrow.buyer,
+                    &penalty_amount,
+                );
+            }
+        }
+
+        escrow.status = EscrowStatus::Refunded;
+        env.storage()
+            .persistent()
+            .set(&DataKey::Escrow(escrow_id), &escrow);
+        env.storage().persistent().extend_ttl(
+            &DataKey::Escrow(escrow_id),
+            PERSISTENT_LIFETIME_THRESHOLD,
+            PERSISTENT_BUMP_AMOUNT,
+        );
+        env.storage()
+            .persistent()
+            .remove(&DataKey::CancellationRequest(escrow_id));
+
+        events::emit_cancellation_accepted(&env, escrow_id, escrow.buyer, return_amount, penalty_amount);
+
+        env.storage()
+            .instance()
+            .extend_ttl(INSTANCE_LIFETIME_THRESHOLD, INSTANCE_BUMP_AMOUNT);
+    }
+
+    /// The counterparty rejects the cancellation request; escrow resumes Active state.
+    pub fn reject_cancellation(env: Env, caller: Address, escrow_id: u32) {
+        Self::require_not_paused(&env);
+        caller.require_auth();
+
+        let mut escrow: Escrow = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Escrow(escrow_id))
+            .expect("Escrow not found");
+
+        if escrow.status != EscrowStatus::CancellationPending {
+            panic!("No pending cancellation for this escrow");
+        }
+
+        let request: CancellationRequest = env
+            .storage()
+            .persistent()
+            .get(&DataKey::CancellationRequest(escrow_id))
+            .expect("Cancellation request not found");
+
+        if caller == request.initiator {
+            panic!("Initiator cannot reject their own cancellation request");
+        }
+        if caller != escrow.buyer && caller != escrow.seller {
+            panic!("Only buyer or seller can reject cancellation");
+        }
+
+        escrow.status = EscrowStatus::Active;
+        env.storage()
+            .persistent()
+            .set(&DataKey::Escrow(escrow_id), &escrow);
+        env.storage().persistent().extend_ttl(
+            &DataKey::Escrow(escrow_id),
+            PERSISTENT_LIFETIME_THRESHOLD,
+            PERSISTENT_BUMP_AMOUNT,
+        );
+        env.storage()
+            .persistent()
+            .remove(&DataKey::CancellationRequest(escrow_id));
+
+        events::emit_cancellation_rejected(&env, escrow_id, caller);
+
+        env.storage()
+            .instance()
+            .extend_ttl(INSTANCE_LIFETIME_THRESHOLD, INSTANCE_BUMP_AMOUNT);
+    }
+
+    /// Expire a stale cancellation request and restore Active state.
+    /// Callable by anyone after the response window has elapsed.
+    pub fn expire_cancellation(env: Env, escrow_id: u32) {
+        let mut escrow: Escrow = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Escrow(escrow_id))
+            .expect("Escrow not found");
+
+        if escrow.status != EscrowStatus::CancellationPending {
+            panic!("No pending cancellation for this escrow");
+        }
+
+        let request: CancellationRequest = env
+            .storage()
+            .persistent()
+            .get(&DataKey::CancellationRequest(escrow_id))
+            .expect("Cancellation request not found");
+
+        if env.ledger().timestamp() <= request.expires_at {
+            panic!("Response window has not elapsed");
+        }
+
+        escrow.status = EscrowStatus::Active;
+        env.storage()
+            .persistent()
+            .set(&DataKey::Escrow(escrow_id), &escrow);
+        env.storage().persistent().extend_ttl(
+            &DataKey::Escrow(escrow_id),
+            PERSISTENT_LIFETIME_THRESHOLD,
+            PERSISTENT_BUMP_AMOUNT,
+        );
+        env.storage()
+            .persistent()
+            .remove(&DataKey::CancellationRequest(escrow_id));
+
+        events::emit_cancellation_expired(&env, escrow_id);
+
+        env.storage()
+            .instance()
+            .extend_ttl(INSTANCE_LIFETIME_THRESHOLD, INSTANCE_BUMP_AMOUNT);
+    }
+
     // --- Internal Helpers ---
 
     fn require_not_paused(env: &Env) {
@@ -3491,6 +3837,366 @@ impl AhjoorEscrowContract {
             initial_version
         }
     }
+
+    // ─── #225: Escrow Buyer Deposit Top-Up ───────────────────────────────────
+
+    /// Admin sets the maximum cumulative top-up as basis points of the original amount.
+    /// Default: 5000 bps = 50%.
+    pub fn set_max_top_up_bps(env: Env, admin: Address, max_top_up_bps: u32) {
+        Self::require_not_paused(&env);
+        admin.require_auth();
+        let stored_admin: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .expect("Not initialized");
+        if admin != stored_admin {
+            panic!("Only admin can set max top-up bps");
+        }
+        env.storage().instance().set(&DataKey::MaxTopUpBps, &max_top_up_bps);
+        env.storage().instance().extend_ttl(INSTANCE_LIFETIME_THRESHOLD, INSTANCE_BUMP_AMOUNT);
+    }
+
+    /// Buyer tops up an active or pending-release escrow with additional funds.
+    /// Rejected if escrow is Disputed, Released, or Cancelled.
+    /// Total cumulative top-ups are capped at `max_top_up_bps` of the original amount.
+    pub fn top_up_escrow(env: Env, buyer: Address, escrow_id: u32, amount: i128) {
+        Self::require_not_paused(&env);
+        buyer.require_auth();
+
+        if amount <= 0 {
+            panic!("Top-up amount must be positive");
+        }
+
+        let mut escrow: Escrow = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Escrow(escrow_id))
+            .expect("Escrow not found");
+
+        if escrow.buyer != buyer {
+            panic!("Only the buyer can top up this escrow");
+        }
+
+        // Only Active or PartiallyReleased states are allowed
+        match escrow.status {
+            EscrowStatus::Active | EscrowStatus::PartiallyReleased => {}
+            _ => panic!("Escrow is not in a top-up eligible state"),
+        }
+
+        // Enforce max_top_up_bps cap
+        let max_top_up_bps: u32 = env
+            .storage()
+            .instance()
+            .get(&DataKey::MaxTopUpBps)
+            .unwrap_or(5_000); // default 50%
+        let original_amount = escrow.amount;
+        let already_topped_up: i128 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::EscrowToppedUpAmount(escrow_id))
+            .unwrap_or(0);
+        let max_top_up = (original_amount * max_top_up_bps as i128) / 10_000;
+        if already_topped_up + amount > max_top_up {
+            panic!("Top-up would exceed maximum allowed top-up amount");
+        }
+
+        // Transfer funds from buyer to contract
+        let token_client = token::Client::new(&env, &escrow.token);
+        token_client.transfer(&buyer, &env.current_contract_address(), &amount);
+
+        // Update escrow amount and cumulative top-up tracker
+        escrow.amount += amount;
+        let new_total = escrow.amount;
+        env.storage()
+            .persistent()
+            .set(&DataKey::Escrow(escrow_id), &escrow);
+        env.storage().persistent().extend_ttl(
+            &DataKey::Escrow(escrow_id),
+            PERSISTENT_LIFETIME_THRESHOLD,
+            PERSISTENT_BUMP_AMOUNT,
+        );
+
+        let new_topped_up = already_topped_up + amount;
+        env.storage()
+            .persistent()
+            .set(&DataKey::EscrowToppedUpAmount(escrow_id), &new_topped_up);
+        env.storage().persistent().extend_ttl(
+            &DataKey::EscrowToppedUpAmount(escrow_id),
+            PERSISTENT_LIFETIME_THRESHOLD,
+            PERSISTENT_BUMP_AMOUNT,
+        );
+
+        events::emit_escrow_topped_up(&env, escrow_id, amount, new_total, buyer);
+
+        env.storage()
+            .instance()
+            .extend_ttl(INSTANCE_LIFETIME_THRESHOLD, INSTANCE_BUMP_AMOUNT);
+    }
+
+    // ─── #219: Multi-Party Split Release ─────────────────────────────────────
+
+    /// Create an escrow with explicit multi-party seller splits.
+    /// `sellers` is a list of (address, bps) where bps must sum to 10,000.
+    /// On release, each seller receives their proportional share of the net amount.
+    /// Emits `MultiSellerEscrowCreated` in addition to the standard escrow events.
+    pub fn create_multi_seller_escrow(
+        env: Env,
+        buyer: Address,
+        sellers: Vec<(Address, u32)>,
+        arbiter: Address,
+        amount: i128,
+        token: Address,
+        deadline: u64,
+        metadata_hash: Option<BytesN<32>>,
+    ) -> u32 {
+        Self::require_not_paused(&env);
+        buyer.require_auth();
+
+        if sellers.is_empty() {
+            panic!("At least one seller required");
+        }
+
+        // Validate shares sum to 10,000 bps
+        let mut total_bps: u32 = 0;
+        for i in 0..sellers.len() {
+            let (_, bps) = sellers.get(i).unwrap();
+            total_bps += bps;
+        }
+        if total_bps != 10_000 {
+            panic!("Seller shares must sum to 10000 bps");
+        }
+
+        let primary_seller = sellers.get(0).unwrap().0;
+
+        let request = EscrowCreateRequest {
+            seller: primary_seller,
+            arbiter,
+            amount,
+            token,
+            deadline,
+            metadata_hash,
+            sellers,
+            auto_renew: false,
+            renewal_count: 0,
+            buyer_inactivity_secs: 0,
+            min_lock_until: None,
+            release_base: None,
+            release_quote: None,
+            release_comparison: None,
+            release_threshold_price: None,
+            arbiter_fee_bps: None,
+            dispute_default_winner: None,
+        };
+
+        let escrow_id = Self::create_escrow_core(&env, &buyer, request);
+
+        let escrow: Escrow = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Escrow(escrow_id))
+            .expect("Escrow not found");
+
+        events::emit_multi_seller_escrow_created(&env, escrow_id, escrow.sellers.clone());
+
+        env.storage()
+            .instance()
+            .extend_ttl(INSTANCE_LIFETIME_THRESHOLD, INSTANCE_BUMP_AMOUNT);
+
+        escrow_id
+    }
+
+    // ─── #146: Post-Resolution Rating System ─────────────────────────────────
+
+    /// Submit a 1-5 star rating for the counterparty after escrow completion.
+    /// Callable by buyer (rating seller) or seller (rating buyer).
+    /// Only allowed once per escrow per rater; escrow must be Released or Resolved.
+    pub fn submit_rating(
+        env: Env,
+        rater: Address,
+        escrow_id: u32,
+        rating: u32,
+        comment_hash: Option<BytesN<32>>,
+    ) {
+        rater.require_auth();
+
+        if rating < 1 || rating > 5 {
+            panic!("Rating must be between 1 and 5");
+        }
+
+        let escrow: Escrow = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Escrow(escrow_id))
+            .expect("Escrow not found");
+
+        if escrow.buyer != buyer {
+            panic!("Only the buyer can veto");
+        }
+        if escrow.status != EscrowStatus::AwaitingBuyerVetoDecision {
+            panic!("No pending seller transfer");
+        }
+
+        let proposal: SellerTransferProposal = env
+            .storage()
+            .persistent()
+            .get(&DataKey::SellerTransferProposal(escrow_id))
+            .expect("Proposal not found");
+
+        if env.ledger().sequence() > proposal.veto_deadline {
+            panic!("Veto window has expired");
+        }
+
+        let refund_amount = escrow.amount;
+        escrow.status = EscrowStatus::Refunded;
+        env.storage()
+            .persistent()
+            .set(&DataKey::Escrow(escrow_id), &escrow);
+        env.storage().persistent().extend_ttl(
+            &DataKey::Escrow(escrow_id),
+        if escrow.status != EscrowStatus::Released && escrow.status != EscrowStatus::Resolved {
+            panic!("Rating only allowed after escrow is Released or Resolved");
+        }
+
+        // Determine ratee: buyer rates seller, seller rates buyer
+        let ratee = if rater == escrow.buyer {
+            escrow.seller.clone()
+        } else if rater == escrow.seller {
+            escrow.buyer.clone()
+        } else {
+            panic!("Only buyer or seller can submit a rating");
+        };
+
+        // Prevent double-rating
+        let rating_key = DataKey::RatingSubmitted(escrow_id, rater.clone());
+        if env.storage().persistent().has(&rating_key) {
+            panic!("Rating already submitted for this escrow");
+        }
+        env.storage().persistent().set(&rating_key, &true);
+        env.storage().persistent().extend_ttl(
+            &rating_key,
+            PERSISTENT_LIFETIME_THRESHOLD,
+            PERSISTENT_BUMP_AMOUNT,
+        );
+
+        // Refund buyer
+        let token_client = token::Client::new(&env, &escrow.token);
+        token_client.transfer(&env.current_contract_address(), &buyer, &refund_amount);
+
+        events::emit_seller_transfer_vetoed(&env, escrow_id, buyer, refund_amount);
+        env.storage()
+            .instance()
+            .extend_ttl(INSTANCE_LIFETIME_THRESHOLD, INSTANCE_BUMP_AMOUNT);
+    }
+
+    /// Buyer explicitly approves the seller transfer, finalising it immediately.
+    pub fn approve_seller_transfer(env: Env, buyer: Address, escrow_id: u32) {
+        buyer.require_auth();
+
+        let mut escrow: Escrow = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Escrow(escrow_id))
+            .expect("Escrow not found");
+
+        if escrow.buyer != buyer {
+            panic!("Only the buyer can approve");
+        }
+        if escrow.status != EscrowStatus::AwaitingBuyerVetoDecision {
+            panic!("No pending seller transfer");
+        }
+
+        let proposal: SellerTransferProposal = env
+            .storage()
+            .persistent()
+            .get(&DataKey::SellerTransferProposal(escrow_id))
+            .expect("Proposal not found");
+
+        escrow.seller = proposal.new_seller.clone();
+        escrow.status = EscrowStatus::Active;
+        env.storage()
+            .persistent()
+            .set(&DataKey::Escrow(escrow_id), &escrow);
+        env.storage().persistent().extend_ttl(
+            &DataKey::Escrow(escrow_id),
+        // Accumulate score
+        let score_key = DataKey::RatingScore(ratee.clone());
+        let (total_score, count): (u64, u32) = env
+            .storage()
+            .persistent()
+            .get(&score_key)
+            .unwrap_or((0u64, 0u32));
+        let new_total = total_score + rating as u64;
+        let new_count = count + 1;
+        env.storage()
+            .persistent()
+            .set(&score_key, &(new_total, new_count));
+        env.storage().persistent().extend_ttl(
+            &score_key,
+            PERSISTENT_LIFETIME_THRESHOLD,
+            PERSISTENT_BUMP_AMOUNT,
+        );
+
+        events::emit_seller_transfer_approved(&env, escrow_id, proposal.new_seller);
+        events::emit_rating_submitted(&env, escrow_id, rater, ratee, rating, comment_hash);
+
+        env.storage()
+            .instance()
+            .extend_ttl(INSTANCE_LIFETIME_THRESHOLD, INSTANCE_BUMP_AMOUNT);
+    }
+
+    /// Anyone can call this after the veto window expires to finalise the transfer.
+    pub fn finalize_seller_transfer_if_expired(env: Env, escrow_id: u32) {
+        let mut escrow: Escrow = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Escrow(escrow_id))
+            .expect("Escrow not found");
+
+        if escrow.status != EscrowStatus::AwaitingBuyerVetoDecision {
+            panic!("No pending seller transfer");
+        }
+
+        let proposal: SellerTransferProposal = env
+            .storage()
+            .persistent()
+            .get(&DataKey::SellerTransferProposal(escrow_id))
+            .expect("Proposal not found");
+
+        if env.ledger().sequence() <= proposal.veto_deadline {
+            panic!("Veto window has not expired yet");
+        }
+
+        escrow.seller = proposal.new_seller.clone();
+        escrow.status = EscrowStatus::Active;
+        env.storage()
+            .persistent()
+            .set(&DataKey::Escrow(escrow_id), &escrow);
+        env.storage().persistent().extend_ttl(
+            &DataKey::Escrow(escrow_id),
+            PERSISTENT_LIFETIME_THRESHOLD,
+            PERSISTENT_BUMP_AMOUNT,
+        );
+
+        events::emit_seller_transfer_expired_approved(&env, escrow_id, proposal.new_seller);
+        env.storage()
+            .instance()
+            .extend_ttl(INSTANCE_LIFETIME_THRESHOLD, INSTANCE_BUMP_AMOUNT);
+    /// Returns (avg_score_x100, total_ratings) for an address.
+    /// avg_score_x100 = (total_score * 100) / count, or 0 if no ratings.
+    pub fn get_reputation(env: Env, address: Address) -> (u32, u32) {
+        let score_key = DataKey::RatingScore(address);
+        let (total_score, count): (u64, u32) = env
+            .storage()
+            .persistent()
+            .get(&score_key)
+            .unwrap_or((0u64, 0u32));
+        if count == 0 {
+            return (0, 0);
+        }
+        let avg_x100 = ((total_score * 100) / count as u64) as u32;
+        (avg_x100, count)
+    }
 }
 
 #[cfg(test)]
@@ -3504,3 +4210,6 @@ mod test_token_whitelist;
 
 #[cfg(test)]
 mod test_cooling_off;
+
+#[cfg(test)]
+mod test_seller_veto;

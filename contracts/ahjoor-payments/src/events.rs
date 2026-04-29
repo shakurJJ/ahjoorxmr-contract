@@ -1034,3 +1034,219 @@ pub fn emit_appeal_approved(e: &Env, merchant: Address) {
 pub fn emit_appeal_rejected(e: &Env, merchant: Address) {
     AppealRejected { merchant }.publish(e);
 }
+
+// --- #216: Recurring Invoice Events ---
+
+/// Event: Recurring invoice schedule created
+#[contractevent]
+#[derive(Clone, Debug)]
+pub struct RecurringInvoiceCreated {
+    pub invoice_id: u32,
+    pub merchant: Address,
+    pub customer: Address,
+    pub amount: i128,
+}
+
+/// Event: Invoice cycle triggered, creating a new payment
+#[contractevent]
+#[derive(Clone, Debug)]
+pub struct InvoiceCycleTriggered {
+    pub invoice_id: u32,
+    pub payment_id: u32,
+    pub cycle_number: u32,
+}
+
+/// Event: Recurring invoice cancelled
+#[contractevent]
+#[derive(Clone, Debug)]
+pub struct RecurringInvoiceCancelled {
+    pub invoice_id: u32,
+    pub cancelled_by: Address,
+}
+
+/// Event: Recurring invoice completed (max cycles reached)
+#[contractevent]
+#[derive(Clone, Debug)]
+pub struct RecurringInvoiceCompleted {
+    pub invoice_id: u32,
+}
+
+pub fn emit_recurring_invoice_created(e: &Env, invoice_id: u32, merchant: Address, customer: Address, amount: i128) {
+    RecurringInvoiceCreated { invoice_id, merchant, customer, amount }.publish(e);
+}
+
+pub fn emit_invoice_cycle_triggered(e: &Env, invoice_id: u32, payment_id: u32, cycle_number: u32) {
+    InvoiceCycleTriggered { invoice_id, payment_id, cycle_number }.publish(e);
+}
+
+pub fn emit_recurring_invoice_cancelled(e: &Env, invoice_id: u32, cancelled_by: Address) {
+    RecurringInvoiceCancelled { invoice_id, cancelled_by }.publish(e);
+}
+
+pub fn emit_recurring_invoice_completed(e: &Env, invoice_id: u32) {
+    RecurringInvoiceCompleted { invoice_id }.publish(e);
+// #231: Withdrawal Rate Limiting Events
+pub fn emit_withdrawal_rate_limit_set(e: &Env, merchant: Address, window_seconds: u64, cap: i128) {
+    e.events().publish((soroban_sdk::Symbol::new(e, "WdrlLimitSet"),), (merchant, window_seconds, cap));
+}
+pub fn emit_withdrawal_rate_limit_exceeded(e: &Env, merchant: Address, attempted: i128, cap: i128) {
+    e.events().publish((soroban_sdk::Symbol::new(e, "WdrlLimitExceeded"),), (merchant, attempted, cap));
+}
+
+// #239: Loyalty Points Events
+
+/// Event: Points accrued to customer after payment completion
+#[contractevent]
+#[derive(Clone, Debug)]
+pub struct PointsAccrued {
+    pub customer: Address,
+    pub payment_id: u32,
+    pub points_earned: i128,
+    pub balance: i128,
+}
+
+/// Event: Points redeemed as discount on a payment
+#[contractevent]
+#[derive(Clone, Debug)]
+pub struct PointsRedeemed {
+    pub customer: Address,
+    pub payment_id: u32,
+    pub points_used: i128,
+    pub discount_applied: i128,
+}
+
+/// Event: Expired points burned on next interaction
+#[contractevent]
+#[derive(Clone, Debug)]
+pub struct PointsExpired {
+    pub customer: Address,
+    pub points_expired: i128,
+}
+
+pub fn emit_points_accrued(e: &Env, customer: Address, payment_id: u32, points_earned: i128, balance: i128) {
+    PointsAccrued { customer, payment_id, points_earned, balance }.publish(e);
+}
+
+pub fn emit_points_redeemed(e: &Env, customer: Address, payment_id: u32, points_used: i128, discount_applied: i128) {
+    PointsRedeemed { customer, payment_id, points_used, discount_applied }.publish(e);
+}
+
+pub fn emit_points_expired(e: &Env, customer: Address, points_expired: i128) {
+    PointsExpired { customer, points_expired }.publish(e);
+// #242: Merchant Referral Commission Events
+/// Event: Referral registered
+#[contractevent]
+#[derive(Clone, Debug)]
+pub struct ReferralRegistered {
+    pub referrer: Address,
+    pub referred_merchant: Address,
+}
+
+/// Event: Commission accrued on referred merchant payment
+#[contractevent]
+#[derive(Clone, Debug)]
+pub struct CommissionAccrued {
+    pub referrer: Address,
+    pub referred_merchant: Address,
+    pub payment_id: u32,
+    pub amount: i128,
+}
+
+/// Event: Referrer claimed accumulated commission
+#[contractevent]
+#[derive(Clone, Debug)]
+pub struct CommissionClaimed {
+    pub referrer: Address,
+    pub amount: i128,
+}
+
+pub fn emit_referral_registered(e: &Env, referrer: Address, referred_merchant: Address) {
+    ReferralRegistered { referrer, referred_merchant }.publish(e);
+}
+
+pub fn emit_commission_accrued(e: &Env, referrer: Address, referred_merchant: Address, payment_id: u32, amount: i128) {
+    CommissionAccrued { referrer, referred_merchant, payment_id, amount }.publish(e);
+}
+
+pub fn emit_commission_claimed(e: &Env, referrer: Address, amount: i128) {
+    CommissionClaimed { referrer, amount }.publish(e);
+// #246: Dynamic Settlement Events
+/// Event: Dynamic payment created with oracle price feed
+#[contractevent]
+#[derive(Clone, Debug)]
+pub struct DynamicPaymentCreated {
+    pub payment_id: u32,
+    pub fiat_amount: i128,
+    pub fiat_currency: soroban_sdk::Symbol,
+    pub oracle_address: Address,
+}
+
+/// Event: Dynamic payment settled with oracle rate
+#[contractevent]
+#[derive(Clone, Debug)]
+pub struct DynamicPaymentSettled {
+    pub payment_id: u32,
+    pub fiat_amount: i128,
+    pub token_amount: i128,
+    pub rate_used: i128,
+}
+
+pub fn emit_dynamic_payment_created(e: &Env, payment_id: u32, fiat_amount: i128, fiat_currency: soroban_sdk::Symbol, oracle_address: Address) {
+    DynamicPaymentCreated { payment_id, fiat_amount, fiat_currency, oracle_address }.publish(e);
+}
+
+pub fn emit_dynamic_payment_settled(e: &Env, payment_id: u32, fiat_amount: i128, token_amount: i128, rate_used: i128) {
+    DynamicPaymentSettled { payment_id, fiat_amount, token_amount, rate_used }.publish(e);
+// #235: Customer Spend Limit Events
+/// Event: Merchant set a per-customer spend limit
+#[contractevent]
+#[derive(Clone, Debug)]
+pub struct CustomerSpendLimitSet {
+    pub merchant: Address,
+    pub customer: Address,
+    pub amount: i128,
+    pub window_seconds: u64,
+}
+
+/// Event: Customer spend limit removed
+#[contractevent]
+#[derive(Clone, Debug)]
+pub struct CustomerSpendLimitRemoved {
+    pub merchant: Address,
+    pub customer: Address,
+}
+
+/// Event: Customer spend limit exceeded (payment rejected)
+#[contractevent]
+#[derive(Clone, Debug)]
+pub struct CustomerSpendLimitExceeded {
+    pub merchant: Address,
+    pub customer: Address,
+    pub attempted: i128,
+    pub cap: i128,
+}
+
+/// Event: Merchant default spend limit set
+#[contractevent]
+#[derive(Clone, Debug)]
+pub struct DefaultSpendLimitSet {
+    pub merchant: Address,
+    pub amount: i128,
+    pub window_seconds: u64,
+}
+
+pub fn emit_customer_spend_limit_set(e: &Env, merchant: Address, customer: Address, amount: i128, window_seconds: u64) {
+    CustomerSpendLimitSet { merchant, customer, amount, window_seconds }.publish(e);
+}
+
+pub fn emit_customer_spend_limit_removed(e: &Env, merchant: Address, customer: Address) {
+    CustomerSpendLimitRemoved { merchant, customer }.publish(e);
+}
+
+pub fn emit_customer_spend_limit_exceeded(e: &Env, merchant: Address, customer: Address, attempted: i128, cap: i128) {
+    CustomerSpendLimitExceeded { merchant, customer, attempted, cap }.publish(e);
+}
+
+pub fn emit_default_spend_limit_set(e: &Env, merchant: Address, amount: i128, window_seconds: u64) {
+    DefaultSpendLimitSet { merchant, amount, window_seconds }.publish(e);
+}
