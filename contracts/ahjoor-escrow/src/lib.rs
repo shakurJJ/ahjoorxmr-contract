@@ -271,6 +271,10 @@ pub enum DataKey {
     MaxTopUpBps,
     /// #225: cumulative top-up amount per escrow
     EscrowToppedUpAmount(u32),
+    /// #146: (ratee) → (total_score: u64, count: u32) for reputation
+    RatingScore(Address),
+    /// #146: (escrow_id, rater) → bool — prevents double-rating
+    RatingSubmitted(u32, Address),
 }
 
 const MAX_PROTOCOL_FEE_BPS: u32 = 200; // 2%
@@ -3912,6 +3916,168 @@ impl AhjoorEscrowContract {
         env.storage()
             .instance()
             .extend_ttl(INSTANCE_LIFETIME_THRESHOLD, INSTANCE_BUMP_AMOUNT);
+    }
+
+    // ─── #219: Multi-Party Split Release ─────────────────────────────────────
+
+    /// Create an escrow with explicit multi-party seller splits.
+    /// `sellers` is a list of (address, bps) where bps must sum to 10,000.
+    /// On release, each seller receives their proportional share of the net amount.
+    /// Emits `MultiSellerEscrowCreated` in addition to the standard escrow events.
+    pub fn create_multi_seller_escrow(
+        env: Env,
+        buyer: Address,
+        sellers: Vec<(Address, u32)>,
+        arbiter: Address,
+        amount: i128,
+        token: Address,
+        deadline: u64,
+        metadata_hash: Option<BytesN<32>>,
+    ) -> u32 {
+        Self::require_not_paused(&env);
+        buyer.require_auth();
+
+        if sellers.is_empty() {
+            panic!("At least one seller required");
+        }
+
+        // Validate shares sum to 10,000 bps
+        let mut total_bps: u32 = 0;
+        for i in 0..sellers.len() {
+            let (_, bps) = sellers.get(i).unwrap();
+            total_bps += bps;
+        }
+        if total_bps != 10_000 {
+            panic!("Seller shares must sum to 10000 bps");
+        }
+
+        let primary_seller = sellers.get(0).unwrap().0;
+
+        let request = EscrowCreateRequest {
+            seller: primary_seller,
+            arbiter,
+            amount,
+            token,
+            deadline,
+            metadata_hash,
+            sellers,
+            auto_renew: false,
+            renewal_count: 0,
+            buyer_inactivity_secs: 0,
+            min_lock_until: None,
+            release_base: None,
+            release_quote: None,
+            release_comparison: None,
+            release_threshold_price: None,
+            arbiter_fee_bps: None,
+            dispute_default_winner: None,
+        };
+
+        let escrow_id = Self::create_escrow_core(&env, &buyer, request);
+
+        let escrow: Escrow = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Escrow(escrow_id))
+            .expect("Escrow not found");
+
+        events::emit_multi_seller_escrow_created(&env, escrow_id, escrow.sellers.clone());
+
+        env.storage()
+            .instance()
+            .extend_ttl(INSTANCE_LIFETIME_THRESHOLD, INSTANCE_BUMP_AMOUNT);
+
+        escrow_id
+    }
+
+    // ─── #146: Post-Resolution Rating System ─────────────────────────────────
+
+    /// Submit a 1-5 star rating for the counterparty after escrow completion.
+    /// Callable by buyer (rating seller) or seller (rating buyer).
+    /// Only allowed once per escrow per rater; escrow must be Released or Resolved.
+    pub fn submit_rating(
+        env: Env,
+        rater: Address,
+        escrow_id: u32,
+        rating: u32,
+        comment_hash: Option<BytesN<32>>,
+    ) {
+        rater.require_auth();
+
+        if rating < 1 || rating > 5 {
+            panic!("Rating must be between 1 and 5");
+        }
+
+        let escrow: Escrow = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Escrow(escrow_id))
+            .expect("Escrow not found");
+
+        if escrow.status != EscrowStatus::Released && escrow.status != EscrowStatus::Resolved {
+            panic!("Rating only allowed after escrow is Released or Resolved");
+        }
+
+        // Determine ratee: buyer rates seller, seller rates buyer
+        let ratee = if rater == escrow.buyer {
+            escrow.seller.clone()
+        } else if rater == escrow.seller {
+            escrow.buyer.clone()
+        } else {
+            panic!("Only buyer or seller can submit a rating");
+        };
+
+        // Prevent double-rating
+        let rating_key = DataKey::RatingSubmitted(escrow_id, rater.clone());
+        if env.storage().persistent().has(&rating_key) {
+            panic!("Rating already submitted for this escrow");
+        }
+        env.storage().persistent().set(&rating_key, &true);
+        env.storage().persistent().extend_ttl(
+            &rating_key,
+            PERSISTENT_LIFETIME_THRESHOLD,
+            PERSISTENT_BUMP_AMOUNT,
+        );
+
+        // Accumulate score
+        let score_key = DataKey::RatingScore(ratee.clone());
+        let (total_score, count): (u64, u32) = env
+            .storage()
+            .persistent()
+            .get(&score_key)
+            .unwrap_or((0u64, 0u32));
+        let new_total = total_score + rating as u64;
+        let new_count = count + 1;
+        env.storage()
+            .persistent()
+            .set(&score_key, &(new_total, new_count));
+        env.storage().persistent().extend_ttl(
+            &score_key,
+            PERSISTENT_LIFETIME_THRESHOLD,
+            PERSISTENT_BUMP_AMOUNT,
+        );
+
+        events::emit_rating_submitted(&env, escrow_id, rater, ratee, rating, comment_hash);
+
+        env.storage()
+            .instance()
+            .extend_ttl(INSTANCE_LIFETIME_THRESHOLD, INSTANCE_BUMP_AMOUNT);
+    }
+
+    /// Returns (avg_score_x100, total_ratings) for an address.
+    /// avg_score_x100 = (total_score * 100) / count, or 0 if no ratings.
+    pub fn get_reputation(env: Env, address: Address) -> (u32, u32) {
+        let score_key = DataKey::RatingScore(address);
+        let (total_score, count): (u64, u32) = env
+            .storage()
+            .persistent()
+            .get(&score_key)
+            .unwrap_or((0u64, 0u32));
+        if count == 0 {
+            return (0, 0);
+        }
+        let avg_x100 = ((total_score * 100) / count as u64) as u32;
+        (avg_x100, count)
     }
 }
 

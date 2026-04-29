@@ -534,9 +534,30 @@ pub enum DataKey {
     DefaultSpendLimit(Address),
     /// Persistent: per-(merchant,customer) rolling spend window state (#235)
     CustomerSpendWindowState(Address, Address),
+    /// #216: recurring invoice counter
+    RecurringInvoiceCounter,
+    /// #216: recurring invoice record
+    RecurringInvoice(u32),
 }
 
 mod events;
+
+/// #216: Recurring invoice schedule.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RecurringInvoice {
+    pub id: u32,
+    pub merchant: Address,
+    pub customer: Address,
+    pub amount: i128,
+    pub token: Address,
+    pub interval_seconds: u64,
+    pub max_cycles: u32,
+    pub cycles_triggered: u32,
+    pub next_due_at: u64,
+    pub reference_hash: Option<BytesN<32>>,
+    pub active: bool,
+}
 
 #[contract]
 pub struct AhjoorPaymentsContract;
@@ -5745,6 +5766,11 @@ impl AhjoorPaymentsContract {
 
     /// Merchant sets a per-customer spend cap within a rolling window.
     pub fn set_customer_spend_limit(
+    // ─── #216: Recurring Invoice Scheduling ──────────────────────────────────
+
+    /// Merchant creates a recurring invoice schedule.
+    /// `max_cycles` = 0 means unlimited.
+    pub fn create_recurring_invoice(
         env: Env,
         merchant: Address,
         customer: Address,
@@ -5847,6 +5873,176 @@ impl AhjoorPaymentsContract {
         state.spent = new_total;
         env.storage().persistent().set(&state_key, &state);
         env.storage().persistent().extend_ttl(&state_key, PERSISTENT_LIFETIME_THRESHOLD, PERSISTENT_BUMP_AMOUNT);
+        token: Address,
+        interval_seconds: u64,
+        max_cycles: u32,
+        reference_hash: Option<BytesN<32>>,
+    ) -> u32 {
+        Self::require_not_paused(&env);
+        merchant.require_auth();
+
+        if amount <= 0 {
+            panic!("Amount must be positive");
+        }
+        if interval_seconds == 0 {
+            panic!("Interval must be positive");
+        }
+
+        Self::require_token_allowed(&env, &token);
+        Self::require_merchant_approved(&env, &merchant);
+
+        let mut counter: u32 = env
+            .storage()
+            .instance()
+            .get(&DataKey::RecurringInvoiceCounter)
+            .unwrap_or(0);
+        let invoice_id = counter;
+        counter += 1;
+        env.storage()
+            .instance()
+            .set(&DataKey::RecurringInvoiceCounter, &counter);
+
+        let now = env.ledger().timestamp();
+        let invoice = RecurringInvoice {
+            id: invoice_id,
+            merchant: merchant.clone(),
+            customer: customer.clone(),
+            amount,
+            token,
+            interval_seconds,
+            max_cycles,
+            cycles_triggered: 0,
+            next_due_at: now,
+            reference_hash,
+            active: true,
+        };
+
+        env.storage()
+            .persistent()
+            .set(&DataKey::RecurringInvoice(invoice_id), &invoice);
+        env.storage().persistent().extend_ttl(
+            &DataKey::RecurringInvoice(invoice_id),
+            PERSISTENT_LIFETIME_THRESHOLD,
+            PERSISTENT_BUMP_AMOUNT,
+        );
+
+        events::emit_recurring_invoice_created(&env, invoice_id, merchant, customer, amount);
+
+        env.storage()
+            .instance()
+            .extend_ttl(INSTANCE_LIFETIME_THRESHOLD, INSTANCE_BUMP_AMOUNT);
+
+        invoice_id
+    }
+
+    /// Trigger the next invoice cycle, creating a standard Payment entry.
+    /// Callable by anyone (merchant, keeper, etc.) when the interval has elapsed.
+    /// Returns the new payment_id.
+    pub fn trigger_invoice_cycle(env: Env, invoice_id: u32) -> u32 {
+        Self::require_not_paused(&env);
+
+        let mut invoice: RecurringInvoice = env
+            .storage()
+            .persistent()
+            .get(&DataKey::RecurringInvoice(invoice_id))
+            .expect("Recurring invoice not found");
+
+        if !invoice.active {
+            panic!("Recurring invoice is cancelled");
+        }
+
+        let now = env.ledger().timestamp();
+        if now < invoice.next_due_at {
+            panic!("Invoice interval has not elapsed");
+        }
+
+        if invoice.max_cycles > 0 && invoice.cycles_triggered >= invoice.max_cycles {
+            panic!("Max cycles reached");
+        }
+
+        // Create a standard Payment entry (funds transferred from customer)
+        let payment_id = Self::create_payment_with_options(
+            env.clone(),
+            invoice.customer.clone(),
+            invoice.merchant.clone(),
+            invoice.amount,
+            invoice.token.clone(),
+            None,
+            None,
+            None,
+            None,
+            None,
+        );
+
+        invoice.cycles_triggered += 1;
+        invoice.next_due_at = now + invoice.interval_seconds;
+
+        // Auto-complete if max_cycles reached
+        if invoice.max_cycles > 0 && invoice.cycles_triggered >= invoice.max_cycles {
+            invoice.active = false;
+            events::emit_recurring_invoice_completed(&env, invoice_id);
+        }
+
+        env.storage()
+            .persistent()
+            .set(&DataKey::RecurringInvoice(invoice_id), &invoice);
+        env.storage().persistent().extend_ttl(
+            &DataKey::RecurringInvoice(invoice_id),
+            PERSISTENT_LIFETIME_THRESHOLD,
+            PERSISTENT_BUMP_AMOUNT,
+        );
+
+        events::emit_invoice_cycle_triggered(&env, invoice_id, payment_id, invoice.cycles_triggered);
+
+        env.storage()
+            .instance()
+            .extend_ttl(INSTANCE_LIFETIME_THRESHOLD, INSTANCE_BUMP_AMOUNT);
+
+        payment_id
+    }
+
+    /// Cancel a recurring invoice. Callable by merchant or customer.
+    pub fn cancel_recurring_invoice(env: Env, caller: Address, invoice_id: u32) {
+        Self::require_not_paused(&env);
+        caller.require_auth();
+
+        let mut invoice: RecurringInvoice = env
+            .storage()
+            .persistent()
+            .get(&DataKey::RecurringInvoice(invoice_id))
+            .expect("Recurring invoice not found");
+
+        if caller != invoice.merchant && caller != invoice.customer {
+            panic!("Only merchant or customer can cancel");
+        }
+
+        if !invoice.active {
+            panic!("Recurring invoice is already cancelled");
+        }
+
+        invoice.active = false;
+        env.storage()
+            .persistent()
+            .set(&DataKey::RecurringInvoice(invoice_id), &invoice);
+        env.storage().persistent().extend_ttl(
+            &DataKey::RecurringInvoice(invoice_id),
+            PERSISTENT_LIFETIME_THRESHOLD,
+            PERSISTENT_BUMP_AMOUNT,
+        );
+
+        events::emit_recurring_invoice_cancelled(&env, invoice_id, caller);
+
+        env.storage()
+            .instance()
+            .extend_ttl(INSTANCE_LIFETIME_THRESHOLD, INSTANCE_BUMP_AMOUNT);
+    }
+
+    /// Get a recurring invoice by ID.
+    pub fn get_recurring_invoice(env: Env, invoice_id: u32) -> RecurringInvoice {
+        env.storage()
+            .persistent()
+            .get(&DataKey::RecurringInvoice(invoice_id))
+            .expect("Recurring invoice not found")
     }
 
 }

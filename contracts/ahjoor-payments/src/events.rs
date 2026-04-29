@@ -1035,6 +1035,56 @@ pub fn emit_appeal_rejected(e: &Env, merchant: Address) {
     AppealRejected { merchant }.publish(e);
 }
 
+// --- #216: Recurring Invoice Events ---
+
+/// Event: Recurring invoice schedule created
+#[contractevent]
+#[derive(Clone, Debug)]
+pub struct RecurringInvoiceCreated {
+    pub invoice_id: u32,
+    pub merchant: Address,
+    pub customer: Address,
+    pub amount: i128,
+}
+
+/// Event: Invoice cycle triggered, creating a new payment
+#[contractevent]
+#[derive(Clone, Debug)]
+pub struct InvoiceCycleTriggered {
+    pub invoice_id: u32,
+    pub payment_id: u32,
+    pub cycle_number: u32,
+}
+
+/// Event: Recurring invoice cancelled
+#[contractevent]
+#[derive(Clone, Debug)]
+pub struct RecurringInvoiceCancelled {
+    pub invoice_id: u32,
+    pub cancelled_by: Address,
+}
+
+/// Event: Recurring invoice completed (max cycles reached)
+#[contractevent]
+#[derive(Clone, Debug)]
+pub struct RecurringInvoiceCompleted {
+    pub invoice_id: u32,
+}
+
+pub fn emit_recurring_invoice_created(e: &Env, invoice_id: u32, merchant: Address, customer: Address, amount: i128) {
+    RecurringInvoiceCreated { invoice_id, merchant, customer, amount }.publish(e);
+}
+
+pub fn emit_invoice_cycle_triggered(e: &Env, invoice_id: u32, payment_id: u32, cycle_number: u32) {
+    InvoiceCycleTriggered { invoice_id, payment_id, cycle_number }.publish(e);
+}
+
+pub fn emit_recurring_invoice_cancelled(e: &Env, invoice_id: u32, cancelled_by: Address) {
+    RecurringInvoiceCancelled { invoice_id, cancelled_by }.publish(e);
+}
+
+pub fn emit_recurring_invoice_completed(e: &Env, invoice_id: u32) {
+    RecurringInvoiceCompleted { invoice_id }.publish(e);
 // #231: Withdrawal Rate Limiting Events
 pub fn emit_withdrawal_rate_limit_set(e: &Env, merchant: Address, window_seconds: u64, cap: i128) {
     e.events().publish((soroban_sdk::Symbol::new(e, "WdrlLimitSet"),), (merchant, window_seconds, cap));
