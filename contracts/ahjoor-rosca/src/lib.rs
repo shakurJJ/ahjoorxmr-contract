@@ -4845,6 +4845,185 @@ impl AhjoorContract {
             .unwrap_or(Map::new(&env));
         debts.get(member).unwrap_or(0)
     }
+
+    // ─── #230: ROSCA Group Merge ──────────────────────────────────────────────
+
+    /// Admin of this group (Group A) proposes a merge with Group B.
+    /// `group_b_id` is an external identifier for the other group.
+    /// Returns the merge proposal ID.
+    pub fn propose_merge(env: Env, admin: Address, group_b_id: u32) -> u32 {
+        internals::check_not_paused(&env);
+        admin.require_auth();
+        let stored_admin: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .expect("Admin not set");
+        if admin != stored_admin {
+            panic_with_error!(&env, Error::OnlyAdminAllowed);
+        }
+
+        // Cannot merge a dissolved or already-merged group
+        let group_status: GroupStatus = env
+            .storage()
+            .instance()
+            .get(&DataKey2::GroupStatus)
+            .unwrap_or(GroupStatus::Active);
+        if group_status != GroupStatus::Active {
+            panic!("Group is not active");
+        }
+
+        // Merges are only permitted between rounds (PaidMembers must be empty)
+        let paid_members: Vec<Address> = env
+            .storage()
+            .instance()
+            .get(&DataKey::PaidMembers)
+            .unwrap_or(Vec::new(&env));
+        if !paid_members.is_empty() {
+            panic!("Merge only permitted between rounds");
+        }
+
+        let proposal_id: u32 = env
+            .storage()
+            .instance()
+            .get(&DataKey2::MergeProposalCounter)
+            .unwrap_or(0) + 1;
+        env.storage()
+            .instance()
+            .set(&DataKey2::MergeProposalCounter, &proposal_id);
+
+        let proposal = MergeProposal {
+            id: proposal_id,
+            group_a_admin: admin.clone(),
+            group_b_id,
+            proposed_at: env.ledger().timestamp(),
+            accepted: false,
+        };
+
+        let mut proposals: Map<u32, MergeProposal> = env
+            .storage()
+            .instance()
+            .get(&DataKey2::MergeProposals)
+            .unwrap_or(Map::new(&env));
+        proposals.set(proposal_id, proposal);
+        env.storage()
+            .instance()
+            .set(&DataKey2::MergeProposals, &proposals);
+
+        events::emit_merge_proposed(&env, proposal_id, admin, group_b_id);
+
+        env.storage()
+            .instance()
+            .extend_ttl(INSTANCE_LIFETIME_THRESHOLD, INSTANCE_BUMP_AMOUNT);
+
+        proposal_id
+    }
+
+    /// Admin accepts a merge proposal and executes the merge.
+    /// `new_members` is the list of Group B's members to append to this group's payout order.
+    /// `group_b_balance` is the amount of tokens transferred from Group B (caller must have
+    /// already transferred the tokens to this contract before calling).
+    pub fn accept_merge(
+        env: Env,
+        admin: Address,
+        merge_proposal_id: u32,
+        new_members: Vec<Address>,
+    ) {
+        internals::check_not_paused(&env);
+        admin.require_auth();
+        let stored_admin: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .expect("Admin not set");
+        if admin != stored_admin {
+            panic_with_error!(&env, Error::OnlyAdminAllowed);
+        }
+
+        let mut proposals: Map<u32, MergeProposal> = env
+            .storage()
+            .instance()
+            .get(&DataKey2::MergeProposals)
+            .unwrap_or(Map::new(&env));
+        let mut proposal = proposals.get(merge_proposal_id).expect("Merge proposal not found");
+
+        if proposal.accepted {
+            panic!("Merge proposal already accepted");
+        }
+
+        // Merges are only permitted between rounds
+        let paid_members: Vec<Address> = env
+            .storage()
+            .instance()
+            .get(&DataKey::PaidMembers)
+            .unwrap_or(Vec::new(&env));
+        if !paid_members.is_empty() {
+            panic!("Merge only permitted between rounds");
+        }
+
+        let max_members: u32 = env
+            .storage()
+            .instance()
+            .get(&DataKey::MaxMembers)
+            .unwrap_or(50);
+
+        let mut members: Vec<Address> = env
+            .storage()
+            .instance()
+            .get(&DataKey::Members)
+            .expect("Not initialized");
+
+        let combined_count = members.len() as u32 + new_members.len() as u32;
+        if combined_count > max_members {
+            panic!("Combined member count exceeds max_members");
+        }
+
+        let mut payout_order: Vec<Address> = env
+            .storage()
+            .instance()
+            .get(&DataKey::PayoutOrder)
+            .expect("Not initialized");
+
+        // Append Group B's members after Group A's remaining members
+        for m in new_members.iter() {
+            if !members.contains(&m) {
+                members.push_back(m.clone());
+                payout_order.push_back(m.clone());
+            }
+        }
+
+        env.storage().instance().set(&DataKey::Members, &members);
+        env.storage().instance().set(&DataKey::PayoutOrder, &payout_order);
+
+        // Mark Group B as merged
+        env.storage()
+            .instance()
+            .set(&DataKey2::GroupMergedInto, &proposal.group_b_id);
+
+        proposal.accepted = true;
+        proposals.set(merge_proposal_id, proposal.clone());
+        env.storage()
+            .instance()
+            .set(&DataKey2::MergeProposals, &proposals);
+
+        events::emit_merge_accepted(&env, merge_proposal_id);
+        events::emit_merge_completed(&env, merge_proposal_id, new_members.len() as u32);
+        events::emit_group_marked_merged(&env, proposal.group_b_id);
+
+        env.storage()
+            .instance()
+            .extend_ttl(INSTANCE_LIFETIME_THRESHOLD, INSTANCE_BUMP_AMOUNT);
+    }
+
+    /// Get a merge proposal by ID.
+    pub fn get_merge_proposal(env: Env, proposal_id: u32) -> MergeProposal {
+        let proposals: Map<u32, MergeProposal> = env
+            .storage()
+            .instance()
+            .get(&DataKey2::MergeProposals)
+            .unwrap_or(Map::new(&env));
+        proposals.get(proposal_id).expect("Merge proposal not found")
+    }
 }
 
 mod test;

@@ -774,6 +774,18 @@ pub fn emit_timelocked_escrow_cancelled(e: &Env, escrow_id: u32, buyer: Address)
     e.events().publish((Symbol::new(e, "TLEscrowCancelled"),), (escrow_id, buyer));
 }
 
+// #229: Mutual Cancellation events
+pub fn emit_cancellation_requested(e: &Env, escrow_id: u32, initiator: Address, expires_at: u64) {
+    e.events().publish((Symbol::new(e, "CancelRequested"),), (escrow_id, initiator, expires_at));
+}
+pub fn emit_cancellation_accepted(e: &Env, escrow_id: u32, buyer: Address, amount_returned: i128, penalty: i128) {
+    e.events().publish((Symbol::new(e, "CancelAccepted"),), (escrow_id, buyer, amount_returned, penalty));
+}
+pub fn emit_cancellation_rejected(e: &Env, escrow_id: u32, rejector: Address) {
+    e.events().publish((Symbol::new(e, "CancelRejected"),), (escrow_id, rejector));
+}
+pub fn emit_cancellation_expired(e: &Env, escrow_id: u32) {
+    e.events().publish((Symbol::new(e, "CancelExpired"),), (escrow_id,));
 // #225: Escrow Top-Up Event
 
 /// Event: Buyer topped up an active escrow with additional funds

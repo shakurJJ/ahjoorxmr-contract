@@ -27,6 +27,8 @@ pub enum EscrowStatus {
     PartiallyDisputed = 6,
     /// Arbiter has recorded a verdict; funds held pending cooling-off window.
     CoolingOff = 7,
+    /// Mutual cancellation requested; awaiting counterparty response (#229).
+    CancellationPending = 8,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -144,6 +146,16 @@ pub struct TimeLockData {
     pub claimed: bool,
 }
 
+/// #229: Mutual cancellation request record.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CancellationRequest {
+    pub initiator: Address,
+    pub reason_hash: BytesN<32>,
+    pub requested_at: u64,
+    pub expires_at: u64,
+}
+
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct DeadlineProposal {
@@ -249,6 +261,12 @@ pub enum DataKey {
     TokenWhitelistContract,
     /// #215: time-lock metadata per escrow
     TimeLockData(u32),
+    /// #229: cancellation request per escrow
+    CancellationRequest(u32),
+    /// #229: admin-configurable cancellation penalty in basis points
+    CancellationPenaltyBps,
+    /// #229: admin-configurable cancellation response window in seconds
+    CancellationResponseWindow,
     /// #225: max top-up as basis points of original escrow amount (e.g. 5000 = 50%)
     MaxTopUpBps,
     /// #225: cumulative top-up amount per escrow
@@ -3206,6 +3224,310 @@ impl AhjoorEscrowContract {
         );
 
         events::emit_inactivity_release_triggered(&env, escrow_id, seller, inactivity_seconds);
+
+        env.storage()
+            .instance()
+            .extend_ttl(INSTANCE_LIFETIME_THRESHOLD, INSTANCE_BUMP_AMOUNT);
+    }
+
+    // -------------------------------------------------------------------------
+    // #229: Escrow Mutual Cancellation with Configurable Penalty
+    // -------------------------------------------------------------------------
+
+    /// Admin sets the cancellation penalty in basis points (applied to initiator's share).
+    pub fn set_cancellation_penalty_bps(env: Env, admin: Address, penalty_bps: u32) {
+        Self::require_not_paused(&env);
+        Self::require_or_bootstrap_admin(&env, &admin);
+        if penalty_bps > 10_000 {
+            panic!("Penalty cannot exceed 10000 bps");
+        }
+        env.storage()
+            .instance()
+            .set(&DataKey::CancellationPenaltyBps, &penalty_bps);
+        env.storage()
+            .instance()
+            .extend_ttl(INSTANCE_LIFETIME_THRESHOLD, INSTANCE_BUMP_AMOUNT);
+    }
+
+    /// Admin sets the response window in seconds for cancellation requests.
+    pub fn set_cancellation_response_window(env: Env, admin: Address, window_seconds: u64) {
+        Self::require_not_paused(&env);
+        Self::require_or_bootstrap_admin(&env, &admin);
+        if window_seconds == 0 {
+            panic!("Response window must be positive");
+        }
+        env.storage()
+            .instance()
+            .set(&DataKey::CancellationResponseWindow, &window_seconds);
+        env.storage()
+            .instance()
+            .extend_ttl(INSTANCE_LIFETIME_THRESHOLD, INSTANCE_BUMP_AMOUNT);
+    }
+
+    /// Either party (buyer or seller) requests mutual cancellation of an active escrow.
+    pub fn request_cancellation(env: Env, caller: Address, escrow_id: u32, reason_hash: BytesN<32>) {
+        Self::require_not_paused(&env);
+        caller.require_auth();
+
+        let mut escrow: Escrow = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Escrow(escrow_id))
+            .expect("Escrow not found");
+
+        if !Self::is_open_escrow_status(escrow.status) {
+            panic!("Escrow is not active");
+        }
+
+        if caller != escrow.buyer && caller != escrow.seller {
+            panic!("Only buyer or seller can request cancellation");
+        }
+
+        let window: u64 = env
+            .storage()
+            .instance()
+            .get(&DataKey::CancellationResponseWindow)
+            .unwrap_or(7 * 24 * 60 * 60); // default 7 days
+
+        let now = env.ledger().timestamp();
+        let expires_at = now + window;
+
+        let request = CancellationRequest {
+            initiator: caller.clone(),
+            reason_hash,
+            requested_at: now,
+            expires_at,
+        };
+
+        env.storage()
+            .persistent()
+            .set(&DataKey::CancellationRequest(escrow_id), &request);
+        env.storage().persistent().extend_ttl(
+            &DataKey::CancellationRequest(escrow_id),
+            PERSISTENT_LIFETIME_THRESHOLD,
+            PERSISTENT_BUMP_AMOUNT,
+        );
+
+        escrow.status = EscrowStatus::CancellationPending;
+        env.storage()
+            .persistent()
+            .set(&DataKey::Escrow(escrow_id), &escrow);
+        env.storage().persistent().extend_ttl(
+            &DataKey::Escrow(escrow_id),
+            PERSISTENT_LIFETIME_THRESHOLD,
+            PERSISTENT_BUMP_AMOUNT,
+        );
+
+        events::emit_cancellation_requested(&env, escrow_id, caller, expires_at);
+
+        env.storage()
+            .instance()
+            .extend_ttl(INSTANCE_LIFETIME_THRESHOLD, INSTANCE_BUMP_AMOUNT);
+    }
+
+    /// The counterparty accepts the cancellation request.
+    /// Full escrow amount minus penalty (applied to initiator) is returned to buyer.
+    /// Penalty goes to fee collector.
+    pub fn accept_cancellation(env: Env, caller: Address, escrow_id: u32) {
+        Self::require_not_paused(&env);
+        caller.require_auth();
+
+        let mut escrow: Escrow = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Escrow(escrow_id))
+            .expect("Escrow not found");
+
+        if escrow.status != EscrowStatus::CancellationPending {
+            panic!("No pending cancellation for this escrow");
+        }
+
+        let request: CancellationRequest = env
+            .storage()
+            .persistent()
+            .get(&DataKey::CancellationRequest(escrow_id))
+            .expect("Cancellation request not found");
+
+        let now = env.ledger().timestamp();
+
+        // Check if request has expired — auto-restore Active
+        if now > request.expires_at {
+            escrow.status = EscrowStatus::Active;
+            env.storage()
+                .persistent()
+                .set(&DataKey::Escrow(escrow_id), &escrow);
+            env.storage().persistent().extend_ttl(
+                &DataKey::Escrow(escrow_id),
+                PERSISTENT_LIFETIME_THRESHOLD,
+                PERSISTENT_BUMP_AMOUNT,
+            );
+            env.storage()
+                .persistent()
+                .remove(&DataKey::CancellationRequest(escrow_id));
+            events::emit_cancellation_expired(&env, escrow_id);
+            return;
+        }
+
+        // Caller must be the counterparty (not the initiator)
+        if caller == request.initiator {
+            panic!("Initiator cannot accept their own cancellation request");
+        }
+        if caller != escrow.buyer && caller != escrow.seller {
+            panic!("Only buyer or seller can accept cancellation");
+        }
+
+        let penalty_bps: u32 = env
+            .storage()
+            .instance()
+            .get(&DataKey::CancellationPenaltyBps)
+            .unwrap_or(0);
+
+        let penalty_amount = if penalty_bps > 0 {
+            (escrow.amount as u128 * penalty_bps as u128 / 10_000) as i128
+        } else {
+            0
+        };
+
+        let return_amount = escrow.amount - penalty_amount;
+
+        let token_client = token::Client::new(&env, &escrow.token);
+
+        // Return funds to buyer
+        if return_amount > 0 {
+            token_client.transfer(
+                &env.current_contract_address(),
+                &escrow.buyer,
+                &return_amount,
+            );
+        }
+
+        // Send penalty to fee collector if configured
+        if penalty_amount > 0 {
+            if let Some(fee_recipient) = env
+                .storage()
+                .instance()
+                .get::<DataKey, Address>(&DataKey::FeeRecipient)
+            {
+                token_client.transfer(
+                    &env.current_contract_address(),
+                    &fee_recipient,
+                    &penalty_amount,
+                );
+            } else {
+                // No fee recipient — return penalty to buyer too
+                token_client.transfer(
+                    &env.current_contract_address(),
+                    &escrow.buyer,
+                    &penalty_amount,
+                );
+            }
+        }
+
+        escrow.status = EscrowStatus::Refunded;
+        env.storage()
+            .persistent()
+            .set(&DataKey::Escrow(escrow_id), &escrow);
+        env.storage().persistent().extend_ttl(
+            &DataKey::Escrow(escrow_id),
+            PERSISTENT_LIFETIME_THRESHOLD,
+            PERSISTENT_BUMP_AMOUNT,
+        );
+        env.storage()
+            .persistent()
+            .remove(&DataKey::CancellationRequest(escrow_id));
+
+        events::emit_cancellation_accepted(&env, escrow_id, escrow.buyer, return_amount, penalty_amount);
+
+        env.storage()
+            .instance()
+            .extend_ttl(INSTANCE_LIFETIME_THRESHOLD, INSTANCE_BUMP_AMOUNT);
+    }
+
+    /// The counterparty rejects the cancellation request; escrow resumes Active state.
+    pub fn reject_cancellation(env: Env, caller: Address, escrow_id: u32) {
+        Self::require_not_paused(&env);
+        caller.require_auth();
+
+        let mut escrow: Escrow = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Escrow(escrow_id))
+            .expect("Escrow not found");
+
+        if escrow.status != EscrowStatus::CancellationPending {
+            panic!("No pending cancellation for this escrow");
+        }
+
+        let request: CancellationRequest = env
+            .storage()
+            .persistent()
+            .get(&DataKey::CancellationRequest(escrow_id))
+            .expect("Cancellation request not found");
+
+        if caller == request.initiator {
+            panic!("Initiator cannot reject their own cancellation request");
+        }
+        if caller != escrow.buyer && caller != escrow.seller {
+            panic!("Only buyer or seller can reject cancellation");
+        }
+
+        escrow.status = EscrowStatus::Active;
+        env.storage()
+            .persistent()
+            .set(&DataKey::Escrow(escrow_id), &escrow);
+        env.storage().persistent().extend_ttl(
+            &DataKey::Escrow(escrow_id),
+            PERSISTENT_LIFETIME_THRESHOLD,
+            PERSISTENT_BUMP_AMOUNT,
+        );
+        env.storage()
+            .persistent()
+            .remove(&DataKey::CancellationRequest(escrow_id));
+
+        events::emit_cancellation_rejected(&env, escrow_id, caller);
+
+        env.storage()
+            .instance()
+            .extend_ttl(INSTANCE_LIFETIME_THRESHOLD, INSTANCE_BUMP_AMOUNT);
+    }
+
+    /// Expire a stale cancellation request and restore Active state.
+    /// Callable by anyone after the response window has elapsed.
+    pub fn expire_cancellation(env: Env, escrow_id: u32) {
+        let mut escrow: Escrow = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Escrow(escrow_id))
+            .expect("Escrow not found");
+
+        if escrow.status != EscrowStatus::CancellationPending {
+            panic!("No pending cancellation for this escrow");
+        }
+
+        let request: CancellationRequest = env
+            .storage()
+            .persistent()
+            .get(&DataKey::CancellationRequest(escrow_id))
+            .expect("Cancellation request not found");
+
+        if env.ledger().timestamp() <= request.expires_at {
+            panic!("Response window has not elapsed");
+        }
+
+        escrow.status = EscrowStatus::Active;
+        env.storage()
+            .persistent()
+            .set(&DataKey::Escrow(escrow_id), &escrow);
+        env.storage().persistent().extend_ttl(
+            &DataKey::Escrow(escrow_id),
+            PERSISTENT_LIFETIME_THRESHOLD,
+            PERSISTENT_BUMP_AMOUNT,
+        );
+        env.storage()
+            .persistent()
+            .remove(&DataKey::CancellationRequest(escrow_id));
+
+        events::emit_cancellation_expired(&env, escrow_id);
 
         env.storage()
             .instance()

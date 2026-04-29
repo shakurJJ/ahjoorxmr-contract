@@ -1078,6 +1078,18 @@ pub fn emit_reinstatement_fee_collected(e: &Env, member: Address, amount: i128) 
     e.events().publish((Symbol::new(e, "ReinFee"),), (member, amount));
 }
 
+// #230: Group Merge Events
+pub fn emit_merge_proposed(e: &Env, proposal_id: u32, group_a_admin: Address, group_b_id: u32) {
+    e.events().publish((Symbol::new(e, "MergeProposed"),), (proposal_id, group_a_admin, group_b_id));
+}
+pub fn emit_merge_accepted(e: &Env, proposal_id: u32) {
+    e.events().publish((Symbol::new(e, "MergeAccepted"),), (proposal_id,));
+}
+pub fn emit_merge_completed(e: &Env, proposal_id: u32, members_added: u32) {
+    e.events().publish((Symbol::new(e, "MergeCompleted"),), (proposal_id, members_added));
+}
+pub fn emit_group_marked_merged(e: &Env, group_b_id: u32) {
+    e.events().publish((Symbol::new(e, "GroupMerged"),), (group_b_id,));
 // #224: Cycle Completion Bonus Events
 
 /// Event: Cycle bonus amount configured by admin

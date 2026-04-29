@@ -104,6 +104,23 @@ pub enum Error {
     VoucherExhausted = 11,
     VoucherRevoked = 12,
     VoucherNotFound = 13,
+    WithdrawalRateLimitExceeded = 14,
+}
+
+/// Per-merchant withdrawal rate limit config (#231).
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct WithdrawalLimit {
+    pub window_seconds: u64,
+    pub cap: i128,
+}
+
+/// Tracks cumulative withdrawals within the current window (#231).
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct WithdrawalWindowState {
+    pub window_start: u64,
+    pub withdrawn: i128,
 }
 
 /// Direction for oracle price condition (#125)
@@ -483,6 +500,14 @@ pub enum DataKey {
     AppealCooldownUntil(Address),
     /// Instance: appeal rejection cooldown in seconds
     AppealRejectionCooldownSeconds,
+    /// Instance: global default withdrawal window in seconds (#231)
+    WithdrawalWindowSeconds,
+    /// Instance: global default withdrawal cap per window (#231)
+    WithdrawalWindowCap,
+    /// Persistent: per-merchant withdrawal limit override (#231)
+    MerchantWithdrawalLimit(Address),
+    /// Persistent: per-merchant withdrawal tracker for current window (#231)
+    MerchantWithdrawalWindow(Address),
     /// Persistent: per-merchant revenue dashboard summary (#226)
     MerchantSummary(Address),
     /// #216: recurring invoice counter
@@ -1062,6 +1087,9 @@ impl AhjoorPaymentsContract {
         let net_amount = total_amount
             .checked_sub(fee_collected)
             .expect("Settlement fee exceeds amount");
+
+        // #231: Enforce withdrawal rate limit
+        Self::check_and_update_withdrawal_rate_limit(&env, &merchant, net_amount);
 
         let token_client = token::Client::new(&env, &settlement_token);
         token_client.transfer(&env.current_contract_address(), &merchant, &net_amount);
@@ -4046,6 +4074,163 @@ impl AhjoorPaymentsContract {
         {
             panic!("Contract is paused");
         }
+    }
+
+    // -------------------------------------------------------------------------
+    // #231: Merchant Withdrawal Rate Limiting
+    // -------------------------------------------------------------------------
+
+    /// Admin sets global default withdrawal window and cap.
+    pub fn set_withdrawal_window(env: Env, admin: Address, window_seconds: u64, cap: i128) {
+        Self::require_not_paused(&env);
+        admin.require_auth();
+        let stored_admin: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .expect("Not initialized");
+        if admin != stored_admin {
+            panic!("Only admin can set withdrawal window");
+        }
+        if window_seconds == 0 {
+            panic!("Window must be positive");
+        }
+        if cap <= 0 {
+            panic!("Cap must be positive");
+        }
+        env.storage()
+            .instance()
+            .set(&DataKey::WithdrawalWindowSeconds, &window_seconds);
+        env.storage()
+            .instance()
+            .set(&DataKey::WithdrawalWindowCap, &cap);
+        env.storage()
+            .instance()
+            .extend_ttl(INSTANCE_LIFETIME_THRESHOLD, INSTANCE_BUMP_AMOUNT);
+    }
+
+    /// Merchant sets a personal (stricter) withdrawal limit.
+    pub fn set_withdrawal_limit(env: Env, merchant: Address, window_seconds: u64, cap: i128) {
+        Self::require_not_paused(&env);
+        merchant.require_auth();
+        if window_seconds == 0 {
+            panic!("Window must be positive");
+        }
+        if cap <= 0 {
+            panic!("Cap must be positive");
+        }
+        let limit = WithdrawalLimit { window_seconds, cap };
+        env.storage()
+            .persistent()
+            .set(&DataKey::MerchantWithdrawalLimit(merchant.clone()), &limit);
+        env.storage().persistent().extend_ttl(
+            &DataKey::MerchantWithdrawalLimit(merchant.clone()),
+            PERSISTENT_LIFETIME_THRESHOLD,
+            PERSISTENT_BUMP_AMOUNT,
+        );
+        events::emit_withdrawal_rate_limit_set(&env, merchant, window_seconds, cap);
+        env.storage()
+            .instance()
+            .extend_ttl(INSTANCE_LIFETIME_THRESHOLD, INSTANCE_BUMP_AMOUNT);
+    }
+
+    /// Admin overrides a merchant's withdrawal cap (emergency override).
+    pub fn override_withdrawal_limit(env: Env, admin: Address, merchant: Address, cap: i128) {
+        Self::require_not_paused(&env);
+        admin.require_auth();
+        let stored_admin: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .expect("Not initialized");
+        if admin != stored_admin {
+            panic!("Only admin can override withdrawal limit");
+        }
+        if cap <= 0 {
+            panic!("Cap must be positive");
+        }
+        // Preserve existing window or use global default
+        let window_seconds: u64 = env
+            .storage()
+            .persistent()
+            .get::<DataKey, WithdrawalLimit>(&DataKey::MerchantWithdrawalLimit(merchant.clone()))
+            .map(|l| l.window_seconds)
+            .unwrap_or_else(|| {
+                env.storage()
+                    .instance()
+                    .get(&DataKey::WithdrawalWindowSeconds)
+                    .unwrap_or(24 * 60 * 60)
+            });
+        let limit = WithdrawalLimit { window_seconds, cap };
+        env.storage()
+            .persistent()
+            .set(&DataKey::MerchantWithdrawalLimit(merchant.clone()), &limit);
+        env.storage().persistent().extend_ttl(
+            &DataKey::MerchantWithdrawalLimit(merchant.clone()),
+            PERSISTENT_LIFETIME_THRESHOLD,
+            PERSISTENT_BUMP_AMOUNT,
+        );
+        events::emit_withdrawal_rate_limit_set(&env, merchant, window_seconds, cap);
+        env.storage()
+            .instance()
+            .extend_ttl(INSTANCE_LIFETIME_THRESHOLD, INSTANCE_BUMP_AMOUNT);
+    }
+
+    /// Internal: check and update the rolling withdrawal window for a merchant.
+    /// Panics with WithdrawalRateLimitExceeded if the cap would be exceeded.
+    fn check_and_update_withdrawal_rate_limit(env: &Env, merchant: &Address, amount: i128) {
+        // Determine effective limit: merchant-specific > global default > no limit
+        let (window_seconds, cap) = if let Some(limit) = env
+            .storage()
+            .persistent()
+            .get::<DataKey, WithdrawalLimit>(&DataKey::MerchantWithdrawalLimit(merchant.clone()))
+        {
+            (limit.window_seconds, limit.cap)
+        } else if let (Some(w), Some(c)) = (
+            env.storage()
+                .instance()
+                .get::<DataKey, u64>(&DataKey::WithdrawalWindowSeconds),
+            env.storage()
+                .instance()
+                .get::<DataKey, i128>(&DataKey::WithdrawalWindowCap),
+        ) {
+            (w, c)
+        } else {
+            // No rate limit configured — allow
+            return;
+        };
+
+        let now = env.ledger().timestamp();
+        let state_key = DataKey::MerchantWithdrawalWindow(merchant.clone());
+
+        let mut state: WithdrawalWindowState = env
+            .storage()
+            .persistent()
+            .get(&state_key)
+            .unwrap_or(WithdrawalWindowState {
+                window_start: now,
+                withdrawn: 0,
+            });
+
+        // Reset window if it has elapsed
+        if now >= state.window_start + window_seconds {
+            state.window_start = now;
+            state.withdrawn = 0;
+        }
+
+        let new_total = state.withdrawn.checked_add(amount).expect("Overflow");
+        if new_total > cap {
+            events::emit_withdrawal_rate_limit_exceeded(env, merchant.clone(), new_total, cap);
+            panic_with_error!(env, Error::WithdrawalRateLimitExceeded);
+        }
+
+        state.withdrawn = new_total;
+        env.storage().persistent().set(&state_key, &state);
+        env.storage().persistent().extend_ttl(
+            &state_key,
+            PERSISTENT_LIFETIME_THRESHOLD,
+            PERSISTENT_BUMP_AMOUNT,
+        );
     }
 
     fn require_admin(env: &Env, admin: &Address) {

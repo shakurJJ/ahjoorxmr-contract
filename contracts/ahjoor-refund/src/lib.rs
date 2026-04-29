@@ -175,6 +175,10 @@ pub enum DataKey {
     CounterOfferExpirySeconds,
     /// #217: admin-configurable max batch size for batch refund operations
     MaxBatchSize,
+    /// Per-merchant auto-approval threshold amount (#228)
+    AutoApproveThreshold(Address),
+    /// Global fraud score cap for auto-approval (#228)
+    AutoApproveFraudScoreCap,
 }
 
 mod events;
@@ -478,10 +482,43 @@ impl AhjoorRefundContract {
 
         let is_whitelisted = Self::is_merchant_auto_approved(&env, &merchant);
 
-        let initial_status = if is_whitelisted {
+        // #228: Check amount-based auto-approval threshold
+        let is_threshold_auto_approved = if !is_whitelisted {
+            let threshold: i128 = env
+                .storage()
+                .instance()
+                .get(&DataKey::AutoApproveThreshold(merchant.clone()))
+                .unwrap_or(0);
+            if threshold > 0 && effective_amount <= threshold {
+                // Check fraud score cap
+                let fraud_cap: u32 = env
+                    .storage()
+                    .instance()
+                    .get(&DataKey::AutoApproveFraudScoreCap)
+                    .unwrap_or(u32::MAX);
+                let buyer_score = Self::get_fraud_score(env.clone(), customer.clone());
+                buyer_score < fraud_cap
+            } else {
+                false
+            }
+        } else {
+            false
+        };
+
+        let is_auto_approved = is_whitelisted || is_threshold_auto_approved;
+
+        let initial_status = if is_auto_approved {
             RefundStatus::Approved
         } else {
             RefundStatus::Requested
+        };
+
+        let auto_source = if is_whitelisted {
+            Some(String::from_str(&env, "whitelist"))
+        } else if is_threshold_auto_approved {
+            Some(String::from_str(&env, "threshold"))
+        } else {
+            None
         };
 
         let now = env.ledger().timestamp();
@@ -496,14 +533,10 @@ impl AhjoorRefundContract {
             reason,
             reason_code,
             requested_at: now,
-            approved_at: if is_whitelisted { Some(now) } else { None },
+            approved_at: if is_auto_approved { Some(now) } else { None },
             processed_at: None,
             rejected_at: None,
-            auto_approved_source: if is_whitelisted {
-                Some(String::from_str(&env, "whitelist"))
-            } else {
-                None
-            },
+            auto_approved_source: auto_source,
             escrow_id: None,
             fee_amount: None,
         };
@@ -543,7 +576,7 @@ impl AhjoorRefundContract {
         );
 
         // #164: Add to pending queue only when not auto-approved
-        if !is_whitelisted {
+        if !is_auto_approved {
             Self::append_to_pending_queue(&env, refund_id);
         }
 
@@ -570,7 +603,11 @@ impl AhjoorRefundContract {
         }
 
         if is_whitelisted {
-            events::emit_refund_auto_approved_whitelist(&env, refund_id, merchant, effective_amount);
+            events::emit_refund_auto_approved_whitelist(&env, refund_id, merchant.clone(), effective_amount);
+        }
+
+        if is_threshold_auto_approved {
+            events::emit_refund_auto_approved_by_threshold(&env, refund_id, effective_amount);
         }
 
         env.storage()
@@ -1340,6 +1377,62 @@ impl AhjoorRefundContract {
             .instance()
             .get(&DataKey::FraudScoreBlockThreshold)
             .unwrap_or(10)
+    }
+
+    // -------------------------------------------------------------------------
+    // #228: Refund Merchant Auto-Approval Threshold
+    // -------------------------------------------------------------------------
+
+    /// Merchant sets their auto-approval threshold.
+    /// Refund requests with amount <= threshold are auto-approved (unless fraud score cap blocks).
+    /// Set to 0 to disable auto-approval by threshold.
+    pub fn set_auto_approve_threshold(env: Env, merchant: Address, amount: i128) {
+        Self::require_not_paused(&env);
+        merchant.require_auth();
+
+        if amount < 0 {
+            panic!("Threshold amount cannot be negative");
+        }
+
+        env.storage()
+            .instance()
+            .set(&DataKey::AutoApproveThreshold(merchant.clone()), &amount);
+
+        events::emit_auto_approve_threshold_set(&env, merchant, amount);
+
+        env.storage()
+            .instance()
+            .extend_ttl(INSTANCE_LIFETIME_THRESHOLD, INSTANCE_BUMP_AMOUNT);
+    }
+
+    /// Get the auto-approval threshold for a merchant. Returns 0 if not set (disabled).
+    pub fn get_auto_approve_threshold(env: Env, merchant: Address) -> i128 {
+        env.storage()
+            .instance()
+            .get(&DataKey::AutoApproveThreshold(merchant))
+            .unwrap_or(0)
+    }
+
+    /// Admin sets the global fraud score cap for auto-approval.
+    /// Buyers with fraud_score >= cap are excluded from threshold auto-approval.
+    pub fn set_auto_approve_fraud_score_cap(env: Env, admin: Address, cap: u32) {
+        Self::require_admin(&env, &admin);
+
+        env.storage()
+            .instance()
+            .set(&DataKey::AutoApproveFraudScoreCap, &cap);
+
+        env.storage()
+            .instance()
+            .extend_ttl(INSTANCE_LIFETIME_THRESHOLD, INSTANCE_BUMP_AMOUNT);
+    }
+
+    /// Get the fraud score cap for auto-approval. Returns u32::MAX if not set (no cap).
+    pub fn get_auto_approve_fraud_score_cap(env: Env) -> u32 {
+        env.storage()
+            .instance()
+            .get(&DataKey::AutoApproveFraudScoreCap)
+            .unwrap_or(u32::MAX)
     }
 
     /// Get the fraud score for a buyer.

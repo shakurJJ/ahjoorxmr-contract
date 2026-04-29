@@ -246,6 +246,13 @@ pub enum DataKey2 {
     ReinstatementFee,        // i128
     PendingReinstatementFee, // Vec<Address>
     ActiveReinstatementProposal, // Map<Address, u32>
+    // Waitlist (#219)
+    Waitlist,                // Vec<(Address, u64)> — (address, joined_at)
+    CatchUpDebt,             // Map<Address, i128> — catch-up contributions owed
+    // #230: Group Merge
+    MergeProposalCounter,    // u32
+    MergeProposals,          // Map<u32, MergeProposal>
+    GroupMergedInto,         // u32 — target group_id this group was merged into
     // #224: Cycle Completion Bonus
     CycleBonusAmount,        // i128 — bonus per qualifying member per cycle
     // #227: Round Duration Update
@@ -321,6 +328,8 @@ pub struct EmergencyPayoutConfig {
 pub enum GroupStatus {
     Active = 0,
     Dissolved = 1,
+    /// Group was merged into another group; all further interactions are rejected.
+    Merged = 2,
 }
 
 #[contracttype]
@@ -328,6 +337,17 @@ pub enum GroupStatus {
 pub struct DissolutionConfig {
     pub dissolution_quorum_bps: u32,    // e.g., 7500 = 75%
     pub vote_window_seconds: u64,
+}
+
+/// #230: Merge proposal between two ROSCA groups.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MergeProposal {
+    pub id: u32,
+    pub group_a_admin: Address,
+    pub group_b_id: u32,
+    pub proposed_at: u64,
+    pub accepted: bool,
 }
 
 // #213: Payout Slot Swap

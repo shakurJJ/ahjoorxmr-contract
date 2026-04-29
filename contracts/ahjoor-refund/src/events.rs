@@ -545,3 +545,29 @@ pub fn emit_refund_counter_accepted(e: &Env, refund_id: u32, customer: Address, 
 pub fn emit_refund_counter_rejected(e: &Env, refund_id: u32, customer: Address) {
     RefundCounterRejected { refund_id, customer }.publish(e);
 }
+
+// --- Issue #228: Refund Merchant Auto-Approval Threshold ---
+
+/// Event: Merchant set their auto-approval threshold
+#[contractevent]
+#[derive(Clone, Debug)]
+pub struct AutoApproveThresholdSet {
+    pub merchant: Address,
+    pub amount: i128,
+}
+
+/// Event: Refund auto-approved because amount <= merchant threshold
+#[contractevent]
+#[derive(Clone, Debug)]
+pub struct RefundAutoApprovedByThreshold {
+    pub refund_id: u32,
+    pub amount: i128,
+}
+
+pub fn emit_auto_approve_threshold_set(e: &Env, merchant: Address, amount: i128) {
+    AutoApproveThresholdSet { merchant, amount }.publish(e);
+}
+
+pub fn emit_refund_auto_approved_by_threshold(e: &Env, refund_id: u32, amount: i128) {
+    RefundAutoApprovedByThreshold { refund_id, amount }.publish(e);
+}
