@@ -1085,6 +1085,8 @@ pub fn emit_recurring_invoice_cancelled(e: &Env, invoice_id: u32, cancelled_by: 
 
 pub fn emit_recurring_invoice_completed(e: &Env, invoice_id: u32) {
     RecurringInvoiceCompleted { invoice_id }.publish(e);
+}
+
 // #231: Withdrawal Rate Limiting Events
 pub fn emit_withdrawal_rate_limit_set(e: &Env, merchant: Address, window_seconds: u64, cap: i128) {
     e.events().publish((soroban_sdk::Symbol::new(e, "WdrlLimitSet"),), (merchant, window_seconds, cap));
@@ -1133,6 +1135,8 @@ pub fn emit_points_redeemed(e: &Env, customer: Address, payment_id: u32, points_
 
 pub fn emit_points_expired(e: &Env, customer: Address, points_expired: i128) {
     PointsExpired { customer, points_expired }.publish(e);
+}
+
 // #242: Merchant Referral Commission Events
 /// Event: Referral registered
 #[contractevent]
@@ -1170,6 +1174,8 @@ pub fn emit_commission_accrued(e: &Env, referrer: Address, referred_merchant: Ad
 
 pub fn emit_commission_claimed(e: &Env, referrer: Address, amount: i128) {
     CommissionClaimed { referrer, amount }.publish(e);
+}
+
 // #246: Dynamic Settlement Events
 /// Event: Dynamic payment created with oracle price feed
 #[contractevent]
@@ -1197,6 +1203,8 @@ pub fn emit_dynamic_payment_created(e: &Env, payment_id: u32, fiat_amount: i128,
 
 pub fn emit_dynamic_payment_settled(e: &Env, payment_id: u32, fiat_amount: i128, token_amount: i128, rate_used: i128) {
     DynamicPaymentSettled { payment_id, fiat_amount, token_amount, rate_used }.publish(e);
+}
+
 // #235: Customer Spend Limit Events
 /// Event: Merchant set a per-customer spend limit
 #[contractevent]
@@ -1249,4 +1257,86 @@ pub fn emit_customer_spend_limit_exceeded(e: &Env, merchant: Address, customer: 
 
 pub fn emit_default_spend_limit_set(e: &Env, merchant: Address, amount: i128, window_seconds: u64) {
     DefaultSpendLimitSet { merchant, amount, window_seconds }.publish(e);
+}
+
+// #265: Tip / Gratuity Events
+
+/// Event: Customer tip forwarded to merchant at payment settlement (#265)
+#[contractevent]
+#[derive(Clone, Debug)]
+pub struct TipReceived {
+    pub payment_id: u32,
+    pub merchant: Address,
+    pub tip_amount: i128,
+    pub token: Address,
+}
+
+pub fn emit_tip_received(e: &Env, payment_id: u32, merchant: Address, tip_amount: i128, token: Address) {
+    TipReceived { payment_id, merchant, tip_amount, token }.publish(e);
+}
+
+// Multi-sig approval events
+pub fn emit_payment_approval_expired(e: &Env, payment_id: u32) {
+    e.events().publish(
+        (soroban_sdk::Symbol::new(e, "PmtApprovalExp"),),
+        (payment_id,),
+    );
+}
+
+pub fn emit_payment_approved(e: &Env, payment_id: u32, signer: Address) {
+    e.events().publish(
+        (soroban_sdk::Symbol::new(e, "PmtApproved"),),
+        (payment_id, signer),
+    );
+}
+
+// Voucher events
+pub fn emit_voucher_issued(
+    e: &Env,
+    merchant: Address,
+    code_hash: soroban_sdk::BytesN<32>,
+    _discount_type: crate::DiscountType,
+    discount_value: u32,
+    max_uses: u32,
+    expiry: u64,
+) {
+    e.events().publish(
+        (soroban_sdk::Symbol::new(e, "VoucherIssued"),),
+        (merchant, code_hash, discount_value, max_uses, expiry),
+    );
+}
+
+pub fn emit_voucher_revoked(e: &Env, merchant: Address, code_hash: soroban_sdk::BytesN<32>) {
+    e.events().publish(
+        (soroban_sdk::Symbol::new(e, "VoucherRevoked"),),
+        (merchant, code_hash),
+    );
+}
+
+pub fn emit_voucher_redeemed(
+    e: &Env,
+    merchant: Address,
+    code_hash: soroban_sdk::BytesN<32>,
+    customer: Address,
+    discount: i128,
+) {
+    e.events().publish(
+        (soroban_sdk::Symbol::new(e, "VoucherRedeemed"),),
+        (merchant, code_hash, customer, discount),
+    );
+}
+
+pub fn emit_voucher_exhausted(e: &Env, merchant: Address, code_hash: soroban_sdk::BytesN<32>) {
+    e.events().publish(
+        (soroban_sdk::Symbol::new(e, "VoucherExhausted"),),
+        (merchant, code_hash),
+    );
+}
+
+// External ID indexing event
+pub fn emit_payment_indexed_by_external_id(e: &Env, payment_id: u32, ext_id: soroban_sdk::BytesN<32>) {
+    e.events().publish(
+        (soroban_sdk::Symbol::new(e, "PmtIndexedExtId"),),
+        (payment_id, ext_id),
+    );
 }

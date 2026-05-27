@@ -32,7 +32,7 @@ pub enum EscrowStatus {
     /// #237: Escrow created but awaiting seller collateral deposit before becoming Active.
     AwaitingCollateral = 9,
     /// Seller has proposed a role transfer; buyer has a veto window (#244).
-    AwaitingBuyerVetoDecision = 9,
+    AwaitingBuyerVetoDecision = 10,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -297,6 +297,12 @@ pub enum DataKey {
     RatingScore(Address),
     /// #146: (escrow_id, rater) → bool — prevents double-rating
     RatingSubmitted(u32, Address),
+    /// Cooling-off window seconds after arbiter verdict (0 = disabled)
+    ResolutionCoolingOffSeconds,
+    /// Pending arbiter verdict awaiting cooling-off
+    PendingVerdict(u32),
+    /// (escrow_id) → (caller, reason_hash) for dispute resolution flag
+    ResolutionFlag(u32),
 }
 
 const MAX_PROTOCOL_FEE_BPS: u32 = 200; // 2%
@@ -1544,7 +1550,7 @@ impl AhjoorEscrowContract {
     }
 
     /// Admin sets the global cooling-off window in seconds (0 = disabled).
-    pub fn set_resolution_cooling_off_seconds(env: Env, admin: Address, seconds: u64) {
+    pub fn set_resolution_cooloff_secs(env: Env, admin: Address, seconds: u64) {
         Self::require_not_paused(&env);
         admin.require_auth();
         let stored_admin: Address = env
@@ -2940,6 +2946,11 @@ impl AhjoorEscrowContract {
                 release_threshold_price: None,
                 arbiter_fee_bps: None,
                 dispute_default_winner: None,
+                required_collateral_bps: 0,
+                collateral_forfeit_bps: 0,
+                collateral_deposit_deadline: 0,
+                collateral_amount: 0,
+                delivery_proof_hash: None,
             },
         };
 
@@ -3128,6 +3139,11 @@ impl AhjoorEscrowContract {
                 release_threshold_price: None,
                 arbiter_fee_bps: None,
                 dispute_default_winner: None,
+                required_collateral_bps: 0,
+                collateral_forfeit_bps: 0,
+                collateral_deposit_deadline: 0,
+                collateral_amount: 0,
+                delivery_proof_hash: None,
             },
         };
 
@@ -4024,15 +4040,18 @@ impl AhjoorEscrowContract {
         if collateral_forfeit_bps > 10_000 {
             panic!("collateral_forfeit_bps cannot exceed 10000");
         }
-        let sellers: Vec<(Address, u32)> = Vec::new(&env);
+        if sellers.is_empty() {
+            panic!("At least one seller required");
+        }
+        let primary_seller = sellers.get(0).unwrap().0;
         let escrow_id = Self::create_escrow_core(
             &env,
             &buyer,
             EscrowCreateRequest {
-                seller: seller.clone(),
+                seller: primary_seller,
                 arbiter,
                 amount,
-                token: token.clone(),
+                token,
                 deadline,
                 metadata_hash,
                 sellers,
@@ -4081,82 +4100,6 @@ impl AhjoorEscrowContract {
         Self::require_not_paused(&env);
         seller.require_auth();
         let mut escrow: Escrow = env
-    ) -> u32 {
-        Self::require_not_paused(&env);
-        buyer.require_auth();
-
-        if sellers.is_empty() {
-            panic!("At least one seller required");
-        }
-
-        // Validate shares sum to 10,000 bps
-        let mut total_bps: u32 = 0;
-        for i in 0..sellers.len() {
-            let (_, bps) = sellers.get(i).unwrap();
-            total_bps += bps;
-        }
-        if total_bps != 10_000 {
-            panic!("Seller shares must sum to 10000 bps");
-        }
-
-        let primary_seller = sellers.get(0).unwrap().0;
-
-        let request = EscrowCreateRequest {
-            seller: primary_seller,
-            arbiter,
-            amount,
-            token,
-            deadline,
-            metadata_hash,
-            sellers,
-            auto_renew: false,
-            renewal_count: 0,
-            buyer_inactivity_secs: 0,
-            min_lock_until: None,
-            release_base: None,
-            release_quote: None,
-            release_comparison: None,
-            release_threshold_price: None,
-            arbiter_fee_bps: None,
-            dispute_default_winner: None,
-        };
-
-        let escrow_id = Self::create_escrow_core(&env, &buyer, request);
-
-        let escrow: Escrow = env
-            .storage()
-            .persistent()
-            .get(&DataKey::Escrow(escrow_id))
-            .expect("Escrow not found");
-
-        events::emit_multi_seller_escrow_created(&env, escrow_id, escrow.sellers.clone());
-
-        env.storage()
-            .instance()
-            .extend_ttl(INSTANCE_LIFETIME_THRESHOLD, INSTANCE_BUMP_AMOUNT);
-
-        escrow_id
-    }
-
-    // ─── #146: Post-Resolution Rating System ─────────────────────────────────
-
-    /// Submit a 1-5 star rating for the counterparty after escrow completion.
-    /// Callable by buyer (rating seller) or seller (rating buyer).
-    /// Only allowed once per escrow per rater; escrow must be Released or Resolved.
-    pub fn submit_rating(
-        env: Env,
-        rater: Address,
-        escrow_id: u32,
-        rating: u32,
-        comment_hash: Option<BytesN<32>>,
-    ) {
-        rater.require_auth();
-
-        if rating < 1 || rating > 5 {
-            panic!("Rating must be between 1 and 5");
-        }
-
-        let escrow: Escrow = env
             .storage()
             .persistent()
             .get(&DataKey::Escrow(escrow_id))
@@ -4182,33 +4125,7 @@ impl AhjoorEscrowContract {
             PERSISTENT_LIFETIME_THRESHOLD,
             PERSISTENT_BUMP_AMOUNT,
         );
-        if escrow.buyer != buyer {
-            panic!("Only buyer can set delivery proof hash");
-        }
-        if escrow.status != EscrowStatus::Active {
-            panic!("Escrow must be Active to set delivery proof hash");
-        }
-        escrow.extensions.delivery_proof_hash = Some(proof_hash);
-
-        if escrow.buyer != buyer {
-            panic!("Only the buyer can veto");
-        }
-        if escrow.status != EscrowStatus::AwaitingBuyerVetoDecision {
-            panic!("No pending seller transfer");
-        }
-
-        let proposal: SellerTransferProposal = env
-            .storage()
-            .persistent()
-            .get(&DataKey::SellerTransferProposal(escrow_id))
-            .expect("Proposal not found");
-
-        if env.ledger().sequence() > proposal.veto_deadline {
-            panic!("Veto window has expired");
-        }
-
-        let refund_amount = escrow.amount;
-        escrow.status = EscrowStatus::Refunded;
+        escrow.status = EscrowStatus::Active;
         env.storage()
             .persistent()
             .set(&DataKey::Escrow(escrow_id), &escrow);
@@ -4217,11 +4134,36 @@ impl AhjoorEscrowContract {
             PERSISTENT_LIFETIME_THRESHOLD,
             PERSISTENT_BUMP_AMOUNT,
         );
+        events::emit_collateral_deposited(&env, escrow_id, seller, collateral);
+        env.storage()
+            .instance()
+            .extend_ttl(INSTANCE_LIFETIME_THRESHOLD, INSTANCE_BUMP_AMOUNT);
+    }
+
+    // ─── #146: Post-Resolution Rating System ─────────────────────────────────
+
+    /// Submit a 1-5 star rating for the counterparty after escrow completion.
+    /// Callable by buyer (rating seller) or seller (rating buyer).
+    /// Only allowed once per escrow per rater; escrow must be Released or Resolved.
+    pub fn submit_rating(
+        env: Env,
+        rater: Address,
+        escrow_id: u32,
+        rating: u32,
+        comment_hash: Option<BytesN<32>>,
+    ) {
+        rater.require_auth();
+        if rating < 1 || rating > 5 {
+            panic!("Rating must be between 1 and 5");
+        }
+        let escrow: Escrow = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Escrow(escrow_id))
+            .expect("Escrow not found");
         if escrow.status != EscrowStatus::Released && escrow.status != EscrowStatus::Resolved {
             panic!("Rating only allowed after escrow is Released or Resolved");
         }
-
-        // Determine ratee: buyer rates seller, seller rates buyer
         let ratee = if rater == escrow.buyer {
             escrow.seller.clone()
         } else if rater == escrow.seller {
@@ -4229,8 +4171,6 @@ impl AhjoorEscrowContract {
         } else {
             panic!("Only buyer or seller can submit a rating");
         };
-
-        // Prevent double-rating
         let rating_key = DataKey::RatingSubmitted(escrow_id, rater.clone());
         if env.storage().persistent().has(&rating_key) {
             panic!("Rating already submitted for this escrow");
@@ -4241,12 +4181,23 @@ impl AhjoorEscrowContract {
             PERSISTENT_LIFETIME_THRESHOLD,
             PERSISTENT_BUMP_AMOUNT,
         );
-
-        // Refund buyer
-        let token_client = token::Client::new(&env, &escrow.token);
-        token_client.transfer(&env.current_contract_address(), &buyer, &refund_amount);
-
-        events::emit_seller_transfer_vetoed(&env, escrow_id, buyer, refund_amount);
+        let score_key = DataKey::RatingScore(ratee.clone());
+        let (total_score, count): (u64, u32) = env
+            .storage()
+            .persistent()
+            .get(&score_key)
+            .unwrap_or((0u64, 0u32));
+        let new_total = total_score + rating as u64;
+        let new_count = count + 1;
+        env.storage()
+            .persistent()
+            .set(&score_key, &(new_total, new_count));
+        env.storage().persistent().extend_ttl(
+            &score_key,
+            PERSISTENT_LIFETIME_THRESHOLD,
+            PERSISTENT_BUMP_AMOUNT,
+        );
+        events::emit_rating_submitted(&env, escrow_id, rater, ratee, rating, comment_hash);
         env.storage()
             .instance()
             .extend_ttl(INSTANCE_LIFETIME_THRESHOLD, INSTANCE_BUMP_AMOUNT);
@@ -4254,14 +4205,9 @@ impl AhjoorEscrowContract {
 
     /// Seller submits a raw proof. If sha256(proof) matches the stored delivery_proof_hash,
     /// the escrow is automatically released to the seller.
-    /// Panics if no proof hash is set, if the escrow is not Active, or if the hash mismatches.
     pub fn submit_delivery_proof(env: Env, seller: Address, escrow_id: u32, proof: BytesN<32>) {
         Self::require_not_paused(&env);
         seller.require_auth();
-    /// Buyer explicitly approves the seller transfer, finalising it immediately.
-    pub fn approve_seller_transfer(env: Env, buyer: Address, escrow_id: u32) {
-        buyer.require_auth();
-
         let mut escrow: Escrow = env
             .storage()
             .persistent()
@@ -4281,32 +4227,47 @@ impl AhjoorEscrowContract {
             .delivery_proof_hash
             .clone()
             .expect("No delivery proof hash set on this escrow");
-
-        // Compute sha256 of the submitted proof bytes
         let proof_bytes = soroban_sdk::Bytes::from(proof.clone());
         let computed: BytesN<32> = env.crypto().sha256(&proof_bytes).into();
         if computed != expected_hash {
             panic!("InvalidDeliveryProof");
         }
-
-        // Auto-release: transfer funds to seller(s)
         let total = escrow.amount;
         Self::transfer_to_sellers(&env, &escrow, total, escrow_id);
         escrow.status = EscrowStatus::Released;
+        env.storage()
+            .persistent()
+            .set(&DataKey::Escrow(escrow_id), &escrow);
+        env.storage().persistent().extend_ttl(
+            &DataKey::Escrow(escrow_id),
+            PERSISTENT_LIFETIME_THRESHOLD,
+            PERSISTENT_BUMP_AMOUNT,
+        );
+        events::emit_delivery_proof_submitted(&env, escrow_id, seller, computed, true);
+        env.storage()
+            .instance()
+            .extend_ttl(INSTANCE_LIFETIME_THRESHOLD, INSTANCE_BUMP_AMOUNT);
+    }
 
+    /// Buyer explicitly approves the seller transfer, finalising it immediately.
+    pub fn approve_seller_transfer(env: Env, buyer: Address, escrow_id: u32) {
+        buyer.require_auth();
+        let mut escrow: Escrow = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Escrow(escrow_id))
+            .expect("Escrow not found");
         if escrow.buyer != buyer {
             panic!("Only the buyer can approve");
         }
         if escrow.status != EscrowStatus::AwaitingBuyerVetoDecision {
             panic!("No pending seller transfer");
         }
-
         let proposal: SellerTransferProposal = env
             .storage()
             .persistent()
             .get(&DataKey::SellerTransferProposal(escrow_id))
             .expect("Proposal not found");
-
         escrow.seller = proposal.new_seller.clone();
         escrow.status = EscrowStatus::Active;
         env.storage()
@@ -4317,69 +4278,30 @@ impl AhjoorEscrowContract {
             PERSISTENT_LIFETIME_THRESHOLD,
             PERSISTENT_BUMP_AMOUNT,
         );
-        events::emit_collateral_deposited(&env, escrow_id, seller, collateral);
-        // Accumulate score
-        let score_key = DataKey::RatingScore(ratee.clone());
-        let (total_score, count): (u64, u32) = env
-            .storage()
-            .persistent()
-            .get(&score_key)
-            .unwrap_or((0u64, 0u32));
-        let new_total = total_score + rating as u64;
-        let new_count = count + 1;
-        env.storage()
-            .persistent()
-            .set(&score_key, &(new_total, new_count));
-        env.storage().persistent().extend_ttl(
-            &score_key,
-            PERSISTENT_LIFETIME_THRESHOLD,
-            PERSISTENT_BUMP_AMOUNT,
-        );
-
         events::emit_seller_transfer_approved(&env, escrow_id, proposal.new_seller);
-        events::emit_rating_submitted(&env, escrow_id, rater, ratee, rating, comment_hash);
-
         env.storage()
             .instance()
             .extend_ttl(INSTANCE_LIFETIME_THRESHOLD, INSTANCE_BUMP_AMOUNT);
     }
 
     /// Anyone can call this after the veto window expires to finalise the transfer.
-    pub fn finalize_seller_transfer_if_expired(env: Env, escrow_id: u32) {
+    pub fn expire_seller_transfer_veto(env: Env, escrow_id: u32) {
         let mut escrow: Escrow = env
             .storage()
             .persistent()
             .get(&DataKey::Escrow(escrow_id))
             .expect("Escrow not found");
-        if escrow.status != EscrowStatus::AwaitingCollateral {
-            panic!("Escrow is not awaiting collateral");
-        }
-        let now = env.ledger().timestamp();
-        if now <= escrow.extensions.collateral_deposit_deadline {
-            panic!("Collateral deposit window has not yet expired");
-        }
-        let client = token::Client::new(&env, &escrow.token);
-        client.transfer(
-            &env.current_contract_address(),
-            &escrow.buyer,
-            &escrow.amount,
-        );
-        escrow.status = EscrowStatus::Refunded;
-
         if escrow.status != EscrowStatus::AwaitingBuyerVetoDecision {
             panic!("No pending seller transfer");
         }
-
         let proposal: SellerTransferProposal = env
             .storage()
             .persistent()
             .get(&DataKey::SellerTransferProposal(escrow_id))
             .expect("Proposal not found");
-
         if env.ledger().sequence() <= proposal.veto_deadline {
             panic!("Veto window has not expired yet");
         }
-
         escrow.seller = proposal.new_seller.clone();
         escrow.status = EscrowStatus::Active;
         env.storage()
@@ -4390,19 +4312,12 @@ impl AhjoorEscrowContract {
             PERSISTENT_LIFETIME_THRESHOLD,
             PERSISTENT_BUMP_AMOUNT,
         );
-        events::emit_escrow_refunded(&env, escrow_id, escrow.buyer, escrow.amount);
-        env.storage()
-            .instance()
-            .extend_ttl(INSTANCE_LIFETIME_THRESHOLD, INSTANCE_BUMP_AMOUNT);
-
-        events::emit_delivery_proof_submitted(&env, escrow_id, seller, computed, true);
-        env.storage()
-            .instance()
-            .extend_ttl(INSTANCE_LIFETIME_THRESHOLD, INSTANCE_BUMP_AMOUNT);
         events::emit_seller_transfer_expired_approved(&env, escrow_id, proposal.new_seller);
         env.storage()
             .instance()
             .extend_ttl(INSTANCE_LIFETIME_THRESHOLD, INSTANCE_BUMP_AMOUNT);
+    }
+
     /// Returns (avg_score_x100, total_ratings) for an address.
     /// avg_score_x100 = (total_score * 100) / count, or 0 if no ratings.
     pub fn get_reputation(env: Env, address: Address) -> (u32, u32) {

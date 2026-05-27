@@ -1135,6 +1135,7 @@ pub fn emit_merge_completed(e: &Env, proposal_id: u32, members_added: u32) {
 }
 pub fn emit_group_marked_merged(e: &Env, group_b_id: u32) {
     e.events().publish((Symbol::new(e, "GroupMerged"),), (group_b_id,));
+}
 // #224: Cycle Completion Bonus Events
 
 /// Event: Cycle bonus amount configured by admin
@@ -1216,6 +1217,7 @@ pub fn emit_co_signer_contributed(e: &Env, group_id: u32, member: Address, co_si
 
 pub fn emit_co_signer_window_expired(e: &Env, group_id: u32, member: Address) {
     e.events().publish((soroban_sdk::Symbol::new(e, "CoSignerWinExpired"),), (group_id, member));
+}
 // #236: Group Activity Freeze Events
 
 /// Event: Group frozen by contract-level admin
@@ -1242,6 +1244,7 @@ pub fn emit_group_frozen(e: &Env, group_id: u32, reason_hash: BytesN<32>, frozen
 
 pub fn emit_group_unfrozen(e: &Env, group_id: u32, resolution_hash: BytesN<32>, unfrozen_at: u32) {
     GroupUnfrozen { group_id, resolution_hash, unfrozen_at }.publish(e);
+}
 // #243: Group State Snapshot Events
 
 /// Event: Group state snapshot taken
@@ -1255,4 +1258,62 @@ pub struct SnapshotTaken {
 
 pub fn emit_snapshot_taken(e: &Env, snapshot_id: u32, taken_by: Address, state_hash: BytesN<32>) {
     SnapshotTaken { snapshot_id, taken_by, state_hash }.publish(e);
+}
+
+// #267: Tiered Contribution Level Events
+
+/// Event: A new tier was defined for the group (#267)
+#[contractevent]
+#[derive(Clone, Debug)]
+pub struct TierDefined {
+    pub tier_id: u32,
+    pub name: soroban_sdk::Symbol,
+    pub contribution_amount: i128,
+    pub payout_weight: u32,
+}
+
+/// Event: Member joined the group with a specific tier (#267)
+#[contractevent]
+#[derive(Clone, Debug)]
+pub struct MemberJoinedWithTier {
+    pub member: Address,
+    pub tier_id: u32,
+}
+
+/// Event: Member's tier change queued or applied (#267)
+#[contractevent]
+#[derive(Clone, Debug)]
+pub struct MemberTierChanged {
+    pub member: Address,
+    pub old_tier: u32,
+    pub new_tier: u32,
+    pub effective_cycle: u32,
+}
+
+pub fn emit_tier_defined(e: &Env, tier_id: u32, name: soroban_sdk::Symbol, contribution_amount: i128, payout_weight: u32) {
+    TierDefined { tier_id, name, contribution_amount, payout_weight }.publish(e);
+}
+
+pub fn emit_member_joined_with_tier(e: &Env, member: Address, tier_id: u32) {
+    MemberJoinedWithTier { member, tier_id }.publish(e);
+}
+
+pub fn emit_member_tier_changed(e: &Env, member: Address, old_tier: u32, new_tier: u32, effective_cycle: u32) {
+    MemberTierChanged { member, old_tier, new_tier, effective_cycle }.publish(e);
+}
+
+// #269: On-Chain Member Credit Score Events
+
+/// Event: A member's credit score was updated (#269)
+#[contractevent]
+#[derive(Clone, Debug)]
+pub struct CreditScoreUpdated {
+    pub member: Address,
+    pub old_score: i128,
+    pub new_score: i128,
+    pub reason: soroban_sdk::Symbol,
+}
+
+pub fn emit_credit_score_updated(e: &Env, member: Address, old_score: i128, new_score: i128, reason: soroban_sdk::Symbol) {
+    CreditScoreUpdated { member, old_score, new_score, reason }.publish(e);
 }

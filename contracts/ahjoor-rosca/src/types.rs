@@ -261,22 +261,30 @@ pub enum DataKey2 {
     PendingRoundDuration,    // u64 — new duration to apply at next round start
     MinRoundDuration,        // u64 — lower bound for round duration
     MaxRoundDuration,        // u64 — upper bound for round duration
-    // Waitlist
-    Waitlist,                // Vec<(Address, u64)> — (address, joined_at)
-    CatchUpDebt,             // Map<Address, i128> — catch-up contributions owed
+    // Waitlist (#219)
     StartAt,                 // u64
     GroupActivationEmitted,  // bool
-    Waitlist,                // Vec<(Address, u64)>
-    CatchUpDebt,             // Map<Address, i128>
     GracePeriodLedgers,      // u32
     PendingPenalties,        // Map<Address, u32> (member -> round)
     LastRoundDeadline,       // u64
     // #240: Co-Signer Guarantee
     CoSigners,               // Map<Address, CoSignerRecord> — member → co-signer record
     CoSignerWindowLedgers,   // u32 — grace period ledgers before penalty applied
-    CoSignerWindowStart,     // Map<Address, u32> — member → ledger when window opened
-    // #236: Group Activity Freeze
-    IsFrozen,                // bool — group is frozen by contract-level admin
+}
+
+/// Overflow key enum — DataKey2 is capped at 50 variants by the soroban XDR limit.
+#[derive(Clone)]
+#[contracttype]
+pub enum DataKey3 {
+    CoSignerWindowStart,     // Map<Address, u32> — member → ledger when window opened (#240)
+    IsFrozen,                // bool — group is frozen by contract-level admin (#236)
+    // #267: Tiered Contribution Levels
+    GroupTiers,              // Vec<Tier> — named tier definitions
+    MemberTierIndex,         // Map<Address, u32> — member → tier_id
+    PendingTierChange,       // Map<Address, u32> — queued tier changes for next cycle
+    // #269: On-Chain Member Credit Score
+    ScoreWeights,            // ScoreWeights — admin-configurable scoring formula weights
+    MinCreditScore,          // i128 — minimum score required to join this group
 }
 
 /// Persistent storage keys — kept separate because DataKey was hitting
@@ -284,9 +292,13 @@ pub enum DataKey2 {
 #[derive(Clone)]
 #[contracttype]
 pub enum PersistentKey {
-    RoundHistory, // Vec<PayoutRecord> — grows every round
-    ReputationScores, // Map<Address, i128> — cumulative member reliability score
-    FreezeLog,    // Vec<FreezeRecord> — append-only freeze audit log
+    RoundHistory,              // Vec<PayoutRecord> — grows every round
+    ReputationScores,          // Map<Address, i128> — cumulative member reliability score
+    FreezeLog,                 // Vec<FreezeRecord> — append-only freeze audit log
+    SnapshotLog,               // Vec<GroupSnapshot> — append-only snapshot log (#243)
+    LastSnapshotLedger,        // u32 — last snapshot ledger for spam guard (#243)
+    MinSnapshotIntervalLedgers, // u32 — min interval between snapshots (#243)
+    MemberCreditScores,        // Map<Address, MemberScore> — per-member credit score (#269)
 }
 
 /// Record of a single freeze/unfreeze cycle for a group.
@@ -298,12 +310,6 @@ pub struct FreezeRecord {
     pub reason_hash: BytesN<32>,
     pub unfrozen_at_ledger: Option<u32>,
     pub resolution_hash: Option<BytesN<32>>,
-    /// Append-only snapshot log (#243)
-    SnapshotLog,  // Vec<GroupSnapshot>
-    /// Last snapshot ledger for spam guard (#243)
-    LastSnapshotLedger, // u32
-    /// Min interval between snapshots in ledgers (#243)
-    MinSnapshotIntervalLedgers, // u32
 }
 
 /// On-chain group state snapshot for immutable audit (#243).
@@ -452,6 +458,44 @@ pub struct InsuranceClaim {
     pub round: u32,
     pub defaulter: Address,
     pub amount_covered: i128,
+}
+
+// ── #267: Tiered Contribution Levels ──────────────────────────────────────────
+
+/// A contribution tier definition — name, fixed contribution amount, and payout weight.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Tier {
+    pub name: soroban_sdk::Symbol,
+    pub contribution_amount: i128,
+    pub payout_weight: u32,
+}
+
+// ── #269: On-Chain Member Credit Score ────────────────────────────────────────
+
+/// Accumulated contribution-behaviour record for a member (#269).
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MemberScore {
+    pub on_time_contributions: u32,
+    pub late_contributions: u32,
+    pub defaults: u32,
+    pub early_exits: u32,
+    pub groups_completed: u32,
+    /// Computed numeric score derived from the above counters and ScoreWeights.
+    pub score: i128,
+}
+
+/// Admin-configurable weights used to compute the credit score (#269).
+/// Positive weights increase score; negative weights decrease it.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ScoreWeights {
+    pub on_time_weight: i128,
+    pub late_weight: i128,
+    pub default_weight: i128,
+    pub exit_weight: i128,
+    pub completion_weight: i128,
 }
 
 

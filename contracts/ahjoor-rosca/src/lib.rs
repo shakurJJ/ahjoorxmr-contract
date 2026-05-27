@@ -922,6 +922,7 @@ impl AhjoorContract {
         // Only mark as fully paid (and track participation) when target is reached
         if new_total == member_required_amount {
             Self::apply_reputation_delta(&env, contributor.clone(), 10, "on_time_full");
+            Self::update_credit_score_internal(&env, &contributor, Symbol::new(&env, "on_time"));
             paid_members.push_back(contributor.clone());
             env.storage()
                 .instance()
@@ -1352,7 +1353,7 @@ impl AhjoorContract {
         let mut window_starts: Map<Address, u32> = env
             .storage()
             .instance()
-            .get(&DataKey2::CoSignerWindowStart)
+            .get(&DataKey3::CoSignerWindowStart)
             .unwrap_or(Map::new(&env));
 
         for member in defaulters.iter() {
@@ -1366,7 +1367,7 @@ impl AhjoorContract {
                             window_starts.set(member.clone(), env.ledger().sequence());
                             env.storage()
                                 .instance()
-                                .set(&DataKey2::CoSignerWindowStart, &window_starts);
+                                .set(&DataKey3::CoSignerWindowStart, &window_starts);
                             // Skip penalty this round — co-signer has a window to act
                             continue;
                         }
@@ -1380,7 +1381,7 @@ impl AhjoorContract {
                         window_starts.remove(member.clone());
                         env.storage()
                             .instance()
-                            .set(&DataKey2::CoSignerWindowStart, &window_starts);
+                            .set(&DataKey3::CoSignerWindowStart, &window_starts);
                         events::emit_co_signer_window_expired(&env, 0, member.clone());
                     }
                 }
@@ -1390,6 +1391,7 @@ impl AhjoorContract {
             default_count.set(member.clone(), count);
 
             events::emit_defaulted(&env, member.clone(), current_round, penalty_amount, count);
+            Self::update_credit_score_internal(&env, &member, Symbol::new(&env, "default"));
 
             // Suspend after reaching max_defaults consecutive missed rounds
             if count >= max_defaults && !suspended_members.contains(&member) {
@@ -1414,7 +1416,16 @@ impl AhjoorContract {
             .get(&DataKey::PayoutOrder)
             .unwrap_or(Vec::new(&env));
         let cycle_len = payout_order.len() as u32;
-        if cycle_len > 0 && (current_round + 1) % cycle_len == 0 {
+        let cycle_completed = cycle_len > 0 && (current_round + 1) % cycle_len == 0;
+        if cycle_completed {
+            // Credit score: every non-exited member who completed the cycle
+            for member in members.iter() {
+                if !exited_members.contains(&member) {
+                    Self::update_credit_score_internal(&env, &member, Symbol::new(&env, "completed"));
+                }
+            }
+        }
+        if cycle_completed {
             let bonus_amount: i128 = env
                 .storage()
                 .instance()
@@ -1486,7 +1497,7 @@ impl AhjoorContract {
         internals::check_not_paused(&env);
         admin.require_auth();
         let a: Address = env.storage().instance().get(&DataKey::Admin).expect("No admin");
-        if admin != a { panic_with_error!(&env, Error::OnlyAdminAllowed); }
+        if admin != a { panic_with_error!(&env, ExtError::OnlyAdminAllowed); }
         if amount < 0 { panic_with_error!(&env, Error::AmountMustBePositive); }
         env.storage().instance().set(&DataKey2::CycleBonusAmount, &amount);
         events::emit_cycle_bonus_configured(&env, amount);
@@ -1506,12 +1517,12 @@ impl AhjoorContract {
         internals::check_not_paused(&env);
         admin.require_auth();
         let a: Address = env.storage().instance().get(&DataKey::Admin).expect("No admin");
-        if admin != a { panic_with_error!(&env, Error::OnlyAdminAllowed); }
+        if admin != a { panic_with_error!(&env, ExtError::OnlyAdminAllowed); }
 
         let min_dur: u64 = env.storage().instance().get(&DataKey2::MinRoundDuration).unwrap_or(60);
         let max_dur: u64 = env.storage().instance().get(&DataKey2::MaxRoundDuration).unwrap_or(u64::MAX);
         if new_duration_seconds < min_dur || new_duration_seconds > max_dur {
-            panic_with_error!(&env, Error::RoundDurationOutOfBounds);
+            panic_with_error!(&env, ExtError::RoundDurationOutOfBounds);
         }
 
         let old_duration: u64 = env.storage().instance().get(&DataKey::RoundDuration).unwrap_or(0);
@@ -1527,12 +1538,17 @@ impl AhjoorContract {
         internals::check_not_paused(&env);
         admin.require_auth();
         let a: Address = env.storage().instance().get(&DataKey::Admin).expect("No admin");
-        if admin != a { panic_with_error!(&env, Error::OnlyAdminAllowed); }
-        if min_seconds == 0 || min_seconds > max_seconds { panic_with_error!(&env, Error::InvalidAmount); }
+        if admin != a { panic_with_error!(&env, ExtError::OnlyAdminAllowed); }
+        if min_seconds == 0 || min_seconds > max_seconds { panic_with_error!(&env, ExtError::InvalidAmount); }
         env.storage().instance().set(&DataKey2::MinRoundDuration, &min_seconds);
         env.storage().instance().set(&DataKey2::MaxRoundDuration, &max_seconds);
         env.storage().instance().extend_ttl(INSTANCE_LIFETIME_THRESHOLD, INSTANCE_BUMP_AMOUNT);
     }
+
+    /// Member requests a grace-period deferral of their pending penalty.
+    /// Admin must approve; if within the grace window, the penalty is queued;
+    /// otherwise it is applied immediately.
+    pub fn request_penalty_grace(env: Env, member: Address) {
         internals::check_not_paused(&env);
         let admin: Address = env
             .storage()
@@ -4235,6 +4251,7 @@ impl AhjoorContract {
             .set(&DataKey2::ExitRequests, &requests);
 
         events::emit_exit_ok(&env, member.clone(), refund_amount);
+        Self::update_credit_score_internal(&env, &member, Symbol::new(&env, "early_exit"));
 
         // Auto-promote from waitlist to fill the vacancy
         Self::try_promote_from_waitlist(&env, &member);
@@ -4595,7 +4612,9 @@ impl AhjoorContract {
                 1 => {
                     // PenaliseDefaulter
                     if let Some(member) = target_member {
-                        Self::penalise_defaulter(env.clone(), member);
+                        let penalty: i128 = env.storage().instance().get(&DataKey::PenaltyAmount).unwrap_or(0);
+                        let round: u32 = env.storage().instance().get(&DataKey::CurrentRound).unwrap_or(0);
+                        Self::apply_penalty(&env, member, penalty, round);
                     }
                 }
                 2 => {
@@ -4658,7 +4677,9 @@ impl AhjoorContract {
             1 => {
                 // PenaliseDefaulter
                 if let Some(member) = target_member {
-                    Self::penalise_defaulter(env.clone(), member);
+                    let penalty: i128 = env.storage().instance().get(&DataKey::PenaltyAmount).unwrap_or(0);
+                    let round: u32 = env.storage().instance().get(&DataKey::CurrentRound).unwrap_or(0);
+                    Self::apply_penalty(&env, member, penalty, round);
                 }
             }
             2 => {
@@ -5113,7 +5134,7 @@ impl AhjoorContract {
             .get(&DataKey::Admin)
             .expect("Admin not set");
         if admin != stored_admin {
-            panic_with_error!(&env, Error::OnlyAdminAllowed);
+            panic_with_error!(&env, ExtError::OnlyAdminAllowed);
         }
 
         // Cannot merge a dissolved or already-merged group
@@ -5190,7 +5211,7 @@ impl AhjoorContract {
             .get(&DataKey::Admin)
             .expect("Admin not set");
         if admin != stored_admin {
-            panic_with_error!(&env, Error::OnlyAdminAllowed);
+            panic_with_error!(&env, ExtError::OnlyAdminAllowed);
         }
 
         let mut proposals: Map<u32, MergeProposal> = env
@@ -5293,20 +5314,17 @@ impl AhjoorContract {
         if admin != stored_admin {
             panic_with_error!(&env, ExtError::OnlyAdminAllowed);
         }
-        env.storage()
-            .instance()
-            .set(&DataKey2::CoSignerWindowLedgers, &window_ledgers);
 
         let is_frozen: bool = env
             .storage()
             .instance()
-            .get(&DataKey2::IsFrozen)
+            .get(&DataKey3::IsFrozen)
             .unwrap_or(false);
         if is_frozen {
             panic_with_error!(&env, ExtError::GroupFrozen);
         }
 
-        env.storage().instance().set(&DataKey2::IsFrozen, &true);
+        env.storage().instance().set(&DataKey3::IsFrozen, &true);
 
         // Append to immutable freeze log in persistent storage.
         let mut log: Vec<FreezeRecord> = env
@@ -5362,6 +5380,9 @@ impl AhjoorContract {
         env.storage().instance().set(&DataKey2::CoSigners, &co_signers);
 
         events::emit_co_signer_set(&env, group_id, member, co_signer);
+        env.storage().instance().extend_ttl(INSTANCE_LIFETIME_THRESHOLD, INSTANCE_BUMP_AMOUNT);
+    }
+
     /// Contract-level admin unfreezes the group, logging the resolution on-chain.
     pub fn unfreeze_group(env: Env, admin: Address, group_id: u32, resolution_hash: BytesN<32>) {
         admin.require_auth();
@@ -5377,13 +5398,13 @@ impl AhjoorContract {
         let is_frozen: bool = env
             .storage()
             .instance()
-            .get(&DataKey2::IsFrozen)
+            .get(&DataKey3::IsFrozen)
             .unwrap_or(false);
         if !is_frozen {
             panic_with_error!(&env, ExtError::GroupNotFrozen);
         }
 
-        env.storage().instance().set(&DataKey2::IsFrozen, &false);
+        env.storage().instance().set(&DataKey3::IsFrozen, &false);
 
         // Update the last freeze record with unfreeze info.
         let mut log: Vec<FreezeRecord> = env
@@ -5465,7 +5486,7 @@ impl AhjoorContract {
         let window_starts: Map<Address, u32> = env
             .storage()
             .instance()
-            .get(&DataKey2::CoSignerWindowStart)
+            .get(&DataKey3::CoSignerWindowStart)
             .unwrap_or(Map::new(&env));
         let start = window_starts.get(member.clone()).unwrap_or_else(|| {
             panic_with_error!(&env, ExtError::CoSignerWindowNotOpen)
@@ -5498,12 +5519,12 @@ impl AhjoorContract {
         let mut window_starts_mut: Map<Address, u32> = env
             .storage()
             .instance()
-            .get(&DataKey2::CoSignerWindowStart)
+            .get(&DataKey3::CoSignerWindowStart)
             .unwrap_or(Map::new(&env));
         window_starts_mut.remove(member.clone());
         env.storage()
             .instance()
-            .set(&DataKey2::CoSignerWindowStart, &window_starts_mut);
+            .set(&DataKey3::CoSignerWindowStart, &window_starts_mut);
 
         events::emit_co_signer_contributed(&env, group_id, member, co_signer, amount);
         env.storage()
@@ -5602,13 +5623,11 @@ impl AhjoorContract {
             member_statuses.push_back(Self::get_member_status(env.clone(), member));
         }
 
-        // Compute state_hash: sha256 of round_number || pooled_balance || payout_order XDR
+        // Compute state_hash: sha256 of round_number || pooled_balance || payout_order_len
         let mut preimage = soroban_sdk::Bytes::new(&env);
         preimage.extend_from_array(&current_round.to_be_bytes());
         preimage.extend_from_array(&pooled_balance.to_be_bytes());
-        for addr in payout_order.iter() {
-            preimage.append(&addr.to_xdr(&env));
-        }
+        preimage.extend_from_array(&(payout_order.len() as u32).to_be_bytes());
         let state_hash: BytesN<32> = env.crypto().sha256(&preimage).into();
 
         // Load existing snapshot log and append
@@ -5650,6 +5669,332 @@ impl AhjoorContract {
     pub fn get_snapshot_count(env: Env) -> u32 {
         let log: Vec<GroupSnapshot> = env.storage().persistent().get(&PersistentKey::SnapshotLog).unwrap_or(Vec::new(&env));
         log.len() as u32
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // #267: Tiered Contribution Levels with Variable Payout Weighting
+    // ─────────────────────────────────────────────────────────────────────────
+
+    /// Initialize a ROSCA group that uses named contribution tiers.
+    ///
+    /// Behaves identically to `init` except that it also stores the supplied
+    /// tier definitions.  Members added later via `join_group_tiered` choose
+    /// one of these tiers; the payout pool is then split proportionally to
+    /// each member's tier weight when their round comes up.
+    #[allow(clippy::too_many_arguments)]
+    pub fn create_group_tiered(
+        env: Env,
+        admin: Address,
+        members: Vec<Address>,
+        contribution_amount: i128,
+        token: Address,
+        round_duration: u64,
+        config: RoscaConfig,
+        start_at: Option<u64>,
+        tiers: Vec<Tier>,
+    ) {
+        // Validate tiers
+        if tiers.is_empty() {
+            panic!("At least one tier is required");
+        }
+        for i in 0..tiers.len() {
+            let t = tiers.get(i).unwrap();
+            if t.contribution_amount <= 0 {
+                panic_with_error!(&env, ExtError::InvalidTierDefinition);
+            }
+            if t.payout_weight == 0 {
+                panic_with_error!(&env, ExtError::InvalidTierDefinition);
+            }
+        }
+
+        // Store tiers before calling init so the group is fully set up
+        env.storage().instance().set(&DataKey3::GroupTiers, &tiers);
+        // Emit TierDefined for each tier
+        for i in 0..tiers.len() {
+            let t = tiers.get(i).unwrap();
+            events::emit_tier_defined(&env, i, t.name, t.contribution_amount, t.payout_weight);
+        }
+
+        // Delegate to the main init path
+        Self::init(env, admin, members, contribution_amount, token, round_duration, config, start_at);
+    }
+
+    /// Member joins an already-initialised tiered group choosing a tier.
+    ///
+    /// Can only be called before the group has started (i.e. before the first
+    /// round).  The member must already be in the members list (added by admin)
+    /// or this call adds them to the group.
+    pub fn join_group_tiered(env: Env, member: Address, tier_id: u32) {
+        internals::check_not_paused(&env);
+        member.require_auth();
+
+        // Validate that the group has tiers configured
+        let tiers: Vec<Tier> = env.storage().instance().get(&DataKey3::GroupTiers).expect("Group has no tiers; use create_group_tiered");
+
+        if tier_id >= tiers.len() {
+            panic_with_error!(&env, ExtError::TierNotFound);
+        }
+
+        let members: Vec<Address> = env.storage().instance().get(&DataKey::Members).expect("Not initialized");
+        if !members.contains(&member) {
+            panic!("Only existing members can join with a tier; use add_member first");
+        }
+
+        // Check min credit score before allowing join
+        Self::require_min_credit_score_internal(&env, &member);
+
+        let mut member_tier_index: Map<Address, u32> = env
+            .storage()
+            .instance()
+            .get(&DataKey3::MemberTierIndex)
+            .unwrap_or(Map::new(&env));
+        member_tier_index.set(member.clone(), tier_id);
+        env.storage().instance().set(&DataKey3::MemberTierIndex, &member_tier_index);
+
+        events::emit_member_joined_with_tier(&env, member, tier_id);
+        env.storage().instance().extend_ttl(INSTANCE_LIFETIME_THRESHOLD, INSTANCE_BUMP_AMOUNT);
+    }
+
+    /// Member requests a tier change.  The change is queued and takes effect
+    /// at the start of the next cycle (once all members have received a payout).
+    pub fn request_tier_change(env: Env, member: Address, new_tier_id: u32) {
+        internals::check_not_paused(&env);
+        member.require_auth();
+
+        let tiers: Vec<Tier> = env.storage().instance().get(&DataKey3::GroupTiers).expect("Group has no tiers");
+        if new_tier_id >= tiers.len() {
+            panic_with_error!(&env, ExtError::TierNotFound);
+        }
+
+        let member_tier_index: Map<Address, u32> = env
+            .storage()
+            .instance()
+            .get(&DataKey3::MemberTierIndex)
+            .unwrap_or(Map::new(&env));
+        let current_tier_id = member_tier_index.get(member.clone()).unwrap_or(0);
+
+        if current_tier_id == new_tier_id {
+            panic!("New tier is the same as current tier");
+        }
+
+        let mut pending: Map<Address, u32> = env
+            .storage()
+            .instance()
+            .get(&DataKey3::PendingTierChange)
+            .unwrap_or(Map::new(&env));
+        pending.set(member.clone(), new_tier_id);
+        env.storage().instance().set(&DataKey3::PendingTierChange, &pending);
+
+        let current_round: u32 = env.storage().instance().get(&DataKey::CurrentRound).unwrap_or(0);
+        let payout_order: Vec<Address> = env.storage().instance().get(&DataKey::PayoutOrder).unwrap_or(Vec::new(&env));
+        let cycle_len = payout_order.len() as u32;
+        let effective_cycle = if cycle_len > 0 { (current_round / cycle_len) + 1 } else { 1 };
+
+        events::emit_member_tier_changed(&env, member, current_tier_id, new_tier_id, effective_cycle);
+        env.storage().instance().extend_ttl(INSTANCE_LIFETIME_THRESHOLD, INSTANCE_BUMP_AMOUNT);
+    }
+
+    /// Admin applies any queued tier changes (called at the start of each new cycle).
+    pub fn apply_pending_tier_changes(env: Env, admin: Address) {
+        admin.require_auth();
+        let stored_admin: Address = env.storage().instance().get(&DataKey::Admin).expect("Not initialized");
+        if admin != stored_admin { panic!("Only admin can apply tier changes"); }
+
+        let pending: Map<Address, u32> = env
+            .storage()
+            .instance()
+            .get(&DataKey3::PendingTierChange)
+            .unwrap_or(Map::new(&env));
+
+        if pending.is_empty() { return; }
+
+        let mut member_tier_index: Map<Address, u32> = env
+            .storage()
+            .instance()
+            .get(&DataKey3::MemberTierIndex)
+            .unwrap_or(Map::new(&env));
+
+        let current_round: u32 = env.storage().instance().get(&DataKey::CurrentRound).unwrap_or(0);
+        let payout_order: Vec<Address> = env.storage().instance().get(&DataKey::PayoutOrder).unwrap_or(Vec::new(&env));
+        let cycle_len = payout_order.len() as u32;
+        let current_cycle = if cycle_len > 0 { current_round / cycle_len } else { 0 };
+
+        for (member, new_tier_id) in pending.iter() {
+            let old_tier = member_tier_index.get(member.clone()).unwrap_or(0);
+            member_tier_index.set(member.clone(), new_tier_id);
+            events::emit_member_tier_changed(&env, member, old_tier, new_tier_id, current_cycle);
+        }
+
+        env.storage().instance().set(&DataKey3::MemberTierIndex, &member_tier_index);
+        env.storage().instance().set(&DataKey3::PendingTierChange, &Map::<Address, u32>::new(&env));
+        env.storage().instance().extend_ttl(INSTANCE_LIFETIME_THRESHOLD, INSTANCE_BUMP_AMOUNT);
+    }
+
+    /// Returns the tier definitions for this group.
+    pub fn get_group_tiers(env: Env) -> Vec<Tier> {
+        env.storage().instance().get(&DataKey3::GroupTiers).unwrap_or(Vec::new(&env))
+    }
+
+    /// Returns the tier index for a specific member (0 = first tier or no tier).
+    pub fn get_member_tier(env: Env, member: Address) -> u32 {
+        let index: Map<Address, u32> = env
+            .storage()
+            .instance()
+            .get(&DataKey3::MemberTierIndex)
+            .unwrap_or(Map::new(&env));
+        index.get(member).unwrap_or(0)
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // #269: On-Chain Member Credit Score from Contribution History
+    // ─────────────────────────────────────────────────────────────────────────
+
+    /// Admin configures the weights used to compute the credit score.
+    /// Weights may be negative to penalise bad behaviour.
+    pub fn set_score_weights(
+        env: Env,
+        admin: Address,
+        on_time_weight: i128,
+        late_weight: i128,
+        default_weight: i128,
+        exit_weight: i128,
+        completion_weight: i128,
+    ) {
+        admin.require_auth();
+        let stored_admin: Address = env.storage().instance().get(&DataKey::Admin).expect("Not initialized");
+        if admin != stored_admin { panic!("Only admin can set score weights"); }
+
+        let weights = ScoreWeights {
+            on_time_weight,
+            late_weight,
+            default_weight,
+            exit_weight,
+            completion_weight,
+        };
+        env.storage().instance().set(&DataKey3::ScoreWeights, &weights);
+        env.storage().instance().extend_ttl(INSTANCE_LIFETIME_THRESHOLD, INSTANCE_BUMP_AMOUNT);
+    }
+
+    /// Admin sets the minimum credit score required to join this group.
+    pub fn set_min_credit_score(env: Env, admin: Address, min_score: i128) {
+        admin.require_auth();
+        let stored_admin: Address = env.storage().instance().get(&DataKey::Admin).expect("Not initialized");
+        if admin != stored_admin { panic!("Only admin can set minimum credit score"); }
+
+        env.storage().instance().set(&DataKey3::MinCreditScore, &min_score);
+        env.storage().instance().extend_ttl(INSTANCE_LIFETIME_THRESHOLD, INSTANCE_BUMP_AMOUNT);
+    }
+
+    /// Returns the current credit score record for a member.
+    pub fn get_credit_score(env: Env, member: Address) -> MemberScore {
+        let scores: Map<Address, MemberScore> = env
+            .storage()
+            .persistent()
+            .get(&PersistentKey::MemberCreditScores)
+            .unwrap_or(Map::new(&env));
+        scores.get(member.clone()).unwrap_or(MemberScore {
+            on_time_contributions: 0,
+            late_contributions: 0,
+            defaults: 0,
+            early_exits: 0,
+            groups_completed: 0,
+            score: 0,
+        })
+    }
+
+    /// Internal: update a member's credit score after a relevant event.
+    fn update_credit_score_internal(env: &Env, member: &Address, reason: Symbol) {
+        let mut scores: Map<Address, MemberScore> = env
+            .storage()
+            .persistent()
+            .get(&PersistentKey::MemberCreditScores)
+            .unwrap_or(Map::new(env));
+
+        let mut ms = scores.get(member.clone()).unwrap_or(MemberScore {
+            on_time_contributions: 0,
+            late_contributions: 0,
+            defaults: 0,
+            early_exits: 0,
+            groups_completed: 0,
+            score: 0,
+        });
+
+        let on_time_sym  = Symbol::new(env, "on_time");
+        let late_sym     = Symbol::new(env, "late");
+        let default_sym  = Symbol::new(env, "default");
+        let exit_sym     = Symbol::new(env, "early_exit");
+        let complete_sym = Symbol::new(env, "completed");
+
+        if reason == on_time_sym {
+            ms.on_time_contributions = ms.on_time_contributions.saturating_add(1);
+        } else if reason == late_sym {
+            ms.late_contributions = ms.late_contributions.saturating_add(1);
+        } else if reason == default_sym {
+            ms.defaults = ms.defaults.saturating_add(1);
+        } else if reason == exit_sym {
+            ms.early_exits = ms.early_exits.saturating_add(1);
+        } else if reason == complete_sym {
+            ms.groups_completed = ms.groups_completed.saturating_add(1);
+        }
+
+        // Recompute score using admin weights
+        let weights: ScoreWeights = env
+            .storage()
+            .instance()
+            .get(&DataKey3::ScoreWeights)
+            .unwrap_or(ScoreWeights {
+                on_time_weight: 10,
+                late_weight: -2,
+                default_weight: -20,
+                exit_weight: -15,
+                completion_weight: 30,
+            });
+
+        let old_score = ms.score;
+        ms.score = (ms.on_time_contributions as i128 * weights.on_time_weight)
+            + (ms.late_contributions as i128 * weights.late_weight)
+            + (ms.defaults as i128 * weights.default_weight)
+            + (ms.early_exits as i128 * weights.exit_weight)
+            + (ms.groups_completed as i128 * weights.completion_weight);
+
+        scores.set(member.clone(), ms.clone());
+        env.storage().persistent().set(&PersistentKey::MemberCreditScores, &scores);
+        env.storage().persistent().extend_ttl(
+            &PersistentKey::MemberCreditScores,
+            PERSISTENT_LIFETIME_THRESHOLD,
+            PERSISTENT_BUMP_AMOUNT,
+        );
+
+        if old_score != ms.score {
+            events::emit_credit_score_updated(env, member.clone(), old_score, ms.score, reason);
+        }
+    }
+
+    /// Internal: panics if member's credit score is below the group minimum.
+    fn require_min_credit_score_internal(env: &Env, member: &Address) {
+        let min_score: i128 = env
+            .storage()
+            .instance()
+            .get(&DataKey3::MinCreditScore)
+            .unwrap_or(i128::MIN);
+        if min_score == i128::MIN { return; } // no minimum configured
+
+        let scores: Map<Address, MemberScore> = env
+            .storage()
+            .persistent()
+            .get(&PersistentKey::MemberCreditScores)
+            .unwrap_or(Map::new(env));
+        let ms = scores.get(member.clone()).unwrap_or(MemberScore {
+            on_time_contributions: 0,
+            late_contributions: 0,
+            defaults: 0,
+            early_exits: 0,
+            groups_completed: 0,
+            score: 0,
+        });
+        if ms.score < min_score {
+            panic_with_error!(env, ExtError::InsufficientCreditScore);
+        }
     }
 
 }

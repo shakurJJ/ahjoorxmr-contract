@@ -786,6 +786,8 @@ pub fn emit_cancellation_rejected(e: &Env, escrow_id: u32, rejector: Address) {
 }
 pub fn emit_cancellation_expired(e: &Env, escrow_id: u32) {
     e.events().publish((Symbol::new(e, "CancelExpired"),), (escrow_id,));
+}
+
 // #225: Escrow Top-Up Event
 
 /// Event: Buyer topped up an active escrow with additional funds
@@ -836,6 +838,8 @@ pub fn emit_collateral_forfeited(e: &Env, escrow_id: u32, amount: i128, awarded_
 }
 pub fn emit_collateral_returned(e: &Env, escrow_id: u32, seller: Address, amount: i128) {
     CollateralReturned { escrow_id, seller, amount }.publish(e);
+}
+
 // --- Issue #241: Delivery Proof Hash ---
 
 /// Event: Seller submitted a delivery proof; auto_released indicates if escrow was released.
@@ -860,6 +864,10 @@ pub fn emit_delivery_proof_submitted(
         seller,
         proof_hash,
         auto_released,
+    }
+    .publish(e);
+}
+
 // #244: Seller Role Transfer Veto Events
 
 pub fn emit_seller_transfer_proposed(e: &Env, escrow_id: u32, original_seller: Address, new_seller: Address, veto_deadline: u32) {
@@ -888,6 +896,8 @@ pub fn emit_seller_transfer_expired_approved(e: &Env, escrow_id: u32, new_seller
         (soroban_sdk::Symbol::new(e, "SellerTransferExpired"),),
         (escrow_id, new_seller),
     );
+}
+
 // --- Issue #146: Post-Resolution Rating System ---
 
 /// Event: Rating submitted after escrow completion
@@ -917,6 +927,35 @@ pub fn emit_rating_submitted(
         comment_hash,
     }
     .publish(e);
+}
+
+// --- Resolution Cooling-Off events ---
+
+pub fn emit_resolution_cooling_off(
+    e: &Env,
+    escrow_id: u32,
+    buyer_percent: u32,
+    arbiter: Address,
+    cooling_off_until: u64,
+) {
+    e.events().publish(
+        (soroban_sdk::Symbol::new(e, "ResolutionCoolingOff"),),
+        (escrow_id, buyer_percent, arbiter, cooling_off_until),
+    );
+}
+
+pub fn emit_resolution_flagged(e: &Env, escrow_id: u32, caller: Address, reason_hash: soroban_sdk::BytesN<32>) {
+    e.events().publish(
+        (soroban_sdk::Symbol::new(e, "ResolutionFlagged"),),
+        (escrow_id, caller, reason_hash),
+    );
+}
+
+pub fn emit_resolution_finalized(e: &Env, escrow_id: u32, buyer_percent: u32, arbiter: Address) {
+    e.events().publish(
+        (soroban_sdk::Symbol::new(e, "ResolutionFinalized"),),
+        (escrow_id, buyer_percent, arbiter),
+    );
 }
 
 // --- Issue #219: Multi-Party Split Release ---

@@ -85,6 +85,8 @@ const IDEMPOTENCY_KEY_LIFETIME_THRESHOLD: u32 = 10_000;
 const IDEMPOTENCY_KEY_BUMP_AMOUNT: u32 = 17_280;
 /// Minimum collateral a merchant must maintain at all times (#129)
 const DEFAULT_MIN_COLLATERAL: i128 = 1_000_000; // 1 USDC (7 decimals)
+/// Default maximum tip: 3000 bps = 30% of base payment amount (#265)
+const DEFAULT_MAX_TIP_BPS: u32 = 3_000;
 
 #[contracterror]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -94,7 +96,7 @@ pub enum Error {
     OracleConditionNotMet = 3,
     /// Subscription's trial period has not elapsed; charging is deferred (#133)
     SubscriptionInTrial = 4,
-    MerchantVolumeCapped = 4,
+    MerchantVolumeCapped = 20,
     TokenNotAllowed = 5,
     DuplicateExternalId = 6,
     MultisigNotRequired = 7,
@@ -110,13 +112,17 @@ pub enum Error {
     /// No pending commission to claim (#242)
     NoCommissionToClaim = 16,
     /// Slippage tolerance exceeded on dynamic payment settlement (#246)
-    SlippageExceeded = 15,
+    SlippageExceeded = 21,
     /// Oracle address is not on the admin whitelist (#246)
-    OracleNotWhitelisted = 16,
+    OracleNotWhitelisted = 22,
     /// Dynamic payment has expired (#246)
     DynamicPaymentExpired = 17,
     /// Customer cumulative spend would exceed the merchant-configured cap (#235)
-    CustomerSpendLimitExceeded = 15,
+    CustomerSpendLimitExceeded = 23,
+    /// Tip supplied on a payment that does not have tipping_enabled (#265)
+    TippingNotEnabled = 18,
+    /// Tip amount exceeds the admin-configured maximum tip bps of the base amount (#265)
+    TipExceedsMaxBps = 19,
 }
 
 /// Per-merchant withdrawal rate limit config (#231).
@@ -142,6 +148,8 @@ pub struct ReferralRecord {
     pub referrer: Address,
     pub registered_at_ledger: u32,
     pub window_ledgers: u32,
+}
+
 /// Per-customer (or default) spend cap config (#235).
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -281,6 +289,8 @@ pub struct Payment {
     // pub release_condition: Option<OracleCondition>,
     /// Optional off-chain order correlation key (hash of merchant order ID).
     pub external_id: Option<BytesN<32>>,
+    /// Whether this payment accepts a customer tip at settlement time (#265).
+    pub tipping_enabled: bool,
 }
 
 #[contracttype]
@@ -424,6 +434,46 @@ pub struct CustomerRateLimit {
     pub window_start_ledger: u32,
 }
 
+/// Voucher discount kind: percentage of payment or fixed token-unit amount.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum DiscountType {
+    Percentage,
+    Fixed,
+}
+
+/// Per-merchant multi-sig approval policy.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MultisigPolicy {
+    pub threshold: i128,
+    pub signers: Vec<Address>,
+    pub m: u32,
+    pub approval_window_seconds: u64,
+}
+
+/// Per-payment approval tracking state.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ApprovalState {
+    pub payment_id: u32,
+    pub approvals: Vec<Address>,
+    pub created_at: u64,
+}
+
+/// Discount voucher issued by a merchant.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Voucher {
+    pub merchant: Address,
+    pub discount_type: DiscountType,
+    pub discount_value: u32,
+    pub max_uses: u32,
+    pub uses_remaining: u32,
+    pub expiry: u64,
+    pub revoked: bool,
+}
+
 /// Storage key classification:
 /// - Instance:    Admin, PaymentCounter, MaxBatchSize, DisputeTimeout,
 ///                OracleAddress, UsdcToken, FeeBps, FeeRecipient
@@ -525,7 +575,7 @@ pub enum DataKey {
     /// Instance: merchant's preferred token for receiving payments
     PreferredToken(Address),
     /// Instance: DEX router contract address for token swaps
-    SwapRouter(Address),
+    SwapRouter,
     // --- Temporary ---
     Dispute(u32),
     /// Temporary: idempotency key → payment_id mapping (expires after 24h)
@@ -536,6 +586,12 @@ pub enum DataKey {
     // --- Task 2: Multi-Sig ---
     /// Instance: per-merchant multi-sig policy
     MultisigPolicy(Address),
+}
+
+/// Overflow storage keys — split from DataKey because #[contracttype] is bounded to 50 variants.
+#[derive(Clone)]
+#[contracttype]
+pub enum DataKey2 {
     /// Persistent: per-payment approval state
     ApprovalState(u32),
     // --- Task 3: Vouchers ---
@@ -596,6 +652,8 @@ pub enum DataKey {
     RecurringInvoiceCounter,
     /// #216: recurring invoice record
     RecurringInvoice(u32),
+    /// #265: maximum tip as basis points of the base payment amount (instance storage)
+    MaxTipBps,
 }
 
 mod events;
@@ -872,6 +930,7 @@ impl AhjoorPaymentsContract {
             capture_deadline: 0,
             // // release_condition: None,
             external_id: None,
+            tipping_enabled: false,
         };
 
         // Persistent: per-payment record with individual TTL
@@ -991,6 +1050,7 @@ impl AhjoorPaymentsContract {
                 capture_deadline: 0,
                 // release_condition: None,
                 external_id: None,
+                tipping_enabled: false,
             };
 
             // Persistent: per-payment record with individual TTL
@@ -1545,6 +1605,7 @@ impl AhjoorPaymentsContract {
                 capture_deadline: 0,
                 // release_condition: None,
                 external_id: None,
+                tipping_enabled: false,
             };
 
             env.storage()
@@ -1665,6 +1726,7 @@ impl AhjoorPaymentsContract {
             capture_deadline: 0,
             // release_condition: None,
             external_id: None,
+            tipping_enabled: false,
         };
 
         env.storage()
@@ -2268,7 +2330,7 @@ impl AhjoorPaymentsContract {
         let mut state: ApprovalState = env
             .storage()
             .persistent()
-            .get(&DataKey::ApprovalState(payment_id))
+            .get(&DataKey2::ApprovalState(payment_id))
             .expect("Approval state not found");
 
         let now = env.ledger().timestamp();
@@ -2324,9 +2386,9 @@ impl AhjoorPaymentsContract {
         } else {
             env.storage()
                 .persistent()
-                .set(&DataKey::ApprovalState(payment_id), &state);
+                .set(&DataKey2::ApprovalState(payment_id), &state);
             env.storage().persistent().extend_ttl(
-                &DataKey::ApprovalState(payment_id),
+                &DataKey2::ApprovalState(payment_id),
                 PERSISTENT_LIFETIME_THRESHOLD,
                 PERSISTENT_BUMP_AMOUNT,
             );
@@ -2360,7 +2422,7 @@ impl AhjoorPaymentsContract {
         let state: ApprovalState = env
             .storage()
             .persistent()
-            .get(&DataKey::ApprovalState(payment_id))
+            .get(&DataKey2::ApprovalState(payment_id))
             .expect("Approval state not found");
 
         let now = env.ledger().timestamp();
@@ -2423,7 +2485,7 @@ impl AhjoorPaymentsContract {
             panic!("discount_value must be positive");
         }
 
-        let key = DataKey::Voucher(merchant.clone(), code_hash.clone());
+        let key = DataKey2::Voucher(merchant.clone(), code_hash.clone());
         if env.storage().persistent().has(&key) {
             panic!("Voucher with this code_hash already exists");
         }
@@ -2445,7 +2507,7 @@ impl AhjoorPaymentsContract {
             PERSISTENT_BUMP_AMOUNT,
         );
 
-        events::emit_voucher_issued(&env, merchant, code_hash, discount_type, discount_value, max_uses, expiry);
+        events::emit_voucher_issued(&env, merchant, code_hash, voucher.discount_type.clone(), discount_value, max_uses, expiry);
 
         env.storage()
             .instance()
@@ -2457,7 +2519,7 @@ impl AhjoorPaymentsContract {
         Self::require_not_paused(&env);
         merchant.require_auth();
 
-        let key = DataKey::Voucher(merchant.clone(), code_hash.clone());
+        let key = DataKey2::Voucher(merchant.clone(), code_hash.clone());
         let mut voucher: Voucher = env
             .storage()
             .persistent()
@@ -2490,7 +2552,7 @@ impl AhjoorPaymentsContract {
     pub fn get_voucher(env: Env, merchant: Address, code_hash: BytesN<32>) -> Voucher {
         env.storage()
             .persistent()
-            .get(&DataKey::Voucher(merchant, code_hash))
+            .get(&DataKey2::Voucher(merchant, code_hash))
             .expect("Voucher not found")
     }
 
@@ -2543,7 +2605,7 @@ impl AhjoorPaymentsContract {
 
         // --- Voucher discount ---
         let effective_amount = if let Some(ref code_hash) = voucher_code_hash {
-            let voucher_key = DataKey::Voucher(merchant.clone(), code_hash.clone());
+            let voucher_key = DataKey2::Voucher(merchant.clone(), code_hash.clone());
             let mut voucher: Voucher = env
                 .storage()
                 .persistent()
@@ -2641,6 +2703,7 @@ impl AhjoorPaymentsContract {
             tags: None,
             capture_deadline: 0,
             external_id: external_id.clone(),
+            tipping_enabled: false,
         };
 
         env.storage()
@@ -2679,9 +2742,9 @@ impl AhjoorPaymentsContract {
             };
             env.storage()
                 .persistent()
-                .set(&DataKey::ApprovalState(payment_id), &state);
+                .set(&DataKey2::ApprovalState(payment_id), &state);
             env.storage().persistent().extend_ttl(
-                &DataKey::ApprovalState(payment_id),
+                &DataKey2::ApprovalState(payment_id),
                 PERSISTENT_LIFETIME_THRESHOLD,
                 PERSISTENT_BUMP_AMOUNT,
             );
@@ -4182,10 +4245,10 @@ impl AhjoorPaymentsContract {
         }
         env.storage()
             .instance()
-            .set(&DataKey::WithdrawalWindowSeconds, &window_seconds);
+            .set(&DataKey2::WithdrawalWindowSeconds, &window_seconds);
         env.storage()
             .instance()
-            .set(&DataKey::WithdrawalWindowCap, &cap);
+            .set(&DataKey2::WithdrawalWindowCap, &cap);
         env.storage()
             .instance()
             .extend_ttl(INSTANCE_LIFETIME_THRESHOLD, INSTANCE_BUMP_AMOUNT);
@@ -4204,9 +4267,9 @@ impl AhjoorPaymentsContract {
         let limit = WithdrawalLimit { window_seconds, cap };
         env.storage()
             .persistent()
-            .set(&DataKey::MerchantWithdrawalLimit(merchant.clone()), &limit);
+            .set(&DataKey2::MerchantWithdrawalLimit(merchant.clone()), &limit);
         env.storage().persistent().extend_ttl(
-            &DataKey::MerchantWithdrawalLimit(merchant.clone()),
+            &DataKey2::MerchantWithdrawalLimit(merchant.clone()),
             PERSISTENT_LIFETIME_THRESHOLD,
             PERSISTENT_BUMP_AMOUNT,
         );
@@ -4235,20 +4298,20 @@ impl AhjoorPaymentsContract {
         let window_seconds: u64 = env
             .storage()
             .persistent()
-            .get::<DataKey, WithdrawalLimit>(&DataKey::MerchantWithdrawalLimit(merchant.clone()))
+            .get::<DataKey2, WithdrawalLimit>(&DataKey2::MerchantWithdrawalLimit(merchant.clone()))
             .map(|l| l.window_seconds)
             .unwrap_or_else(|| {
                 env.storage()
                     .instance()
-                    .get(&DataKey::WithdrawalWindowSeconds)
+                    .get(&DataKey2::WithdrawalWindowSeconds)
                     .unwrap_or(24 * 60 * 60)
             });
         let limit = WithdrawalLimit { window_seconds, cap };
         env.storage()
             .persistent()
-            .set(&DataKey::MerchantWithdrawalLimit(merchant.clone()), &limit);
+            .set(&DataKey2::MerchantWithdrawalLimit(merchant.clone()), &limit);
         env.storage().persistent().extend_ttl(
-            &DataKey::MerchantWithdrawalLimit(merchant.clone()),
+            &DataKey2::MerchantWithdrawalLimit(merchant.clone()),
             PERSISTENT_LIFETIME_THRESHOLD,
             PERSISTENT_BUMP_AMOUNT,
         );
@@ -4265,16 +4328,16 @@ impl AhjoorPaymentsContract {
         let (window_seconds, cap) = if let Some(limit) = env
             .storage()
             .persistent()
-            .get::<DataKey, WithdrawalLimit>(&DataKey::MerchantWithdrawalLimit(merchant.clone()))
+            .get::<DataKey2, WithdrawalLimit>(&DataKey2::MerchantWithdrawalLimit(merchant.clone()))
         {
             (limit.window_seconds, limit.cap)
         } else if let (Some(w), Some(c)) = (
             env.storage()
                 .instance()
-                .get::<DataKey, u64>(&DataKey::WithdrawalWindowSeconds),
+                .get::<DataKey2, u64>(&DataKey2::WithdrawalWindowSeconds),
             env.storage()
                 .instance()
-                .get::<DataKey, i128>(&DataKey::WithdrawalWindowCap),
+                .get::<DataKey2, i128>(&DataKey2::WithdrawalWindowCap),
         ) {
             (w, c)
         } else {
@@ -4283,7 +4346,7 @@ impl AhjoorPaymentsContract {
         };
 
         let now = env.ledger().timestamp();
-        let state_key = DataKey::MerchantWithdrawalWindow(merchant.clone());
+        let state_key = DataKey2::MerchantWithdrawalWindow(merchant.clone());
 
         let mut state: WithdrawalWindowState = env
             .storage()
@@ -4454,6 +4517,21 @@ impl AhjoorPaymentsContract {
 
     /// Execute a token swap via the configured DEX router.
     /// Returns the output amount or an error symbol.
+    /// Internal: if a DynamicPayment record exists for this payment, validate expiry.
+    /// Full oracle-rate recomputation is deferred to a future implementation.
+    fn settle_dynamic_payment_if_needed(env: &Env, payment: &mut Payment) {
+        let dyn_opt: Option<DynamicPayment> = env
+            .storage()
+            .persistent()
+            .get(&DataKey2::DynamicPayment(payment.id));
+        if let Some(dp) = dyn_opt {
+            let now = env.ledger().timestamp();
+            if dp.expiry > 0 && now > dp.expiry {
+                panic_with_error!(env, Error::DynamicPaymentExpired);
+            }
+        }
+    }
+
     fn execute_token_swap(
         env: &Env,
         payment_id: u32,
@@ -4571,7 +4649,7 @@ impl AhjoorPaymentsContract {
                     
                     match swap_result {
                         Ok(swapped_amount) => {
-                            final_token = preferred;
+                            final_token = preferred.clone();
                             final_amount = swapped_amount;
                             events::emit_payment_swapped_and_settled(
                                 env,
@@ -4982,7 +5060,7 @@ impl AhjoorPaymentsContract {
         let status: MerchantStatus = env
             .storage()
             .persistent()
-            .get(&DataKey::MerchantStatus(merchant.clone()))
+            .get(&DataKey2::MerchantStatus(merchant.clone()))
             .unwrap_or(MerchantStatus::Active);
 
         match status {
@@ -4991,7 +5069,7 @@ impl AhjoorPaymentsContract {
                 let expiry: u64 = env
                     .storage()
                     .persistent()
-                    .get(&DataKey::MerchantSuspensionExpiry(merchant.clone()))
+                    .get(&DataKey2::MerchantSuspensionExpiry(merchant.clone()))
                     .unwrap_or(0);
                 if expiry == 0 || env.ledger().timestamp() <= expiry {
                     panic!("Merchant is suspended");
@@ -5183,7 +5261,7 @@ impl AhjoorPaymentsContract {
         Self::save_merchant_stats(env, merchant, &s);
 
         // #226: Track pending count in MerchantSummary
-        let key = DataKey::MerchantSummary(merchant.clone());
+        let key = DataKey2::MerchantSummary(merchant.clone());
         let mut summary: MerchantSummary = env
             .storage()
             .persistent()
@@ -5208,7 +5286,7 @@ impl AhjoorPaymentsContract {
         Self::save_merchant_stats(env, merchant, &s);
 
         // #226: Update MerchantSummary
-        let key = DataKey::MerchantSummary(merchant.clone());
+        let key = DataKey2::MerchantSummary(merchant.clone());
         let mut summary: MerchantSummary = env
             .storage()
             .persistent()
@@ -5230,7 +5308,7 @@ impl AhjoorPaymentsContract {
     }
 
     fn inc_merchant_failed(env: &Env, merchant: &Address) {
-        let key = DataKey::MerchantSummary(merchant.clone());
+        let key = DataKey2::MerchantSummary(merchant.clone());
         let mut summary: MerchantSummary = env
             .storage()
             .persistent()
@@ -5244,22 +5322,6 @@ impl AhjoorPaymentsContract {
             });
         summary.failed_count += 1;
         if summary.pending_count > 0 { summary.pending_count -= 1; }
-        env.storage().persistent().set(&key, &summary);
-        env.storage().persistent().extend_ttl(&key, PERSISTENT_LIFETIME_THRESHOLD, PERSISTENT_BUMP_AMOUNT);
-    }
-        let key = DataKey::MerchantSummary(merchant.clone());
-        let mut summary: MerchantSummary = env
-            .storage()
-            .persistent()
-            .get(&key)
-            .unwrap_or(MerchantSummary {
-                total_volume: 0,
-                completed_count: 0,
-                failed_count: 0,
-                pending_count: 0,
-                volume_by_token: Map::new(env),
-            });
-        summary.failed_count += 1;
         env.storage().persistent().set(&key, &summary);
         env.storage().persistent().extend_ttl(&key, PERSISTENT_LIFETIME_THRESHOLD, PERSISTENT_BUMP_AMOUNT);
     }
@@ -5463,7 +5525,7 @@ impl AhjoorPaymentsContract {
         }
         env.storage()
             .instance()
-            .set(&DataKey::AppealRejectionCooldownSeconds, &seconds);
+            .set(&DataKey2::AppealRejectionCooldownSeconds, &seconds);
         env.storage()
             .instance()
             .extend_ttl(INSTANCE_LIFETIME_THRESHOLD, INSTANCE_BUMP_AMOUNT);
@@ -5488,17 +5550,17 @@ impl AhjoorPaymentsContract {
         let expiry = env.ledger().timestamp() + duration_seconds;
         env.storage()
             .persistent()
-            .set(&DataKey::MerchantStatus(merchant.clone()), &MerchantStatus::Suspended);
+            .set(&DataKey2::MerchantStatus(merchant.clone()), &MerchantStatus::Suspended);
         env.storage()
             .persistent()
-            .set(&DataKey::MerchantSuspensionExpiry(merchant.clone()), &expiry);
+            .set(&DataKey2::MerchantSuspensionExpiry(merchant.clone()), &expiry);
         env.storage().persistent().extend_ttl(
-            &DataKey::MerchantStatus(merchant.clone()),
+            &DataKey2::MerchantStatus(merchant.clone()),
             PERSISTENT_LIFETIME_THRESHOLD,
             PERSISTENT_BUMP_AMOUNT,
         );
         env.storage().persistent().extend_ttl(
-            &DataKey::MerchantSuspensionExpiry(merchant.clone()),
+            &DataKey2::MerchantSuspensionExpiry(merchant.clone()),
             PERSISTENT_LIFETIME_THRESHOLD,
             PERSISTENT_BUMP_AMOUNT,
         );
@@ -5525,12 +5587,12 @@ impl AhjoorPaymentsContract {
 
         env.storage()
             .persistent()
-            .set(&DataKey::MerchantStatus(merchant.clone()), &MerchantStatus::Banned);
+            .set(&DataKey2::MerchantStatus(merchant.clone()), &MerchantStatus::Banned);
         env.storage()
             .persistent()
             .set(&DataKey::MerchantApproved(merchant.clone()), &false);
         env.storage().persistent().extend_ttl(
-            &DataKey::MerchantStatus(merchant.clone()),
+            &DataKey2::MerchantStatus(merchant.clone()),
             PERSISTENT_LIFETIME_THRESHOLD,
             PERSISTENT_BUMP_AMOUNT,
         );
@@ -5557,12 +5619,12 @@ impl AhjoorPaymentsContract {
 
         env.storage()
             .persistent()
-            .set(&DataKey::MerchantStatus(merchant.clone()), &MerchantStatus::Active);
+            .set(&DataKey2::MerchantStatus(merchant.clone()), &MerchantStatus::Active);
         env.storage()
             .persistent()
             .set(&DataKey::MerchantApproved(merchant.clone()), &true);
         env.storage().persistent().extend_ttl(
-            &DataKey::MerchantStatus(merchant.clone()),
+            &DataKey2::MerchantStatus(merchant.clone()),
             PERSISTENT_LIFETIME_THRESHOLD,
             PERSISTENT_BUMP_AMOUNT,
         );
@@ -5580,7 +5642,7 @@ impl AhjoorPaymentsContract {
         let status: MerchantStatus = env
             .storage()
             .persistent()
-            .get(&DataKey::MerchantStatus(merchant.clone()))
+            .get(&DataKey2::MerchantStatus(merchant.clone()))
             .unwrap_or(MerchantStatus::Active);
 
         if status != MerchantStatus::Banned {
@@ -5588,11 +5650,11 @@ impl AhjoorPaymentsContract {
         }
 
         // Enforce one-active-appeal guard
-        if let Some(existing): Option<MerchantAppeal> = env
+        let existing_opt: Option<MerchantAppeal> = env
             .storage()
             .persistent()
-            .get(&DataKey::MerchantAppeal(merchant.clone()))
-        {
+            .get(&DataKey2::MerchantAppeal(merchant.clone()));
+        if let Some(existing) = existing_opt {
             if !existing.resolved {
                 panic!("An active appeal already exists");
             }
@@ -5602,7 +5664,7 @@ impl AhjoorPaymentsContract {
         let cooldown_until: u64 = env
             .storage()
             .persistent()
-            .get(&DataKey::AppealCooldownUntil(merchant.clone()))
+            .get(&DataKey2::AppealCooldownUntil(merchant.clone()))
             .unwrap_or(0);
         if env.ledger().timestamp() < cooldown_until {
             panic!("Appeal cooldown has not elapsed");
@@ -5618,9 +5680,9 @@ impl AhjoorPaymentsContract {
 
         env.storage()
             .persistent()
-            .set(&DataKey::MerchantAppeal(merchant.clone()), &appeal);
+            .set(&DataKey2::MerchantAppeal(merchant.clone()), &appeal);
         env.storage().persistent().extend_ttl(
-            &DataKey::MerchantAppeal(merchant.clone()),
+            &DataKey2::MerchantAppeal(merchant.clone()),
             PERSISTENT_LIFETIME_THRESHOLD,
             PERSISTENT_BUMP_AMOUNT,
         );
@@ -5648,7 +5710,7 @@ impl AhjoorPaymentsContract {
         let mut appeal: MerchantAppeal = env
             .storage()
             .persistent()
-            .get(&DataKey::MerchantAppeal(merchant.clone()))
+            .get(&DataKey2::MerchantAppeal(merchant.clone()))
             .expect("No appeal found");
 
         if appeal.resolved {
@@ -5659,17 +5721,17 @@ impl AhjoorPaymentsContract {
         appeal.approved = true;
         env.storage()
             .persistent()
-            .set(&DataKey::MerchantAppeal(merchant.clone()), &appeal);
+            .set(&DataKey2::MerchantAppeal(merchant.clone()), &appeal);
 
         // Reinstate merchant
         env.storage()
             .persistent()
-            .set(&DataKey::MerchantStatus(merchant.clone()), &MerchantStatus::Active);
+            .set(&DataKey2::MerchantStatus(merchant.clone()), &MerchantStatus::Active);
         env.storage()
             .persistent()
             .set(&DataKey::MerchantApproved(merchant.clone()), &true);
         env.storage().persistent().extend_ttl(
-            &DataKey::MerchantStatus(merchant.clone()),
+            &DataKey2::MerchantStatus(merchant.clone()),
             PERSISTENT_LIFETIME_THRESHOLD,
             PERSISTENT_BUMP_AMOUNT,
         );
@@ -5697,7 +5759,7 @@ impl AhjoorPaymentsContract {
         let mut appeal: MerchantAppeal = env
             .storage()
             .persistent()
-            .get(&DataKey::MerchantAppeal(merchant.clone()))
+            .get(&DataKey2::MerchantAppeal(merchant.clone()))
             .expect("No appeal found");
 
         if appeal.resolved {
@@ -5708,21 +5770,21 @@ impl AhjoorPaymentsContract {
         appeal.approved = false;
         env.storage()
             .persistent()
-            .set(&DataKey::MerchantAppeal(merchant.clone()), &appeal);
+            .set(&DataKey2::MerchantAppeal(merchant.clone()), &appeal);
 
         // Apply cooldown
         let cooldown_seconds: u64 = env
             .storage()
             .instance()
-            .get(&DataKey::AppealRejectionCooldownSeconds)
+            .get(&DataKey2::AppealRejectionCooldownSeconds)
             .unwrap_or(0);
         if cooldown_seconds > 0 {
             let cooldown_until = env.ledger().timestamp() + cooldown_seconds;
             env.storage()
                 .persistent()
-                .set(&DataKey::AppealCooldownUntil(merchant.clone()), &cooldown_until);
+                .set(&DataKey2::AppealCooldownUntil(merchant.clone()), &cooldown_until);
             env.storage().persistent().extend_ttl(
-                &DataKey::AppealCooldownUntil(merchant.clone()),
+                &DataKey2::AppealCooldownUntil(merchant.clone()),
                 PERSISTENT_LIFETIME_THRESHOLD,
                 PERSISTENT_BUMP_AMOUNT,
             );
@@ -5739,7 +5801,7 @@ impl AhjoorPaymentsContract {
     pub fn get_merchant_status(env: Env, merchant: Address) -> MerchantStatus {
         env.storage()
             .persistent()
-            .get(&DataKey::MerchantStatus(merchant))
+            .get(&DataKey2::MerchantStatus(merchant))
             .unwrap_or(MerchantStatus::Active)
     }
 
@@ -5747,7 +5809,7 @@ impl AhjoorPaymentsContract {
     pub fn get_merchant_appeal(env: Env, merchant: Address) -> Option<MerchantAppeal> {
         env.storage()
             .persistent()
-            .get(&DataKey::MerchantAppeal(merchant))
+            .get(&DataKey2::MerchantAppeal(merchant))
     }
 
     // ─── #226: Merchant Revenue Dashboard ────────────────────────────────────
@@ -5756,7 +5818,7 @@ impl AhjoorPaymentsContract {
     pub fn get_merchant_summary(env: Env, merchant: Address) -> MerchantSummary {
         env.storage()
             .persistent()
-            .get(&DataKey::MerchantSummary(merchant))
+            .get(&DataKey2::MerchantSummary(merchant))
             .unwrap_or(MerchantSummary {
                 total_volume: 0,
                 completed_count: 0,
@@ -5771,7 +5833,7 @@ impl AhjoorPaymentsContract {
         let summary: MerchantSummary = env
             .storage()
             .persistent()
-            .get(&DataKey::MerchantSummary(merchant))
+            .get(&DataKey2::MerchantSummary(merchant))
             .unwrap_or(MerchantSummary {
                 total_volume: 0,
                 completed_count: 0,
@@ -5787,7 +5849,7 @@ impl AhjoorPaymentsContract {
         let summary: MerchantSummary = env
             .storage()
             .persistent()
-            .get(&DataKey::MerchantSummary(merchant))
+            .get(&DataKey2::MerchantSummary(merchant))
             .unwrap_or(MerchantSummary {
                 total_volume: 0,
                 completed_count: 0,
@@ -5815,7 +5877,7 @@ impl AhjoorPaymentsContract {
             pending_count: 0,
             volume_by_token: Map::new(&env),
         };
-        let key = DataKey::MerchantSummary(merchant);
+        let key = DataKey2::MerchantSummary(merchant);
         env.storage().persistent().set(&key, &empty);
         env.storage().persistent().extend_ttl(
             &key,
@@ -5849,10 +5911,10 @@ impl AhjoorPaymentsContract {
         if admin != stored_admin {
             panic!("Only admin");
         }
-        env.storage().instance().set(&DataKey::LoyaltyPointsPerUnit, &points_per_unit);
-        env.storage().instance().set(&DataKey::LoyaltyRedemptionRateBps, &redemption_rate_bps);
-        env.storage().instance().set(&DataKey::LoyaltyMinPaymentFloor, &min_payment_floor);
-        env.storage().instance().set(&DataKey::LoyaltyExpiryLedgers, &expiry_ledgers);
+        env.storage().instance().set(&DataKey2::LoyaltyPointsPerUnit, &points_per_unit);
+        env.storage().instance().set(&DataKey2::LoyaltyRedemptionRateBps, &redemption_rate_bps);
+        env.storage().instance().set(&DataKey2::LoyaltyMinPaymentFloor, &min_payment_floor);
+        env.storage().instance().set(&DataKey2::LoyaltyExpiryLedgers, &expiry_ledgers);
         env.storage().instance().extend_ttl(INSTANCE_LIFETIME_THRESHOLD, INSTANCE_BUMP_AMOUNT);
     }
 
@@ -5869,7 +5931,7 @@ impl AhjoorPaymentsContract {
         let balance: i128 = env
             .storage()
             .persistent()
-            .get(&DataKey::LoyaltyBalance(customer.clone()))
+            .get(&DataKey2::LoyaltyBalance(customer.clone()))
             .unwrap_or(0);
         if points_to_redeem <= 0 || points_to_redeem > balance {
             panic!("Insufficient loyalty points");
@@ -5878,12 +5940,12 @@ impl AhjoorPaymentsContract {
         let redemption_rate_bps: u32 = env
             .storage()
             .instance()
-            .get(&DataKey::LoyaltyRedemptionRateBps)
+            .get(&DataKey2::LoyaltyRedemptionRateBps)
             .unwrap_or(0);
         let min_floor: i128 = env
             .storage()
             .instance()
-            .get(&DataKey::LoyaltyMinPaymentFloor)
+            .get(&DataKey2::LoyaltyMinPaymentFloor)
             .unwrap_or(0);
 
         let mut payment: Payment = env
@@ -5912,9 +5974,9 @@ impl AhjoorPaymentsContract {
 
         // Burn points
         let new_balance = balance - actual_points_used;
-        env.storage().persistent().set(&DataKey::LoyaltyBalance(customer.clone()), &new_balance);
+        env.storage().persistent().set(&DataKey2::LoyaltyBalance(customer.clone()), &new_balance);
         env.storage().persistent().extend_ttl(
-            &DataKey::LoyaltyBalance(customer.clone()),
+            &DataKey2::LoyaltyBalance(customer.clone()),
             PERSISTENT_LIFETIME_THRESHOLD,
             PERSISTENT_BUMP_AMOUNT,
         );
@@ -5924,6 +5986,13 @@ impl AhjoorPaymentsContract {
         env.storage().persistent().set(&DataKey::Payment(payment_id), &payment);
         env.storage().persistent().extend_ttl(
             &DataKey::Payment(payment_id),
+            PERSISTENT_LIFETIME_THRESHOLD,
+            PERSISTENT_BUMP_AMOUNT,
+        );
+        events::emit_points_redeemed(&env, customer, payment_id, actual_points_used, actual_discount);
+        env.storage().instance().extend_ttl(INSTANCE_LIFETIME_THRESHOLD, INSTANCE_BUMP_AMOUNT);
+    }
+
     // =========================================================================
     // #242: Merchant Referral Commission Tracking
     // =========================================================================
@@ -5932,11 +6001,6 @@ impl AhjoorPaymentsContract {
 
     /// Merchant sets a per-customer spend cap within a rolling window.
     pub fn set_customer_spend_limit(
-    // ─── #216: Recurring Invoice Scheduling ──────────────────────────────────
-
-    /// Merchant creates a recurring invoice schedule.
-    /// `max_cycles` = 0 means unlimited.
-    pub fn create_recurring_invoice(
         env: Env,
         merchant: Address,
         customer: Address,
@@ -5951,7 +6015,7 @@ impl AhjoorPaymentsContract {
         if window_seconds == 0 {
             panic!("Window seconds must be positive");
         }
-        let key = DataKey::CustomerSpendLimit(merchant.clone(), customer.clone());
+        let key = DataKey2::CustomerSpendLimit(merchant.clone(), customer.clone());
         let limit = SpendLimit { amount, window_seconds };
         env.storage().persistent().set(&key, &limit);
         env.storage().persistent().extend_ttl(&key, PERSISTENT_LIFETIME_THRESHOLD, PERSISTENT_BUMP_AMOUNT);
@@ -5963,7 +6027,7 @@ impl AhjoorPaymentsContract {
     pub fn remove_customer_spend_limit(env: Env, merchant: Address, customer: Address) {
         Self::require_not_paused(&env);
         merchant.require_auth();
-        let key = DataKey::CustomerSpendLimit(merchant.clone(), customer.clone());
+        let key = DataKey2::CustomerSpendLimit(merchant.clone(), customer.clone());
         env.storage().persistent().remove(&key);
         events::emit_customer_spend_limit_removed(&env, merchant, customer);
         env.storage().instance().extend_ttl(INSTANCE_LIFETIME_THRESHOLD, INSTANCE_BUMP_AMOUNT);
@@ -5984,7 +6048,7 @@ impl AhjoorPaymentsContract {
         if window_seconds == 0 {
             panic!("Window seconds must be positive");
         }
-        let key = DataKey::DefaultSpendLimit(merchant.clone());
+        let key = DataKey2::DefaultSpendLimit(merchant.clone());
         let limit = SpendLimit { amount, window_seconds };
         env.storage().persistent().set(&key, &limit);
         env.storage().persistent().extend_ttl(&key, PERSISTENT_LIFETIME_THRESHOLD, PERSISTENT_BUMP_AMOUNT);
@@ -5994,12 +6058,12 @@ impl AhjoorPaymentsContract {
 
     /// Get the per-customer spend limit for a merchant+customer pair.
     pub fn get_customer_spend_limit(env: Env, merchant: Address, customer: Address) -> Option<SpendLimit> {
-        env.storage().persistent().get(&DataKey::CustomerSpendLimit(merchant, customer))
+        env.storage().persistent().get(&DataKey2::CustomerSpendLimit(merchant, customer))
     }
 
     /// Get the default spend limit for a merchant.
     pub fn get_default_spend_limit(env: Env, merchant: Address) -> Option<SpendLimit> {
-        env.storage().persistent().get(&DataKey::DefaultSpendLimit(merchant))
+        env.storage().persistent().get(&DataKey2::DefaultSpendLimit(merchant))
     }
 
     /// Check and update the customer spend window. Panics with CustomerSpendLimitExceeded if cap would be breached.
@@ -6008,15 +6072,15 @@ impl AhjoorPaymentsContract {
         let limit_opt: Option<SpendLimit> = env
             .storage()
             .persistent()
-            .get(&DataKey::CustomerSpendLimit(merchant.clone(), customer.clone()))
-            .or_else(|| env.storage().persistent().get(&DataKey::DefaultSpendLimit(merchant.clone())));
+            .get(&DataKey2::CustomerSpendLimit(merchant.clone(), customer.clone()))
+            .or_else(|| env.storage().persistent().get(&DataKey2::DefaultSpendLimit(merchant.clone())));
 
         let limit = match limit_opt {
             Some(l) => l,
             None => return, // No limit configured
         };
 
-        let state_key = DataKey::CustomerSpendWindowState(merchant.clone(), customer.clone());
+        let state_key = DataKey2::CustomerSpendWindowState(merchant.clone(), customer.clone());
         let now = env.ledger().timestamp();
 
         let mut state: CustomerSpendWindow = env
@@ -6039,6 +6103,17 @@ impl AhjoorPaymentsContract {
         state.spent = new_total;
         env.storage().persistent().set(&state_key, &state);
         env.storage().persistent().extend_ttl(&state_key, PERSISTENT_LIFETIME_THRESHOLD, PERSISTENT_BUMP_AMOUNT);
+    }
+
+    // ─── #216: Recurring Invoice Scheduling ──────────────────────────────────
+
+    /// Merchant creates a recurring invoice schedule.
+    /// `max_cycles` = 0 means unlimited.
+    pub fn create_recurring_invoice(
+        env: Env,
+        merchant: Address,
+        customer: Address,
+        amount: i128,
         token: Address,
         interval_seconds: u64,
         max_cycles: u32,
@@ -6060,13 +6135,13 @@ impl AhjoorPaymentsContract {
         let mut counter: u32 = env
             .storage()
             .instance()
-            .get(&DataKey::RecurringInvoiceCounter)
+            .get(&DataKey2::RecurringInvoiceCounter)
             .unwrap_or(0);
         let invoice_id = counter;
         counter += 1;
         env.storage()
             .instance()
-            .set(&DataKey::RecurringInvoiceCounter, &counter);
+            .set(&DataKey2::RecurringInvoiceCounter, &counter);
 
         let now = env.ledger().timestamp();
         let invoice = RecurringInvoice {
@@ -6085,9 +6160,9 @@ impl AhjoorPaymentsContract {
 
         env.storage()
             .persistent()
-            .set(&DataKey::RecurringInvoice(invoice_id), &invoice);
+            .set(&DataKey2::RecurringInvoice(invoice_id), &invoice);
         env.storage().persistent().extend_ttl(
-            &DataKey::RecurringInvoice(invoice_id),
+            &DataKey2::RecurringInvoice(invoice_id),
             PERSISTENT_LIFETIME_THRESHOLD,
             PERSISTENT_BUMP_AMOUNT,
         );
@@ -6110,7 +6185,7 @@ impl AhjoorPaymentsContract {
         let mut invoice: RecurringInvoice = env
             .storage()
             .persistent()
-            .get(&DataKey::RecurringInvoice(invoice_id))
+            .get(&DataKey2::RecurringInvoice(invoice_id))
             .expect("Recurring invoice not found");
 
         if !invoice.active {
@@ -6151,15 +6226,17 @@ impl AhjoorPaymentsContract {
 
         env.storage()
             .persistent()
-            .set(&DataKey::RecurringInvoice(invoice_id), &invoice);
+            .set(&DataKey2::RecurringInvoice(invoice_id), &invoice);
         env.storage().persistent().extend_ttl(
-            &DataKey::RecurringInvoice(invoice_id),
+            &DataKey2::RecurringInvoice(invoice_id),
             PERSISTENT_LIFETIME_THRESHOLD,
             PERSISTENT_BUMP_AMOUNT,
         );
 
-        events::emit_points_redeemed(&env, customer, payment_id, actual_points_used, actual_discount);
+        events::emit_invoice_cycle_triggered(&env, invoice_id, payment_id, invoice.cycles_triggered);
         env.storage().instance().extend_ttl(INSTANCE_LIFETIME_THRESHOLD, INSTANCE_BUMP_AMOUNT);
+
+        payment_id
     }
 
     /// Returns the loyalty points balance for a customer (after expiry check).
@@ -6167,7 +6244,7 @@ impl AhjoorPaymentsContract {
         Self::maybe_expire_points(&env, &customer);
         env.storage()
             .persistent()
-            .get(&DataKey::LoyaltyBalance(customer))
+            .get(&DataKey2::LoyaltyBalance(customer))
             .unwrap_or(0)
     }
 
@@ -6176,7 +6253,7 @@ impl AhjoorPaymentsContract {
         let points_per_unit: u32 = match env
             .storage()
             .instance()
-            .get(&DataKey::LoyaltyPointsPerUnit)
+            .get(&DataKey2::LoyaltyPointsPerUnit)
         {
             Some(v) => v,
             None => return, // loyalty not configured
@@ -6196,29 +6273,26 @@ impl AhjoorPaymentsContract {
         let old_balance: i128 = env
             .storage()
             .persistent()
-            .get(&DataKey::LoyaltyBalance(customer.clone()))
+            .get(&DataKey2::LoyaltyBalance(customer.clone()))
             .unwrap_or(0);
         let new_balance = old_balance + points_earned;
 
-        env.storage().persistent().set(&DataKey::LoyaltyBalance(customer.clone()), &new_balance);
+        env.storage().persistent().set(&DataKey2::LoyaltyBalance(customer.clone()), &new_balance);
         env.storage().persistent().extend_ttl(
-            &DataKey::LoyaltyBalance(customer.clone()),
+            &DataKey2::LoyaltyBalance(customer.clone()),
             PERSISTENT_LIFETIME_THRESHOLD,
             PERSISTENT_BUMP_AMOUNT,
         );
         env.storage().persistent().set(
-            &DataKey::LoyaltyLastAccrualLedger(customer.clone()),
+            &DataKey2::LoyaltyLastAccrualLedger(customer.clone()),
             &env.ledger().sequence(),
         );
         env.storage().persistent().extend_ttl(
-            &DataKey::LoyaltyLastAccrualLedger(customer.clone()),
-        events::emit_invoice_cycle_triggered(&env, invoice_id, payment_id, invoice.cycles_triggered);
-
-        env.storage()
-            .instance()
-            .extend_ttl(INSTANCE_LIFETIME_THRESHOLD, INSTANCE_BUMP_AMOUNT);
-
-        payment_id
+            &DataKey2::LoyaltyLastAccrualLedger(customer.clone()),
+            PERSISTENT_LIFETIME_THRESHOLD,
+            PERSISTENT_BUMP_AMOUNT,
+        );
+        events::emit_points_accrued(env, customer.clone(), payment_id, points_earned, new_balance);
     }
 
     /// Cancel a recurring invoice. Callable by merchant or customer.
@@ -6229,7 +6303,7 @@ impl AhjoorPaymentsContract {
         let mut invoice: RecurringInvoice = env
             .storage()
             .persistent()
-            .get(&DataKey::RecurringInvoice(invoice_id))
+            .get(&DataKey2::RecurringInvoice(invoice_id))
             .expect("Recurring invoice not found");
 
         if caller != invoice.merchant && caller != invoice.customer {
@@ -6243,14 +6317,18 @@ impl AhjoorPaymentsContract {
         invoice.active = false;
         env.storage()
             .persistent()
-            .set(&DataKey::RecurringInvoice(invoice_id), &invoice);
+            .set(&DataKey2::RecurringInvoice(invoice_id), &invoice);
         env.storage().persistent().extend_ttl(
-            &DataKey::RecurringInvoice(invoice_id),
+            &DataKey2::RecurringInvoice(invoice_id),
             PERSISTENT_LIFETIME_THRESHOLD,
             PERSISTENT_BUMP_AMOUNT,
         );
 
-        events::emit_points_accrued(env, customer.clone(), payment_id, points_earned, new_balance);
+        events::emit_recurring_invoice_cancelled(&env, invoice_id, caller.clone());
+
+        env.storage()
+            .instance()
+            .extend_ttl(INSTANCE_LIFETIME_THRESHOLD, INSTANCE_BUMP_AMOUNT);
     }
 
     /// Internal: burn expired points if expiry window has passed.
@@ -6258,7 +6336,7 @@ impl AhjoorPaymentsContract {
         let expiry_ledgers: u32 = env
             .storage()
             .instance()
-            .get(&DataKey::LoyaltyExpiryLedgers)
+            .get(&DataKey2::LoyaltyExpiryLedgers)
             .unwrap_or(0);
         if expiry_ledgers == 0 {
             return;
@@ -6266,7 +6344,7 @@ impl AhjoorPaymentsContract {
         let last_accrual: u32 = match env
             .storage()
             .persistent()
-            .get(&DataKey::LoyaltyLastAccrualLedger(customer.clone()))
+            .get(&DataKey2::LoyaltyLastAccrualLedger(customer.clone()))
         {
             Some(v) => v,
             None => return,
@@ -6276,29 +6354,22 @@ impl AhjoorPaymentsContract {
             let balance: i128 = env
                 .storage()
                 .persistent()
-                .get(&DataKey::LoyaltyBalance(customer.clone()))
+                .get(&DataKey2::LoyaltyBalance(customer.clone()))
                 .unwrap_or(0);
             if balance > 0 {
-                env.storage().persistent().set(&DataKey::LoyaltyBalance(customer.clone()), &0i128);
+                env.storage().persistent().set(&DataKey2::LoyaltyBalance(customer.clone()), &0i128);
                 events::emit_points_expired(env, customer.clone(), balance);
             }
         }
-        events::emit_recurring_invoice_cancelled(&env, invoice_id, caller);
-
-        env.storage()
-            .instance()
-            .extend_ttl(INSTANCE_LIFETIME_THRESHOLD, INSTANCE_BUMP_AMOUNT);
     }
 
     /// Get a recurring invoice by ID.
     pub fn get_recurring_invoice(env: Env, invoice_id: u32) -> RecurringInvoice {
         env.storage()
             .persistent()
-            .get(&DataKey::RecurringInvoice(invoice_id))
+            .get(&DataKey2::RecurringInvoice(invoice_id))
             .expect("Recurring invoice not found")
     }
-
-}
 
     /// Admin sets global referral terms.
     pub fn set_referral_config(env: Env, admin: Address, commission_bps: u32, window_ledgers: u32) {
@@ -6306,8 +6377,8 @@ impl AhjoorPaymentsContract {
         admin.require_auth();
         let stored_admin: Address = env.storage().instance().get(&DataKey::Admin).expect("Not initialized");
         if admin != stored_admin { panic!("Only admin can set referral config"); }
-        env.storage().instance().set(&DataKey::ReferralCommissionBps, &commission_bps);
-        env.storage().instance().set(&DataKey::ReferralWindowLedgers, &window_ledgers);
+        env.storage().instance().set(&DataKey2::ReferralCommissionBps, &commission_bps);
+        env.storage().instance().set(&DataKey2::ReferralWindowLedgers, &window_ledgers);
         env.storage().instance().extend_ttl(INSTANCE_LIFETIME_THRESHOLD, INSTANCE_BUMP_AMOUNT);
     }
 
@@ -6325,13 +6396,13 @@ impl AhjoorPaymentsContract {
         let already_exists: bool = env.storage().persistent().get(&DataKey::MerchantApproved(referred_merchant.clone())).unwrap_or(false);
         if already_exists { panic_with_error!(&env, Error::ReferralAlreadyExists); }
 
-        let window_ledgers: u32 = env.storage().instance().get(&DataKey::ReferralWindowLedgers).unwrap_or(0);
+        let window_ledgers: u32 = env.storage().instance().get(&DataKey2::ReferralWindowLedgers).unwrap_or(0);
         let record = ReferralRecord {
             referrer: referrer.clone(),
             registered_at_ledger: env.ledger().sequence(),
             window_ledgers,
         };
-        let key = DataKey::ReferralRecord(referred_merchant.clone());
+        let key = DataKey2::ReferralRecord(referred_merchant.clone());
         env.storage().persistent().set(&key, &record);
         env.storage().persistent().extend_ttl(&key, PERSISTENT_LIFETIME_THRESHOLD, PERSISTENT_BUMP_AMOUNT);
 
@@ -6344,7 +6415,7 @@ impl AhjoorPaymentsContract {
         Self::require_not_paused(&env);
         referrer.require_auth();
 
-        let key = DataKey::PendingCommission(referrer.clone());
+        let key = DataKey2::PendingCommission(referrer.clone());
         let pending: i128 = env.storage().persistent().get(&key).unwrap_or(0);
         if pending <= 0 { panic_with_error!(&env, Error::NoCommissionToClaim); }
 
@@ -6360,19 +6431,19 @@ impl AhjoorPaymentsContract {
 
     /// Get pending commission balance for a referrer.
     pub fn get_pending_commission(env: Env, referrer: Address) -> i128 {
-        env.storage().persistent().get(&DataKey::PendingCommission(referrer)).unwrap_or(0)
+        env.storage().persistent().get(&DataKey2::PendingCommission(referrer)).unwrap_or(0)
     }
 
     /// Get the referral record for a referred merchant.
     pub fn get_referral_record(env: Env, referred_merchant: Address) -> Option<ReferralRecord> {
-        env.storage().persistent().get(&DataKey::ReferralRecord(referred_merchant))
+        env.storage().persistent().get(&DataKey2::ReferralRecord(referred_merchant))
     }
 
     /// Internal: accrue referral commission when a referred merchant's payment is finalized.
     fn accrue_referral_commission(env: &Env, merchant: &Address, payment_id: u32, fee_amount: i128) {
         if fee_amount <= 0 { return; }
 
-        let record_opt: Option<ReferralRecord> = env.storage().persistent().get(&DataKey::ReferralRecord(merchant.clone()));
+        let record_opt: Option<ReferralRecord> = env.storage().persistent().get(&DataKey2::ReferralRecord(merchant.clone()));
         let record = match record_opt {
             Some(r) => r,
             None => return,
@@ -6384,13 +6455,13 @@ impl AhjoorPaymentsContract {
             return;
         }
 
-        let commission_bps: u32 = env.storage().instance().get(&DataKey::ReferralCommissionBps).unwrap_or(0);
+        let commission_bps: u32 = env.storage().instance().get(&DataKey2::ReferralCommissionBps).unwrap_or(0);
         if commission_bps == 0 { return; }
 
         let commission = (fee_amount * commission_bps as i128) / 10_000;
         if commission <= 0 { return; }
 
-        let pending_key = DataKey::PendingCommission(record.referrer.clone());
+        let pending_key = DataKey2::PendingCommission(record.referrer.clone());
         let current: i128 = env.storage().persistent().get(&pending_key).unwrap_or(0);
         let new_total = current.saturating_add(commission);
         env.storage().persistent().set(&pending_key, &new_total);
@@ -6399,7 +6470,142 @@ impl AhjoorPaymentsContract {
         events::emit_commission_accrued(env, record.referrer, merchant.clone(), payment_id, commission);
     }
 
+    // ─────────────────────────────────────────────────────────────────
+    // #265: Merchant Tip and Gratuity Support
+    // ─────────────────────────────────────────────────────────────────
+
+    /// Create a payment with tipping enabled. Identical to `create_payment`
+    /// except `tipping_enabled` is stored on the payment record so that
+    /// `complete_payment_with_tip` may attach a gratuity at settlement.
+    #[allow(clippy::too_many_arguments)]
+    pub fn create_payment_with_tipping(
+        env: Env,
+        customer: Address,
+        merchant: Address,
+        amount: i128,
+        token: Address,
+        reference: Option<String>,
+        metadata: Option<Map<String, String>>,
+        idempotency_key: Option<BytesN<32>>,
+    ) -> u32 {
+        let payment_id = Self::create_payment_with_expiry(
+            env.clone(),
+            customer,
+            merchant,
+            amount,
+            token,
+            reference,
+            metadata,
+            None,
+            None,
+            idempotency_key,
+            None,
+        );
+        // Flip the tipping flag on the freshly-stored payment.
+        let mut payment: Payment = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Payment(payment_id))
+            .expect("Payment not found");
+        payment.tipping_enabled = true;
+        env.storage()
+            .persistent()
+            .set(&DataKey::Payment(payment_id), &payment);
+        env.storage().persistent().extend_ttl(
+            &DataKey::Payment(payment_id),
+            PERSISTENT_LIFETIME_THRESHOLD,
+            PERSISTENT_BUMP_AMOUNT,
+        );
+        payment_id
+    }
+
+    /// Admin completes a payment and optionally forwards a customer-provided
+    /// gratuity directly to the merchant (fee-exempt).
+    ///
+    /// * `tip_amount == 0` behaves identically to `complete_payment`.
+    /// * `tip_amount > 0` requires `payment.tipping_enabled == true`.
+    /// * `tip_amount` must not exceed `max_tip_bps` percent of the base amount.
+    /// * The customer must auth this call (to authorise the tip pull).
+    pub fn complete_payment_with_tip(
+        env: Env,
+        payment_id: u32,
+        customer: Address,
+        tip_amount: i128,
+    ) {
+        Self::require_not_paused(&env);
+        let admin: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .expect("Not initialized");
+        admin.require_auth();
+
+        let payment: Payment = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Payment(payment_id))
+            .expect("Payment not found");
+
+        if tip_amount < 0 {
+            panic!("tip_amount cannot be negative");
+        }
+
+        if tip_amount > 0 {
+            if !payment.tipping_enabled {
+                panic_with_error!(&env, Error::TippingNotEnabled);
+            }
+            let max_tip_bps: u32 = env
+                .storage()
+                .instance()
+                .get(&DataKey2::MaxTipBps)
+                .unwrap_or(DEFAULT_MAX_TIP_BPS);
+            let max_tip = (payment.amount * max_tip_bps as i128) / 10_000;
+            if tip_amount > max_tip {
+                panic_with_error!(&env, Error::TipExceedsMaxBps);
+            }
+            // Customer must auth the tip transfer.
+            customer.require_auth();
+            let token_client = token::Client::new(&env, &payment.token);
+            token_client.transfer(&customer, &payment.merchant, &tip_amount);
+            events::emit_tip_received(&env, payment_id, payment.merchant.clone(), tip_amount, payment.token.clone());
+        }
+
+        Self::complete_payment_internal(&env, payment_id, false);
+    }
+
+    /// Admin sets the global maximum tip in basis points.
+    /// Must be ≤ 10 000 bps (100%).  Default is 3 000 bps (30%).
+    pub fn set_max_tip_bps(env: Env, admin: Address, max_bps: u32) {
+        admin.require_auth();
+        let stored_admin: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .expect("Not initialized");
+        if admin != stored_admin {
+            panic!("Only admin can set max tip bps");
+        }
+        if max_bps > 10_000 {
+            panic!("max_tip_bps cannot exceed 10 000");
+        }
+        env.storage().instance().set(&DataKey2::MaxTipBps, &max_bps);
+        env.storage()
+            .instance()
+            .extend_ttl(INSTANCE_LIFETIME_THRESHOLD, INSTANCE_BUMP_AMOUNT);
+    }
+
+    /// Returns the current maximum tip in basis points (default: 3 000).
+    pub fn get_max_tip_bps(env: Env) -> u32 {
+        env.storage()
+            .instance()
+            .get(&DataKey2::MaxTipBps)
+            .unwrap_or(DEFAULT_MAX_TIP_BPS)
+    }
+
 }
+
+#[cfg(test)]
+mod test_tip;
 
 #[cfg(test)]
 mod test_token_whitelist;
@@ -6418,8 +6624,11 @@ mod test_merchant_ban;
 
 #[cfg(test)]
 mod test_loyalty_points;
+#[cfg(test)]
 mod test_referral;
+#[cfg(test)]
 mod test_dynamic_settlement;
+#[cfg(test)]
 mod test_spending_limit;
 
 pub use events::*;

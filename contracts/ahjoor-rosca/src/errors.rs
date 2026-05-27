@@ -71,36 +71,6 @@ pub enum Error {
     InsufficientApprovals = 49,
     /// Not a co-admin.
     NotACoAdmin = 50,
-    /// Emergency payout already requested for this member in this cycle.
-    EmergencyPayoutAlreadyRequested = 51,
-    /// Emergency payout quorum not met.
-    EmergencyPayoutQuorumNotMet = 52,
-    /// Emergency payout vote window expired.
-    EmergencyPayoutVoteExpired = 53,
-    /// Emergency payout already executed for this member in this cycle.
-    EmergencyPayoutAlreadyExecuted = 54,
-    /// Maximum emergency payouts per cycle reached.
-    EmergencyPayoutLimitReached = 55,
-    /// Group is already dissolved.
-    GroupAlreadyDissolved = 56,
-    /// Dissolution vote already in progress.
-    DissolutionVoteInProgress = 57,
-    /// Dissolution quorum not met.
-    DissolutionQuorumNotMet = 58,
-    /// Dissolution vote window expired.
-    DissolutionVoteExpired = 59,
-    /// No funds to distribute during dissolution.
-    NoFundsToDistribute = 60,
-    /// Invalid emergency payout configuration.
-    InvalidEmergencyConfig = 61,
-    /// Invalid dissolution configuration.
-    InvalidDissolutionConfig = 62,
-    /// Only admin is allowed to perform this action.
-    OnlyAdminAllowed = 63,
-    /// Invalid amount provided.
-    InvalidAmount = 64,
-    /// Round duration is out of the configured bounds.
-    RoundDurationOutOfBounds = 65,
 }
 
 /// Extension error codes 51-56 — split from Error because #[contracterror]
@@ -163,9 +133,17 @@ pub enum ExtError {
     /// Co-signer window has expired.
     CoSignerWindowExpired = 77,
     /// Group is frozen by contract-level admin pending investigation.
-    GroupFrozen = 72,
+    GroupFrozen = 78,
     /// Group is not currently frozen.
-    GroupNotFrozen = 73,
+    GroupNotFrozen = 79,
     /// Snapshot taken too soon; min_snapshot_interval_ledgers not elapsed (#243).
-    SnapshotTooSoon = 72,
+    SnapshotTooSoon = 80,
+    /// Tier ID does not exist in this group's tier definitions (#267).
+    TierNotFound = 81,
+    /// Tier definition is invalid (e.g. zero contribution_amount or payout_weight) (#267).
+    InvalidTierDefinition = 82,
+    /// Member's credit score is below the group's minimum threshold (#269).
+    InsufficientCreditScore = 83,
+    /// Round duration is out of the configured bounds.
+    RoundDurationOutOfBounds = 84,
 }
