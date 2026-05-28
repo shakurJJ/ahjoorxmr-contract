@@ -6,6 +6,11 @@ use soroban_sdk::{
 };
 use ahjoor_token_whitelist::TokenWhitelistClient;
 
+pub mod multi_token_invoice;
+pub mod multi_token_invoice_impl;
+pub mod pre_approved_spending;
+pub mod pre_approved_spending_impl;
+
 /// Maximum length (bytes) for the optional payment reference string.
 const MAX_REFERENCE_LEN: u32 = 64;
 /// Maximum number of entries in the optional metadata map.

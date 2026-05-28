@@ -25,6 +25,8 @@ mod errors;
 mod events;
 mod internals;
 mod audit_trail;
+pub mod savings_goal_tracking;
+pub mod savings_goal_tracking_impl;
 mod test_tiers;
 mod test_weighted_voting;
 mod test_reinvest;
