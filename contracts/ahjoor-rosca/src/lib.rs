@@ -5455,6 +5455,402 @@ impl AhjoorContract {
             .extend_ttl(INSTANCE_LIFETIME_THRESHOLD, INSTANCE_BUMP_AMOUNT);
     }
 
+    /// Authorize or replace a proxy for a member in a specific group.
+    pub fn authorize_proxy(
+        env: Env,
+        member: Address,
+        group_id: u32,
+        proxy_address: Address,
+        max_rounds: u32,
+    ) {
+        member.require_auth();
+        if max_rounds == 0 {
+            panic_with_error!(&env, ExtError::InvalidAmount);
+        }
+
+        let members: Vec<Address> = env
+            .storage()
+            .instance()
+            .get(&DataKey::Members)
+            .expect("Not initialized");
+        if !members.contains(&member) {
+            panic_with_error!(&env, Error::NotAMember);
+        }
+
+        let mut proxy_auths: Map<(u32, Address), ProxyAuthorization> = env
+            .storage()
+            .instance()
+            .get(&DataKey3::ProxyAuthorizations)
+            .unwrap_or(Map::new(&env));
+
+        proxy_auths.set(
+            (group_id, member.clone()),
+            ProxyAuthorization {
+                proxy: proxy_address.clone(),
+                max_rounds,
+                used_rounds: 0,
+            },
+        );
+        env.storage()
+            .instance()
+            .set(&DataKey3::ProxyAuthorizations, &proxy_auths);
+
+        events::emit_proxy_authorized(&env, group_id, member, proxy_address, max_rounds);
+        env.storage()
+            .instance()
+            .extend_ttl(INSTANCE_LIFETIME_THRESHOLD, INSTANCE_BUMP_AMOUNT);
+    }
+
+    /// Proxy contributes from their own balance, credited to the member.
+    pub fn contribute_as_proxy(
+        env: Env,
+        proxy: Address,
+        group_id: u32,
+        member: Address,
+        token: Address,
+        amount: i128,
+    ) {
+        internals::check_not_paused(&env);
+        internals::check_not_frozen(&env);
+        proxy.require_auth();
+
+        let start_at = Self::get_start_time(env.clone());
+        if env.ledger().timestamp() < start_at {
+            panic_with_error!(&env, ExtError::GroupNotYetActive);
+        }
+
+        let group_status: GroupStatus = env
+            .storage()
+            .instance()
+            .get(&DataKey2::GroupStatus)
+            .unwrap_or(GroupStatus::Active);
+        if group_status == GroupStatus::Dissolved {
+            panic_with_error!(&env, ExtError::GroupAlreadyDissolved);
+        }
+
+        let use_timestamp: bool = env
+            .storage()
+            .instance()
+            .get(&DataKey::UseTimestampSchedule)
+            .unwrap_or(false);
+        let deadline: u64 = if use_timestamp {
+            env.storage()
+                .instance()
+                .get(&DataKey::RoundDeadlineTimestamp)
+                .expect("Timestamp deadline not set")
+        } else {
+            env.storage()
+                .instance()
+                .get(&DataKey::RoundDeadline)
+                .expect("Deadline not set")
+        };
+        if env.ledger().timestamp() > deadline {
+            panic_with_error!(&env, Error::ContributionWindowClosed);
+        }
+
+        let exited_members: Vec<Address> = env
+            .storage()
+            .instance()
+            .get(&DataKey::ExitedMembers)
+            .unwrap_or(Vec::new(&env));
+        if exited_members.contains(&member) {
+            panic_with_error!(&env, Error::MemberHasExited);
+        }
+
+        let members: Vec<Address> = env
+            .storage()
+            .instance()
+            .get(&DataKey::Members)
+            .expect("Not initialized");
+        if !members.contains(&member) {
+            panic_with_error!(&env, Error::NotAMember);
+        }
+
+        let activation_emitted: bool = env
+            .storage()
+            .instance()
+            .get(&DataKey2::GroupActivationEmitted)
+            .unwrap_or(false);
+
+        let mut paid_members: Vec<Address> = env
+            .storage()
+            .instance()
+            .get(&DataKey::PaidMembers)
+            .expect("Not initialized");
+        if paid_members.contains(&member) {
+            panic_with_error!(&env, Error::AlreadyContributed);
+        }
+
+        let mut proxy_auths: Map<(u32, Address), ProxyAuthorization> = env
+            .storage()
+            .instance()
+            .get(&DataKey3::ProxyAuthorizations)
+            .unwrap_or(Map::new(&env));
+        let key = (group_id, member.clone());
+        let mut auth = proxy_auths
+            .get(key.clone())
+            .unwrap_or_else(|| panic_with_error!(&env, Error::NoDelegationFound));
+
+        if auth.proxy != proxy {
+            panic_with_error!(&env, Error::NoDelegationFound);
+        }
+
+        if auth.used_rounds >= auth.max_rounds {
+            proxy_auths.remove(key);
+            env.storage()
+                .instance()
+                .set(&DataKey3::ProxyAuthorizations, &proxy_auths);
+            panic_with_error!(&env, Error::NoDelegationFound);
+        }
+
+        let approved_tokens: Vec<Address> = env
+            .storage()
+            .instance()
+            .get(&DataKey::ApprovedTokens)
+            .unwrap_or(Vec::new(&env));
+        if !approved_tokens.contains(&token) {
+            panic_with_error!(&env, Error::TokenNotApproved);
+        }
+        Self::require_token_allowed(&env, &token);
+
+        let base_token: Address = env.storage().instance().get(&DataKey::Token).unwrap();
+        if token != base_token {
+            panic_with_error!(&env, ExtError::IncorrectContributionAmount);
+        }
+
+        let base_amount: i128 = env
+            .storage()
+            .instance()
+            .get(&DataKey::ContributionAmt)
+            .unwrap();
+
+        let tiers: Map<Address, u32> = env
+            .storage()
+            .instance()
+            .get(&DataKey::MemberTiers)
+            .unwrap_or(Map::new(&env));
+        let tier_bps = tiers.get(member.clone()).unwrap_or(10_000);
+        let member_required_amount = (base_amount * tier_bps as i128) / 10_000;
+
+        let mut member_contributions: Map<Address, i128> = env
+            .storage()
+            .instance()
+            .get(&DataKey::MemberContributions)
+            .unwrap_or(Map::new(&env));
+        let already_paid: i128 = member_contributions.get(member.clone()).unwrap_or(0);
+        let remaining = member_required_amount - already_paid;
+
+        if amount != remaining {
+            panic_with_error!(&env, ExtError::IncorrectContributionAmount);
+        }
+
+        let limits: Map<Address, i128> = env
+            .storage()
+            .instance()
+            .get(&DataKey::TokenLimits)
+            .unwrap_or(Map::new(&env));
+        if let Some(limit) = limits.get(token.clone()) {
+            if amount > limit {
+                panic_with_error!(&env, Error::ExceedsTokenLimit);
+            }
+        }
+
+        let insurance_bps: u32 = env
+            .storage()
+            .instance()
+            .get(&DataKey2::InsuranceContributionBps)
+            .unwrap_or(0);
+        let insurance_deduction = if insurance_bps > 0 {
+            (amount * insurance_bps as i128) / 10_000
+        } else {
+            0
+        };
+        let total_transfer_amount = amount + insurance_deduction;
+
+        let client = token::Client::new(&env, &token);
+        client.transfer(&proxy, &env.current_contract_address(), &total_transfer_amount);
+
+        if insurance_deduction > 0 {
+            let mut insurance_pool: i128 = env
+                .storage()
+                .instance()
+                .get(&DataKey2::InsurancePool)
+                .unwrap_or(0);
+            insurance_pool += insurance_deduction;
+            env.storage()
+                .instance()
+                .set(&DataKey2::InsurancePool, &insurance_pool);
+            events::emit_insurance_top_up(&env, proxy.clone(), insurance_deduction);
+        }
+
+        let current_round: u32 = env
+            .storage()
+            .instance()
+            .get(&DataKey::CurrentRound)
+            .unwrap_or(0);
+
+        let new_total = already_paid + amount;
+        member_contributions.set(member.clone(), new_total);
+        env.storage()
+            .instance()
+            .set(&DataKey::MemberContributions, &member_contributions);
+
+        events::emit_contrib(&env, member.clone(), current_round, token, amount);
+        events::emit_proxy_contributed(
+            &env,
+            group_id,
+            member.clone(),
+            proxy.clone(),
+            current_round,
+        );
+
+        Self::apply_reputation_delta(&env, member.clone(), 10, "on_time_full");
+        Self::update_credit_score_internal(&env, &member, Symbol::new(&env, "on_time"));
+        paid_members.push_back(member.clone());
+        env.storage().instance().set(&DataKey::PaidMembers, &paid_members);
+
+        let mut total_participations: u32 = env
+            .storage()
+            .instance()
+            .get(&DataKey::TotalParticipations)
+            .unwrap_or(0);
+        let mut member_participation: Map<Address, u32> = env
+            .storage()
+            .instance()
+            .get(&DataKey::MemberParticipation)
+            .unwrap_or(Map::new(&env));
+        let current_participation = member_participation.get(member.clone()).unwrap_or(0);
+        member_participation.set(member.clone(), current_participation + 1);
+        total_participations += 1;
+        env.storage()
+            .instance()
+            .set(&DataKey::TotalParticipations, &total_participations);
+        env.storage()
+            .instance()
+            .set(&DataKey::MemberParticipation, &member_participation);
+
+        if paid_members.len() == members.len() {
+            internals::complete_round_payout(&env, &paid_members);
+
+            let auto_close_enabled: bool = env
+                .storage()
+                .temporary()
+                .get(&Symbol::new(&env, "auto_close_enabled"))
+                .unwrap_or(false);
+            if auto_close_enabled {
+                let current_round: u32 = env
+                    .storage()
+                    .instance()
+                    .get(&DataKey::CurrentRound)
+                    .unwrap_or(0);
+                events::emit_round_auto_closed_early(
+                    &env,
+                    current_round,
+                    env.ledger().timestamp(),
+                );
+            }
+        }
+
+        let mut total_collected: i128 = env
+            .storage()
+            .instance()
+            .get(&DataKey::TotalCollected)
+            .unwrap_or(0);
+        total_collected += amount;
+        env.storage()
+            .instance()
+            .set(&DataKey::TotalCollected, &total_collected);
+
+        let mut member_collected: Map<Address, i128> = env
+            .storage()
+            .instance()
+            .get(&DataKey::MemberCollected)
+            .unwrap_or(Map::new(&env));
+        let m_collected = member_collected.get(member.clone()).unwrap_or(0) + amount;
+        member_collected.set(member.clone(), m_collected);
+        env.storage()
+            .instance()
+            .set(&DataKey::MemberCollected, &member_collected);
+
+        if let Some(collective_goal) = env
+            .storage()
+            .instance()
+            .get::<_, i128>(&DataKey::CollectiveGoal)
+        {
+            let mut milestones_reached: Vec<u32> = env
+                .storage()
+                .instance()
+                .get(&DataKey::MilestonesReached)
+                .unwrap_or(Vec::new(&env));
+
+            let progress_bps = (total_collected * 10000i128) / collective_goal;
+            let thresholds: [u32; 4] = [2500u32, 5000u32, 7500u32, 10000u32];
+            let milestone_names: [u32; 4] = [25u32, 50u32, 75u32, 100u32];
+
+            for i in 0..4 {
+                let threshold = thresholds[i];
+                let milestone = milestone_names[i];
+                if progress_bps >= threshold as i128 && !milestones_reached.contains(&milestone) {
+                    milestones_reached.push_back(milestone);
+                    events::emit_milestone(&env, milestone, total_collected);
+                }
+            }
+            env.storage()
+                .instance()
+                .set(&DataKey::MilestonesReached, &milestones_reached);
+        }
+
+        auth.used_rounds += 1;
+        if auth.used_rounds >= auth.max_rounds {
+            proxy_auths.remove((group_id, member.clone()));
+        } else {
+            proxy_auths.set((group_id, member.clone()), auth);
+        }
+        env.storage()
+            .instance()
+            .set(&DataKey3::ProxyAuthorizations, &proxy_auths);
+
+        if !activation_emitted {
+            events::emit_group_activated(&env, start_at);
+            env.storage()
+                .instance()
+                .set(&DataKey2::GroupActivationEmitted, &true);
+        }
+
+        env.storage()
+            .instance()
+            .extend_ttl(INSTANCE_LIFETIME_THRESHOLD, INSTANCE_BUMP_AMOUNT);
+    }
+
+    /// Revoke an active proxy authorization before it expires.
+    pub fn revoke_proxy(env: Env, member: Address, group_id: u32, proxy_address: Address) {
+        member.require_auth();
+
+        let mut proxy_auths: Map<(u32, Address), ProxyAuthorization> = env
+            .storage()
+            .instance()
+            .get(&DataKey3::ProxyAuthorizations)
+            .unwrap_or(Map::new(&env));
+
+        let key = (group_id, member.clone());
+        let auth = proxy_auths
+            .get(key.clone())
+            .unwrap_or_else(|| panic_with_error!(&env, Error::NoDelegationFound));
+        if auth.proxy != proxy_address {
+            panic_with_error!(&env, Error::NoDelegationFound);
+        }
+
+        proxy_auths.remove(key);
+        env.storage()
+            .instance()
+            .set(&DataKey3::ProxyAuthorizations, &proxy_auths);
+
+        events::emit_proxy_revoked(&env, group_id, member, proxy_address);
+        env.storage()
+            .instance()
+            .extend_ttl(INSTANCE_LIFETIME_THRESHOLD, INSTANCE_BUMP_AMOUNT);
+    }
+
     /// Co-signer pays on behalf of a defaulting member during the grace window.
     /// The contribution is recorded as the member's own.
     pub fn co_signer_contribute(
@@ -6005,6 +6401,7 @@ mod test_skip;
 mod test_quorum;
 mod test_waitlist;
 mod test_cosigner_guarantee;
+mod test_proxy;
 mod test_group_freeze;
 mod test_snapshot;
 pub use events::*;

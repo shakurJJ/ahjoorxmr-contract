@@ -1218,6 +1218,73 @@ pub fn emit_co_signer_contributed(e: &Env, group_id: u32, member: Address, co_si
 pub fn emit_co_signer_window_expired(e: &Env, group_id: u32, member: Address) {
     e.events().publish((soroban_sdk::Symbol::new(e, "CoSignerWinExpired"),), (group_id, member));
 }
+
+#[contractevent]
+#[derive(Clone, Debug)]
+pub struct ProxyAuthorized {
+    pub group_id: u32,
+    pub member: Address,
+    pub proxy: Address,
+    pub max_rounds: u32,
+}
+
+#[contractevent]
+#[derive(Clone, Debug)]
+pub struct ProxyContributed {
+    pub group_id: u32,
+    pub member: Address,
+    pub proxy: Address,
+    pub round_index: u32,
+}
+
+#[contractevent]
+#[derive(Clone, Debug)]
+pub struct ProxyRevoked {
+    pub group_id: u32,
+    pub member: Address,
+    pub proxy: Address,
+}
+
+pub fn emit_proxy_authorized(
+    e: &Env,
+    group_id: u32,
+    member: Address,
+    proxy: Address,
+    max_rounds: u32,
+) {
+    ProxyAuthorized {
+        group_id,
+        member,
+        proxy,
+        max_rounds,
+    }
+    .publish(e);
+}
+
+pub fn emit_proxy_contributed(
+    e: &Env,
+    group_id: u32,
+    member: Address,
+    proxy: Address,
+    round_index: u32,
+) {
+    ProxyContributed {
+        group_id,
+        member,
+        proxy,
+        round_index,
+    }
+    .publish(e);
+}
+
+pub fn emit_proxy_revoked(e: &Env, group_id: u32, member: Address, proxy: Address) {
+    ProxyRevoked {
+        group_id,
+        member,
+        proxy,
+    }
+    .publish(e);
+}
 // #236: Group Activity Freeze Events
 
 /// Event: Group frozen by contract-level admin

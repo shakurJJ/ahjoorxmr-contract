@@ -146,4 +146,6 @@ pub enum ExtError {
     InsufficientCreditScore = 83,
     /// Round duration is out of the configured bounds.
     RoundDurationOutOfBounds = 84,
+    /// Proxy supplied an amount that does not exactly match required contribution.
+    IncorrectContributionAmount = 85,
 }
