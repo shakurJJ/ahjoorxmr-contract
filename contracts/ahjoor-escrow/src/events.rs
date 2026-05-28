@@ -979,3 +979,32 @@ pub fn emit_multi_seller_escrow_created(
     }
     .publish(e);
 }
+
+// --- Issue #272: Inspector Role ---
+
+pub fn emit_seller_marked_complete(e: &Env, escrow_id: u32, seller: Address) {
+    e.events().publish(
+        (soroban_sdk::Symbol::new(e, "SellerMarkedComplete"),),
+        (escrow_id, seller),
+    );
+}
+
+pub fn emit_inspection_report_submitted(
+    e: &Env,
+    escrow_id: u32,
+    inspector: Address,
+    approved: bool,
+    report_hash: BytesN<32>,
+) {
+    e.events().publish(
+        (soroban_sdk::Symbol::new(e, "InspectionReport"),),
+        (escrow_id, inspector, approved, report_hash),
+    );
+}
+
+pub fn emit_inspector_replaced(e: &Env, escrow_id: u32, old_inspector: Address, new_inspector: Address) {
+    e.events().publish(
+        (soroban_sdk::Symbol::new(e, "InspectorReplaced"),),
+        (escrow_id, old_inspector, new_inspector),
+    );
+}

@@ -1,6 +1,6 @@
 #![no_std]
 use soroban_sdk::{
-    contract, contracterror, contractimpl, contracttype, Address, Env, Vec,
+    contract, contracterror, contractimpl, contracttype, Address, BytesN, Env, Vec,
 };
 
 /// Storage TTL Constants
@@ -29,6 +29,27 @@ pub enum DataKey {
     ProposedAdmin,
     /// Persistent: Vec of whitelisted token addresses
     WhitelistedTokens,
+    /// Persistent: Active suspension per token (Option<TokenSuspension>)
+    TokenSuspension(Address),
+    /// Persistent: Suspension history per token (Vec<SuspensionRecord>, capped at 10)
+    SuspensionHistory(Address),
+}
+
+/// #297: Active suspension record.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TokenSuspension {
+    pub expiry_ledger: u32,
+    pub reason_hash: soroban_sdk::BytesN<32>,
+}
+
+/// #297: Historical suspension entry.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SuspensionRecord {
+    pub expiry_ledger: u32,
+    pub reason_hash: soroban_sdk::BytesN<32>,
+    pub lifted_early: bool,
 }
 
 mod events;
@@ -146,6 +167,23 @@ impl TokenWhitelistContract {
 
     /// Check if a token is allowed (public view function)
     pub fn is_token_allowed(env: Env, token: Address) -> bool {
+        // #297: Lazy suspension check
+        let susp_key = DataKey::TokenSuspension(token.clone());
+        if let Some(suspension) = env
+            .storage()
+            .persistent()
+            .get::<DataKey, TokenSuspension>(&susp_key)
+        {
+            if env.ledger().sequence() < suspension.expiry_ledger {
+                // Still suspended
+                return false;
+            } else {
+                // Expired — lazy reinstatement: clear suspension record
+                env.storage().persistent().remove(&susp_key);
+                events::emit_token_auto_reinstated(&env, token.clone(), env.ledger().sequence());
+            }
+        }
+
         let whitelist: Vec<Address> = env
             .storage()
             .persistent()
@@ -237,6 +275,149 @@ impl TokenWhitelistContract {
         events::emit_admin_transferred(&env, old_admin, new_admin);
     }
 
+    // ─── #297: Time-Locked Token Suspension ───────────────────────────────────────
+
+    /// Suspend a whitelisted token for `suspend_duration_ledgers` ledgers.
+    /// The token is immediately treated as non-whitelisted.
+    pub fn suspend_token_timed(
+        env: Env,
+        admin: Address,
+        token: Address,
+        suspend_duration_ledgers: u32,
+        reason_hash: BytesN<32>,
+    ) {
+        admin.require_auth();
+        Self::require_admin(&env, &admin);
+        if suspend_duration_ledgers == 0 {
+            panic!("suspend_duration_ledgers must be positive");
+        }
+        // Token must be whitelisted
+        let whitelist: Vec<Address> = env
+            .storage().persistent()
+            .get(&DataKey::WhitelistedTokens)
+            .unwrap_or_else(|| Vec::new(&env));
+        let mut found = false;
+        for t in whitelist.iter() {
+            if t == token { found = true; break; }
+        }
+        if !found { panic!("Token not whitelisted"); }
+
+        let expiry_ledger = env.ledger().sequence() + suspend_duration_ledgers;
+        let suspension = TokenSuspension {
+            expiry_ledger,
+            reason_hash: reason_hash.clone(),
+        };
+        let susp_key = DataKey::TokenSuspension(token.clone());
+        env.storage().persistent().set(&susp_key, &suspension);
+        env.storage().persistent().extend_ttl(
+            &susp_key, PERSISTENT_LIFETIME_THRESHOLD, PERSISTENT_BUMP_AMOUNT,
+        );
+        Self::push_suspension_history(&env, &token, expiry_ledger, reason_hash.clone(), false);
+        events::emit_token_suspended(&env, token, expiry_ledger, reason_hash);
+        env.storage().instance().extend_ttl(INSTANCE_LIFETIME_THRESHOLD, INSTANCE_BUMP_AMOUNT);
+    }
+
+    /// Lift an active suspension early; token becomes active immediately.
+    pub fn lift_token_suspension(env: Env, admin: Address, token: Address) {
+        admin.require_auth();
+        Self::require_admin(&env, &admin);
+        let susp_key = DataKey::TokenSuspension(token.clone());
+        if !env.storage().persistent().has(&susp_key) {
+            panic!("No active suspension for this token");
+        }
+        env.storage().persistent().remove(&susp_key);
+        // Mark last history entry as lifted early
+        let hist_key = DataKey::SuspensionHistory(token.clone());
+        let mut history: Vec<SuspensionRecord> = env
+            .storage().persistent().get(&hist_key).unwrap_or_else(|| Vec::new(&env));
+        let len = history.len();
+        if len > 0 {
+            let mut last = history.get(len - 1).unwrap();
+            last.lifted_early = true;
+            history.set(len - 1, last);
+            env.storage().persistent().set(&hist_key, &history);
+            env.storage().persistent().extend_ttl(
+                &hist_key, PERSISTENT_LIFETIME_THRESHOLD, PERSISTENT_BUMP_AMOUNT,
+            );
+        }
+        events::emit_token_suspension_lifted(&env, token, admin, env.ledger().sequence());
+        env.storage().instance().extend_ttl(INSTANCE_LIFETIME_THRESHOLD, INSTANCE_BUMP_AMOUNT);
+    }
+
+    /// Extend an active suspension by `additional_ledgers`.
+    pub fn extend_token_suspension(
+        env: Env,
+        admin: Address,
+        token: Address,
+        additional_ledgers: u32,
+    ) {
+        admin.require_auth();
+        Self::require_admin(&env, &admin);
+        if additional_ledgers == 0 { panic!("additional_ledgers must be positive"); }
+        let susp_key = DataKey::TokenSuspension(token.clone());
+        let mut suspension: TokenSuspension = env
+            .storage().persistent().get(&susp_key)
+            .expect("No active suspension for this token");
+        suspension.expiry_ledger += additional_ledgers;
+        env.storage().persistent().set(&susp_key, &suspension);
+        env.storage().persistent().extend_ttl(
+            &susp_key, PERSISTENT_LIFETIME_THRESHOLD, PERSISTENT_BUMP_AMOUNT,
+        );
+        // Update last history entry expiry
+        let hist_key = DataKey::SuspensionHistory(token.clone());
+        let mut history: Vec<SuspensionRecord> = env
+            .storage().persistent().get(&hist_key).unwrap_or_else(|| Vec::new(&env));
+        let len = history.len();
+        if len > 0 {
+            let mut last = history.get(len - 1).unwrap();
+            last.expiry_ledger = suspension.expiry_ledger;
+            history.set(len - 1, last);
+            env.storage().persistent().set(&hist_key, &history);
+            env.storage().persistent().extend_ttl(
+                &hist_key, PERSISTENT_LIFETIME_THRESHOLD, PERSISTENT_BUMP_AMOUNT,
+            );
+        }
+        env.storage().instance().extend_ttl(INSTANCE_LIFETIME_THRESHOLD, INSTANCE_BUMP_AMOUNT);
+    }
+
+    /// Get the active suspension for a token, if any.
+    pub fn get_token_suspension(env: Env, token: Address) -> Option<TokenSuspension> {
+        env.storage().persistent().get(&DataKey::TokenSuspension(token))
+    }
+
+    /// Get the suspension history (last up to 10 entries) for a token.
+    pub fn get_suspension_history(env: Env, token: Address) -> Vec<SuspensionRecord> {
+        env.storage().persistent()
+            .get(&DataKey::SuspensionHistory(token))
+            .unwrap_or_else(|| Vec::new(&env))
+    }
+
+    /// Push a new entry to the suspension history, capped at 10.
+    fn push_suspension_history(
+        env: &Env,
+        token: &Address,
+        expiry_ledger: u32,
+        reason_hash: BytesN<32>,
+        lifted_early: bool,
+    ) {
+        let hist_key = DataKey::SuspensionHistory(token.clone());
+        let mut history: Vec<SuspensionRecord> = env
+            .storage().persistent().get(&hist_key).unwrap_or_else(|| Vec::new(env));
+        // If at cap (10), drop the oldest entry
+        if history.len() >= 10 {
+            let mut trimmed = Vec::new(env);
+            for i in 1..history.len() {
+                trimmed.push_back(history.get(i).unwrap());
+            }
+            history = trimmed;
+        }
+        history.push_back(SuspensionRecord { expiry_ledger, reason_hash, lifted_early });
+        env.storage().persistent().set(&hist_key, &history);
+        env.storage().persistent().extend_ttl(
+            &hist_key, PERSISTENT_LIFETIME_THRESHOLD, PERSISTENT_BUMP_AMOUNT,
+        );
+    }
+
     /// Internal helper to check admin authorization
     fn require_admin(env: &Env, caller: &Address) {
         let admin: Address = env
@@ -253,3 +434,6 @@ impl TokenWhitelistContract {
 
 #[cfg(test)]
 mod test;
+
+#[cfg(test)]
+mod test_suspension;

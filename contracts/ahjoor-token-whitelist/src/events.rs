@@ -1,4 +1,4 @@
-use soroban_sdk::{contractevent, Address, Env};
+use soroban_sdk::{contractevent, Address, BytesN, Env};
 
 /// Event: Contract initialized
 #[contractevent]
@@ -67,4 +67,27 @@ pub fn emit_admin_transferred(e: &Env, old_admin: Address, new_admin: Address) {
         new_admin,
     }
     .publish(e);
+}
+
+// --- Issue #297: Time-Locked Token Suspension ---
+
+pub fn emit_token_suspended(e: &Env, token: Address, expiry_ledger: u32, reason_hash: BytesN<32>) {
+    e.events().publish(
+        (soroban_sdk::Symbol::new(e, "TokenSuspended"),),
+        (token, expiry_ledger, reason_hash),
+    );
+}
+
+pub fn emit_token_suspension_lifted(e: &Env, token: Address, lifted_by: Address, ledger: u32) {
+    e.events().publish(
+        (soroban_sdk::Symbol::new(e, "TokenSuspensionLifted"),),
+        (token, lifted_by, ledger),
+    );
+}
+
+pub fn emit_token_auto_reinstated(e: &Env, token: Address, ledger: u32) {
+    e.events().publish(
+        (soroban_sdk::Symbol::new(e, "TokenAutoReinstated"),),
+        (token, ledger),
+    );
 }

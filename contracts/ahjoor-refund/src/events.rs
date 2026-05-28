@@ -614,3 +614,55 @@ pub struct RefundPrioritySet {
 pub fn emit_refund_priority_set(e: &Env, refund_id: u32, new_priority: u32, set_by: Address) {
     RefundPrioritySet { refund_id, new_priority, set_by }.publish(e);
 }
+
+// --- Issue #274: Merchant Reserve Fund ---
+
+pub fn emit_reserve_deposited(e: &Env, merchant: Address, amount: i128) {
+    e.events().publish(
+        (soroban_sdk::Symbol::new(e, "ReserveDeposited"),),
+        (merchant, amount),
+    );
+}
+
+pub fn emit_reserve_withdrawn(e: &Env, merchant: Address, amount: i128) {
+    e.events().publish(
+        (soroban_sdk::Symbol::new(e, "ReserveWithdrawn"),),
+        (merchant, amount),
+    );
+}
+
+pub fn emit_reserve_used_for_refund(e: &Env, merchant: Address, refund_id: u32, amount: i128) {
+    e.events().publish(
+        (soroban_sdk::Symbol::new(e, "ReserveUsedForRefund"),),
+        (merchant, refund_id, amount),
+    );
+}
+
+pub fn emit_merchant_flagged_low_reserve(e: &Env, merchant: Address, current_reserve: i128, required_reserve: i128) {
+    e.events().publish(
+        (soroban_sdk::Symbol::new(e, "MerchantFlaggedLowReserve"),),
+        (merchant, current_reserve, required_reserve),
+    );
+}
+
+// --- Issue #276: Merchant Counter-Dispute Evidence Window ---
+
+pub fn emit_merchant_evidence_submitted(
+    e: &Env,
+    refund_id: u32,
+    merchant: Address,
+    num_hashes: u32,
+    statement_hash: soroban_sdk::BytesN<32>,
+) {
+    e.events().publish(
+        (soroban_sdk::Symbol::new(e, "MerchantEvidenceSubmitted"),),
+        (refund_id, merchant, num_hashes, statement_hash),
+    );
+}
+
+pub fn emit_evidence_period_expired(e: &Env, refund_id: u32, merchant: Address) {
+    e.events().publish(
+        (soroban_sdk::Symbol::new(e, "EvidencePeriodExpired"),),
+        (refund_id, merchant),
+    );
+}

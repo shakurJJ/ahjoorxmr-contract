@@ -33,6 +33,12 @@ pub enum EscrowStatus {
     AwaitingCollateral = 9,
     /// Seller has proposed a role transfer; buyer has a veto window (#244).
     AwaitingBuyerVetoDecision = 10,
+    /// #272: Seller marked work complete; awaiting inspector verdict.
+    AwaitingInspection = 11,
+    /// #272: Inspector approved; buyer may release.
+    InspectionPassed = 12,
+    /// #272: Inspector rejected; buyer/seller may negotiate or dispute.
+    InspectionFailed = 13,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -130,6 +136,8 @@ pub struct EscrowExtensions {
     pub collateral_amount: i128,
     /// #241: Optional pre-committed delivery proof hash set by buyer at creation.
     pub delivery_proof_hash: Option<BytesN<32>>,
+    /// #272: Optional inspector address for three-party quality gate.
+    pub inspector: Option<Address>,
 }
 
 #[contracttype]
@@ -303,6 +311,10 @@ pub enum DataKey {
     PendingVerdict(u32),
     /// (escrow_id) → (caller, reason_hash) for dispute resolution flag
     ResolutionFlag(u32),
+    /// #272: Inspector report per escrow
+    InspectorReport(u32),
+    /// #272: Pending inspector replacement
+    InspectorReplacement(u32),
 }
 
 const MAX_PROTOCOL_FEE_BPS: u32 = 200; // 2%
@@ -317,6 +329,25 @@ pub struct SellerTransferProposal {
     pub original_seller: Address,
     pub new_seller: Address,
     pub veto_deadline: u32, // ledger sequence
+}
+
+/// #272: Inspector report stored on-chain.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct InspectorReport {
+    pub inspector: Address,
+    pub approved: bool,
+    pub report_hash: BytesN<32>,
+    pub submitted_at: u64,
+}
+
+/// #272: Pending inspector replacement request.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct InspectorReplacement {
+    pub new_inspector: Address,
+    pub buyer_signed: bool,
+    pub seller_signed: bool,
 }
 
 /// Verdict recorded by arbiter during cooling-off period.
@@ -531,6 +562,134 @@ impl AhjoorEscrowContract {
         created_ids
     }
 
+    // ─── #272: Escrow Third-Party Inspector Role ─────────────────────────────
+
+    /// Create an escrow with an optional inspector for quality gate.
+    pub fn create_escrow_with_inspector(
+        env: Env,
+        buyer: Address,
+        request: EscrowCreateRequest,
+        inspector: Option<Address>,
+    ) -> u32 {
+        Self::require_not_paused(&env);
+        buyer.require_auth();
+        let escrow_id = Self::create_escrow_core(&env, &buyer, request);
+        if let Some(ref insp) = inspector {
+            let mut escrow: Escrow = env
+                .storage().persistent().get(&DataKey::Escrow(escrow_id)).expect("Escrow not found");
+            escrow.extensions.inspector = Some(insp.clone());
+            env.storage().persistent().set(&DataKey::Escrow(escrow_id), &escrow);
+            env.storage().persistent().extend_ttl(
+                &DataKey::Escrow(escrow_id), PERSISTENT_LIFETIME_THRESHOLD, PERSISTENT_BUMP_AMOUNT,
+            );
+        }
+        env.storage().instance().extend_ttl(INSTANCE_LIFETIME_THRESHOLD, INSTANCE_BUMP_AMOUNT);
+        escrow_id
+    }
+
+    /// Seller marks work complete. If inspector is set, moves to AwaitingInspection.
+    pub fn seller_mark_complete(env: Env, seller: Address, escrow_id: u32) {
+        Self::require_not_paused(&env);
+        seller.require_auth();
+        let mut escrow: Escrow = env
+            .storage().persistent().get(&DataKey::Escrow(escrow_id)).expect("Escrow not found");
+        if escrow.seller != seller { panic!("Only seller can mark complete"); }
+        if !Self::is_open_escrow_status(escrow.status) { panic!("Escrow is not active"); }
+        if escrow.extensions.inspector.is_none() { panic!("No inspector set; use release_escrow directly"); }
+        escrow.status = EscrowStatus::AwaitingInspection;
+        env.storage().persistent().set(&DataKey::Escrow(escrow_id), &escrow);
+        env.storage().persistent().extend_ttl(
+            &DataKey::Escrow(escrow_id), PERSISTENT_LIFETIME_THRESHOLD, PERSISTENT_BUMP_AMOUNT,
+        );
+        events::emit_seller_marked_complete(&env, escrow_id, seller);
+        env.storage().instance().extend_ttl(INSTANCE_LIFETIME_THRESHOLD, INSTANCE_BUMP_AMOUNT);
+    }
+
+    /// Inspector submits their verdict. Moves status to InspectionPassed or InspectionFailed.
+    pub fn submit_inspection_report(
+        env: Env,
+        inspector: Address,
+        escrow_id: u32,
+        approved: bool,
+        report_hash: BytesN<32>,
+    ) {
+        Self::require_not_paused(&env);
+        inspector.require_auth();
+        let mut escrow: Escrow = env
+            .storage().persistent().get(&DataKey::Escrow(escrow_id)).expect("Escrow not found");
+        if escrow.status != EscrowStatus::AwaitingInspection {
+            panic!("Escrow is not awaiting inspection");
+        }
+        let stored_inspector = escrow.extensions.inspector.clone().expect("No inspector set");
+        if inspector != stored_inspector { panic!("Only the assigned inspector can submit a report"); }
+        let report = InspectorReport {
+            inspector: inspector.clone(),
+            approved,
+            report_hash: report_hash.clone(),
+            submitted_at: env.ledger().timestamp(),
+        };
+        env.storage().persistent().set(&DataKey::InspectorReport(escrow_id), &report);
+        env.storage().persistent().extend_ttl(
+            &DataKey::InspectorReport(escrow_id), PERSISTENT_LIFETIME_THRESHOLD, PERSISTENT_BUMP_AMOUNT,
+        );
+        escrow.status = if approved { EscrowStatus::InspectionPassed } else { EscrowStatus::InspectionFailed };
+        env.storage().persistent().set(&DataKey::Escrow(escrow_id), &escrow);
+        env.storage().persistent().extend_ttl(
+            &DataKey::Escrow(escrow_id), PERSISTENT_LIFETIME_THRESHOLD, PERSISTENT_BUMP_AMOUNT,
+        );
+        events::emit_inspection_report_submitted(&env, escrow_id, inspector, approved, report_hash);
+        env.storage().instance().extend_ttl(INSTANCE_LIFETIME_THRESHOLD, INSTANCE_BUMP_AMOUNT);
+    }
+
+    /// Replace inspector by mutual agreement (both buyer and seller must call).
+    pub fn replace_inspector(env: Env, caller: Address, escrow_id: u32, new_inspector: Address) {
+        Self::require_not_paused(&env);
+        caller.require_auth();
+        let escrow: Escrow = env
+            .storage().persistent().get(&DataKey::Escrow(escrow_id)).expect("Escrow not found");
+        if caller != escrow.buyer && caller != escrow.seller {
+            panic!("Only buyer or seller can propose inspector replacement");
+        }
+        if escrow.extensions.inspector.is_none() { panic!("No inspector set on this escrow"); }
+        let key = DataKey::InspectorReplacement(escrow_id);
+        let mut replacement: InspectorReplacement = env
+            .storage().persistent().get(&key)
+            .unwrap_or(InspectorReplacement {
+                new_inspector: new_inspector.clone(),
+                buyer_signed: false,
+                seller_signed: false,
+            });
+        if replacement.new_inspector != new_inspector {
+            replacement = InspectorReplacement { new_inspector: new_inspector.clone(), buyer_signed: false, seller_signed: false };
+        }
+        if caller == escrow.buyer { replacement.buyer_signed = true; } else { replacement.seller_signed = true; }
+        if replacement.buyer_signed && replacement.seller_signed {
+            let mut updated = escrow.clone();
+            let old_inspector = updated.extensions.inspector.clone().unwrap();
+            updated.extensions.inspector = Some(new_inspector.clone());
+            if updated.status == EscrowStatus::AwaitingInspection || updated.status == EscrowStatus::InspectionFailed {
+                updated.status = EscrowStatus::Active;
+            }
+            env.storage().persistent().set(&DataKey::Escrow(escrow_id), &updated);
+            env.storage().persistent().extend_ttl(
+                &DataKey::Escrow(escrow_id), PERSISTENT_LIFETIME_THRESHOLD, PERSISTENT_BUMP_AMOUNT,
+            );
+            env.storage().persistent().remove(&key);
+            events::emit_inspector_replaced(&env, escrow_id, old_inspector, new_inspector);
+        } else {
+            env.storage().persistent().set(&key, &replacement);
+            env.storage().persistent().extend_ttl(
+                &key, PERSISTENT_LIFETIME_THRESHOLD, PERSISTENT_BUMP_AMOUNT,
+            );
+        }
+        env.storage().instance().extend_ttl(INSTANCE_LIFETIME_THRESHOLD, INSTANCE_BUMP_AMOUNT);
+    }
+
+    /// Get the inspector report for an escrow.
+    pub fn get_inspector_report(env: Env, escrow_id: u32) -> Option<InspectorReport> {
+        env.storage().persistent().get(&DataKey::InspectorReport(escrow_id))
+    }
+
     fn create_escrow_core(env: &Env, buyer: &Address, request: EscrowCreateRequest) -> u32 {
         let EscrowCreateRequest {
             seller,
@@ -676,6 +835,7 @@ impl AhjoorEscrowContract {
                 collateral_deposit_deadline: 0,
                 collateral_amount: 0,
                 delivery_proof_hash: None,
+                inspector: None,
             },
         };
 
@@ -807,7 +967,14 @@ impl AhjoorEscrowContract {
 
         let renewal_source = escrow.clone();
 
-        if !Self::is_open_escrow_status(escrow.status) {
+        // #272: Block release if inspection is pending
+        if escrow.status == EscrowStatus::AwaitingInspection {
+            panic!("InspectionPending: inspector must submit report before release");
+        }
+
+        if escrow.status == EscrowStatus::InspectionPassed {
+            // Allow release from InspectionPassed — fall through
+        } else if !Self::is_open_escrow_status(escrow.status) {
             panic!("Escrow is not active");
         }
 
@@ -2951,6 +3118,7 @@ impl AhjoorEscrowContract {
                 collateral_deposit_deadline: 0,
                 collateral_amount: 0,
                 delivery_proof_hash: None,
+                inspector: None,
             },
         };
 
@@ -3144,6 +3312,7 @@ impl AhjoorEscrowContract {
                 collateral_deposit_deadline: 0,
                 collateral_amount: 0,
                 delivery_proof_hash: None,
+                inspector: None,
             },
         };
 
@@ -3756,7 +3925,7 @@ impl AhjoorEscrowContract {
     fn is_open_escrow_status(status: EscrowStatus) -> bool {
         matches!(
             status,
-            EscrowStatus::Active | EscrowStatus::PartiallyReleased
+            EscrowStatus::Active | EscrowStatus::PartiallyReleased | EscrowStatus::InspectionPassed
         )
     }
 
@@ -3850,6 +4019,7 @@ impl AhjoorEscrowContract {
                 collateral_deposit_deadline: 0,
                 collateral_amount: 0,
                 delivery_proof_hash: source.extensions.delivery_proof_hash.clone(),
+                inspector: source.extensions.inspector.clone(),
             },
         };
 
@@ -4349,3 +4519,6 @@ mod test_cooling_off;
 
 #[cfg(test)]
 mod test_seller_veto;
+
+#[cfg(test)]
+mod test_inspector;
