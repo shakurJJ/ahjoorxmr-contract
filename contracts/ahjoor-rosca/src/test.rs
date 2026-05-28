@@ -137,6 +137,10 @@ fn default_init(setup: &TestSetup<'_>) {
             skip_fee: 0,
             max_skips_per_cycle: 0,
             voting_mode: VotingMode::Equal,
+        late_fee_bps: 0,
+        grace_period_seconds: 0,
+        auction_enabled: false,
+        auction_window_ledgers: 0,
         },
         &None,
     );
@@ -171,6 +175,10 @@ fn test_delayed_start_blocks_then_allows_contribution() {
             skip_fee: 0,
             max_skips_per_cycle: 0,
             voting_mode: VotingMode::Equal,
+        late_fee_bps: 0,
+        grace_period_seconds: 0,
+        auction_enabled: false,
+        auction_window_ledgers: 0,
         },
         &Some(start_at),
     );
@@ -221,6 +229,10 @@ fn test_cancel_pending_group_refunds_reward_deposit() {
             skip_fee: 0,
             max_skips_per_cycle: 0,
             voting_mode: VotingMode::Equal,
+        late_fee_bps: 0,
+        grace_period_seconds: 0,
+        auction_enabled: false,
+        auction_window_ledgers: 0,
         },
         &Some(start_at),
     );
@@ -361,7 +373,7 @@ fn test_admin_assigned_strategy_execution() {
             max_members: None,
             skip_fee: 0,
             max_skips_per_cycle: 0,
-            voting_mode: VotingMode::Equal,},
+            voting_mode: VotingMode::Equal, late_fee_bps: 0, grace_period_seconds: 0, auction_enabled: false, auction_window_ledgers: 0,},
         &None,
     );
 
@@ -407,7 +419,7 @@ fn test_invalid_admin_order_validation() {
             max_members: None,
             skip_fee: 0,
             max_skips_per_cycle: 0,
-            voting_mode: VotingMode::Equal,},
+            voting_mode: VotingMode::Equal, late_fee_bps: 0, grace_period_seconds: 0, auction_enabled: false, auction_window_ledgers: 0,},
         &None,
     );
     assert_eq!(
@@ -470,7 +482,7 @@ fn test_admin_assigned_e2e_all_rounds() {
             max_members: None,
             skip_fee: 0,
             max_skips_per_cycle: 0,
-            voting_mode: VotingMode::Equal,},
+            voting_mode: VotingMode::Equal, late_fee_bps: 0, grace_period_seconds: 0, auction_enabled: false, auction_window_ledgers: 0,},
         &None,
     );
 
@@ -519,7 +531,7 @@ fn test_single_defaulter_penalty() {
             max_members: None,
             skip_fee: 0,
             max_skips_per_cycle: 0,
-            voting_mode: VotingMode::Equal,},
+            voting_mode: VotingMode::Equal, late_fee_bps: 0, grace_period_seconds: 0, auction_enabled: false, auction_window_ledgers: 0,},
         &None,
     );
 
@@ -570,6 +582,10 @@ fn test_penalty_deferred_within_grace_period() {
             skip_fee: 0,
             max_skips_per_cycle: 0,
             voting_mode: VotingMode::Equal,
+        late_fee_bps: 0,
+        grace_period_seconds: 0,
+        auction_enabled: false,
+        auction_window_ledgers: 0,
         },
         &None,
     );
@@ -611,6 +627,10 @@ fn test_penalty_applied_after_grace_boundary() {
             skip_fee: 0,
             max_skips_per_cycle: 0,
             voting_mode: VotingMode::Equal,
+        late_fee_bps: 0,
+        grace_period_seconds: 0,
+        auction_enabled: false,
+        auction_window_ledgers: 0,
         },
         &None,
     );
@@ -657,6 +677,10 @@ fn test_reputation_score_lifecycle_and_bounds() {
             skip_fee: 0,
             max_skips_per_cycle: 0,
             voting_mode: VotingMode::Equal,
+        late_fee_bps: 0,
+        grace_period_seconds: 0,
+        auction_enabled: false,
+        auction_window_ledgers: 0,
         },
         &None,
     );
@@ -732,7 +756,7 @@ fn test_multiple_defaulters_penalty() {
             max_members: None,
             skip_fee: 0,
             max_skips_per_cycle: 0,
-            voting_mode: VotingMode::Equal,},
+            voting_mode: VotingMode::Equal, late_fee_bps: 0, grace_period_seconds: 0, auction_enabled: false, auction_window_ledgers: 0,},
         &None,
     );
 
@@ -784,7 +808,7 @@ fn test_member_suspension_after_two_defaults() {
             max_members: None,
             skip_fee: 0,
             max_skips_per_cycle: 0,
-            voting_mode: VotingMode::Equal,},
+            voting_mode: VotingMode::Equal, late_fee_bps: 0, grace_period_seconds: 0, auction_enabled: false, auction_window_ledgers: 0,},
         &None,
     );
 
@@ -859,7 +883,7 @@ fn test_suspended_member_skipped_in_payout() {
             max_members: None,
             skip_fee: 0,
             max_skips_per_cycle: 0,
-            voting_mode: VotingMode::Equal,},
+            voting_mode: VotingMode::Equal, late_fee_bps: 0, grace_period_seconds: 0, auction_enabled: false, auction_window_ledgers: 0,},
         &None,
     );
 
@@ -937,7 +961,7 @@ fn test_cannot_penalise_before_deadline() {
             max_members: None,
             skip_fee: 0,
             max_skips_per_cycle: 0,
-            voting_mode: VotingMode::Equal,},
+            voting_mode: VotingMode::Equal, late_fee_bps: 0, grace_period_seconds: 0, auction_enabled: false, auction_window_ledgers: 0,},
         &None,
     );
 
@@ -983,7 +1007,7 @@ fn test_penalty_disabled_when_amount_zero() {
             max_members: None,
             skip_fee: 0,
             max_skips_per_cycle: 0,
-            voting_mode: VotingMode::Equal,},
+            voting_mode: VotingMode::Equal, late_fee_bps: 0, grace_period_seconds: 0, auction_enabled: false, auction_window_ledgers: 0,},
         &None,
     );
 
@@ -1038,7 +1062,7 @@ fn test_cannot_penalise_non_defaulter() {
             max_members: None,
             skip_fee: 0,
             max_skips_per_cycle: 0,
-            voting_mode: VotingMode::Equal,},
+            voting_mode: VotingMode::Equal, late_fee_bps: 0, grace_period_seconds: 0, auction_enabled: false, auction_window_ledgers: 0,},
         &None,
     );
 
@@ -1097,7 +1121,7 @@ fn test_read_interface_lifecycle() {
             max_members: None,
             skip_fee: 0,
             max_skips_per_cycle: 0,
-            voting_mode: VotingMode::Equal,},
+            voting_mode: VotingMode::Equal, late_fee_bps: 0, grace_period_seconds: 0, auction_enabled: false, auction_window_ledgers: 0,},
         &None,
     );
 
@@ -1180,7 +1204,7 @@ fn test_member_status_resets_after_round() {
             max_members: None,
             skip_fee: 0,
             max_skips_per_cycle: 0,
-            voting_mode: VotingMode::Equal,},
+            voting_mode: VotingMode::Equal, late_fee_bps: 0, grace_period_seconds: 0, auction_enabled: false, auction_window_ledgers: 0,},
         &None,
     );
 
@@ -1247,7 +1271,7 @@ fn test_add_member_before_round() {
             max_members: None,
             skip_fee: 0,
             max_skips_per_cycle: 0,
-            voting_mode: VotingMode::Equal,},
+            voting_mode: VotingMode::Equal, late_fee_bps: 0, grace_period_seconds: 0, auction_enabled: false, auction_window_ledgers: 0,},
         &None,
     );
 
@@ -1310,7 +1334,7 @@ fn test_add_member_mid_round_panics() {
             max_members: None,
             skip_fee: 0,
             max_skips_per_cycle: 0,
-            voting_mode: VotingMode::Equal,},
+            voting_mode: VotingMode::Equal, late_fee_bps: 0, grace_period_seconds: 0, auction_enabled: false, auction_window_ledgers: 0,},
         &None,
     );
 
@@ -1371,7 +1395,7 @@ fn test_remove_member_between_rounds() {
             max_members: None,
             skip_fee: 0,
             max_skips_per_cycle: 0,
-            voting_mode: VotingMode::Equal,},
+            voting_mode: VotingMode::Equal, late_fee_bps: 0, grace_period_seconds: 0, auction_enabled: false, auction_window_ledgers: 0,},
         &None,
     );
 
@@ -1436,7 +1460,7 @@ fn test_remove_member_mid_round_panics() {
             max_members: None,
             skip_fee: 0,
             max_skips_per_cycle: 0,
-            voting_mode: VotingMode::Equal,},
+            voting_mode: VotingMode::Equal, late_fee_bps: 0, grace_period_seconds: 0, auction_enabled: false, auction_window_ledgers: 0,},
         &None,
     );
 
@@ -1499,7 +1523,7 @@ fn test_remove_member_who_already_received_payout() {
             max_members: None,
             skip_fee: 0,
             max_skips_per_cycle: 0,
-            voting_mode: VotingMode::Equal,},
+            voting_mode: VotingMode::Equal, late_fee_bps: 0, grace_period_seconds: 0, auction_enabled: false, auction_window_ledgers: 0,},
         &None,
     );
 
@@ -1606,7 +1630,7 @@ fn test_init_with_approved_token() {
             max_members: None,
             skip_fee: 0,
             max_skips_per_cycle: 0,
-            voting_mode: VotingMode::Equal,},
+            voting_mode: VotingMode::Equal, late_fee_bps: 0, grace_period_seconds: 0, auction_enabled: false, auction_window_ledgers: 0,},
         &None,
     );
 }
@@ -1655,7 +1679,7 @@ fn test_init_with_unapproved_token_panics() {
             max_members: None,
             skip_fee: 0,
             max_skips_per_cycle: 0,
-            voting_mode: VotingMode::Equal,},
+            voting_mode: VotingMode::Equal, late_fee_bps: 0, grace_period_seconds: 0, auction_enabled: false, auction_window_ledgers: 0,},
         &None,
     );
     assert_eq!(res.unwrap_err().unwrap(), Error::TokenNotApproved.into());
@@ -1697,7 +1721,7 @@ fn test_init_twice_panics() {
             max_members: None,
             skip_fee: 0,
             max_skips_per_cycle: 0,
-            voting_mode: VotingMode::Equal,},
+            voting_mode: VotingMode::Equal, late_fee_bps: 0, grace_period_seconds: 0, auction_enabled: false, auction_window_ledgers: 0,},
         &None,
     );
 
@@ -1726,7 +1750,7 @@ fn test_init_twice_panics() {
             max_members: None,
             skip_fee: 0,
             max_skips_per_cycle: 0,
-            voting_mode: VotingMode::Equal,},
+            voting_mode: VotingMode::Equal, late_fee_bps: 0, grace_period_seconds: 0, auction_enabled: false, auction_window_ledgers: 0,},
         &None,
     );
     assert_eq!(res.unwrap_err().unwrap(), Error::AlreadyInitialized.into());
@@ -1764,7 +1788,7 @@ fn test_contribute_non_member_panics() {
             max_members: None,
             skip_fee: 0,
             max_skips_per_cycle: 0,
-            voting_mode: VotingMode::Equal,},
+            voting_mode: VotingMode::Equal, late_fee_bps: 0, grace_period_seconds: 0, auction_enabled: false, auction_window_ledgers: 0,},
         &None,
     );
 
@@ -1808,7 +1832,7 @@ fn test_contribute_twice_panics() {
             max_members: None,
             skip_fee: 0,
             max_skips_per_cycle: 0,
-            voting_mode: VotingMode::Equal,},
+            voting_mode: VotingMode::Equal, late_fee_bps: 0, grace_period_seconds: 0, auction_enabled: false, auction_window_ledgers: 0,},
         &None,
     );
 
@@ -1857,7 +1881,7 @@ fn test_payout_correct_member_n_group() {
             max_members: None,
             skip_fee: 0,
             max_skips_per_cycle: 0,
-            voting_mode: VotingMode::Equal,},
+            voting_mode: VotingMode::Equal, late_fee_bps: 0, grace_period_seconds: 0, auction_enabled: false, auction_window_ledgers: 0,},
         &None,
     );
 
@@ -1936,7 +1960,7 @@ fn test_contract_balance_zero_after_round() {
             max_members: None,
             skip_fee: 0,
             max_skips_per_cycle: 0,
-            voting_mode: VotingMode::Equal,},
+            voting_mode: VotingMode::Equal, late_fee_bps: 0, grace_period_seconds: 0, auction_enabled: false, auction_window_ledgers: 0,},
         &None,
     );
 
@@ -1985,7 +2009,7 @@ fn test_single_member_rosca() {
             max_members: None,
             skip_fee: 0,
             max_skips_per_cycle: 0,
-            voting_mode: VotingMode::Equal,},
+            voting_mode: VotingMode::Equal, late_fee_bps: 0, grace_period_seconds: 0, auction_enabled: false, auction_window_ledgers: 0,},
         &None,
     );
 
@@ -2038,7 +2062,7 @@ fn test_large_group_rosca() {
             max_members: None,
             skip_fee: 0,
             max_skips_per_cycle: 0,
-            voting_mode: VotingMode::Equal,},
+            voting_mode: VotingMode::Equal, late_fee_bps: 0, grace_period_seconds: 0, auction_enabled: false, auction_window_ledgers: 0,},
         &None,
     );
 
@@ -2096,7 +2120,7 @@ fn test_get_state_lifecycle_details() {
             max_members: None,
             skip_fee: 0,
             max_skips_per_cycle: 0,
-            voting_mode: VotingMode::Equal,},
+            voting_mode: VotingMode::Equal, late_fee_bps: 0, grace_period_seconds: 0, auction_enabled: false, auction_window_ledgers: 0,},
         &None,
     );
 
@@ -2157,7 +2181,7 @@ fn test_bump_storage() {
             max_members: None,
             skip_fee: 0,
             max_skips_per_cycle: 0,
-            voting_mode: VotingMode::Equal,},
+            voting_mode: VotingMode::Equal, late_fee_bps: 0, grace_period_seconds: 0, auction_enabled: false, auction_window_ledgers: 0,},
         &None,
     );
 
@@ -2211,7 +2235,7 @@ fn test_reward_distribution_scenarios() {
             max_members: None,
             skip_fee: 0,
             max_skips_per_cycle: 0,
-            voting_mode: VotingMode::Equal,},
+            voting_mode: VotingMode::Equal, late_fee_bps: 0, grace_period_seconds: 0, auction_enabled: false, auction_window_ledgers: 0,},
         &None,
     );
 
@@ -2300,7 +2324,7 @@ fn test_contribution_pot_separation() {
             max_members: None,
             skip_fee: 0,
             max_skips_per_cycle: 0,
-            voting_mode: VotingMode::Equal,},
+            voting_mode: VotingMode::Equal, late_fee_bps: 0, grace_period_seconds: 0, auction_enabled: false, auction_window_ledgers: 0,},
         &None,
     );
 
@@ -2383,7 +2407,7 @@ fn setup_exit_env(
             max_members: None,
             skip_fee: 0,
             max_skips_per_cycle: 0,
-            voting_mode: VotingMode::Equal,},
+            voting_mode: VotingMode::Equal, late_fee_bps: 0, grace_period_seconds: 0, auction_enabled: false, auction_window_ledgers: 0,},
         &None,
     );
 
@@ -2671,7 +2695,7 @@ fn test_exit_with_zero_penalty() {
             max_members: None,
             skip_fee: 0,
             max_skips_per_cycle: 0,
-            voting_mode: VotingMode::Equal,},
+            voting_mode: VotingMode::Equal, late_fee_bps: 0, grace_period_seconds: 0, auction_enabled: false, auction_window_ledgers: 0,},
         &None,
     );
 
@@ -2797,7 +2821,7 @@ fn test_pause_and_resume_flow() {
             max_members: None,
             skip_fee: 0,
             max_skips_per_cycle: 0,
-            voting_mode: VotingMode::Equal,},
+            voting_mode: VotingMode::Equal, late_fee_bps: 0, grace_period_seconds: 0, auction_enabled: false, auction_window_ledgers: 0,},
         &None,
     );
 
@@ -2873,7 +2897,7 @@ fn test_paused_blocks_contribute() {
             max_members: None,
             skip_fee: 0,
             max_skips_per_cycle: 0,
-            voting_mode: VotingMode::Equal,},
+            voting_mode: VotingMode::Equal, late_fee_bps: 0, grace_period_seconds: 0, auction_enabled: false, auction_window_ledgers: 0,},
         &None,
     );
 
@@ -2919,7 +2943,7 @@ fn test_cannot_pause_already_paused() {
             max_members: None,
             skip_fee: 0,
             max_skips_per_cycle: 0,
-            voting_mode: VotingMode::Equal,},
+            voting_mode: VotingMode::Equal, late_fee_bps: 0, grace_period_seconds: 0, auction_enabled: false, auction_window_ledgers: 0,},
         &None,
     );
 
@@ -2966,7 +2990,7 @@ fn test_cannot_resume_not_paused() {
             max_members: None,
             skip_fee: 0,
             max_skips_per_cycle: 0,
-            voting_mode: VotingMode::Equal,},
+            voting_mode: VotingMode::Equal, late_fee_bps: 0, grace_period_seconds: 0, auction_enabled: false, auction_window_ledgers: 0,},
         &None,
     );
 
@@ -3030,7 +3054,7 @@ fn test_get_member_contribution_status() {
             max_members: None,
             skip_fee: 0,
             max_skips_per_cycle: 0,
-            voting_mode: VotingMode::Equal,},
+            voting_mode: VotingMode::Equal, late_fee_bps: 0, grace_period_seconds: 0, auction_enabled: false, auction_window_ledgers: 0,},
         &None,
     );
 
@@ -3104,7 +3128,7 @@ fn test_overpayment_rejected() {
             max_members: None,
             skip_fee: 0,
             max_skips_per_cycle: 0,
-            voting_mode: VotingMode::Equal,},
+            voting_mode: VotingMode::Equal, late_fee_bps: 0, grace_period_seconds: 0, auction_enabled: false, auction_window_ledgers: 0,},
         &None,
     );
 
@@ -3148,7 +3172,7 @@ fn test_emit_deadline_reminder() {
             max_members: None,
             skip_fee: 0,
             max_skips_per_cycle: 0,
-            voting_mode: VotingMode::Equal,},
+            voting_mode: VotingMode::Equal, late_fee_bps: 0, grace_period_seconds: 0, auction_enabled: false, auction_window_ledgers: 0,},
         &None,
     );
 
@@ -3226,7 +3250,7 @@ fn test_get_upcoming_deadlines() {
             max_members: None,
             skip_fee: 0,
             max_skips_per_cycle: 0,
-            voting_mode: VotingMode::Equal,},
+            voting_mode: VotingMode::Equal, late_fee_bps: 0, grace_period_seconds: 0, auction_enabled: false, auction_window_ledgers: 0,},
         &None,
     );
 
@@ -3275,7 +3299,7 @@ fn test_create_proposal() {
             max_members: None,
             skip_fee: 0,
             max_skips_per_cycle: 0,
-            voting_mode: VotingMode::Equal,},
+            voting_mode: VotingMode::Equal, late_fee_bps: 0, grace_period_seconds: 0, auction_enabled: false, auction_window_ledgers: 0,},
         &None,
     );
 
@@ -3335,7 +3359,7 @@ fn test_vote_on_proposal() {
             max_members: None,
             skip_fee: 0,
             max_skips_per_cycle: 0,
-            voting_mode: VotingMode::Equal,},
+            voting_mode: VotingMode::Equal, late_fee_bps: 0, grace_period_seconds: 0, auction_enabled: false, auction_window_ledgers: 0,},
         &None,
     );
 
@@ -3393,7 +3417,7 @@ fn test_execute_proposal_with_quorum() {
             max_members: None,
             skip_fee: 0,
             max_skips_per_cycle: 0,
-            voting_mode: VotingMode::Equal,},
+            voting_mode: VotingMode::Equal, late_fee_bps: 0, grace_period_seconds: 0, auction_enabled: false, auction_window_ledgers: 0,},
         &None,
     );
 
@@ -3459,7 +3483,7 @@ fn test_proposal_insufficient_quorum() {
             max_members: None,
             skip_fee: 0,
             max_skips_per_cycle: 0,
-            voting_mode: VotingMode::Equal,},
+            voting_mode: VotingMode::Equal, late_fee_bps: 0, grace_period_seconds: 0, auction_enabled: false, auction_window_ledgers: 0,},
         &None,
     );
 
@@ -3522,7 +3546,7 @@ fn test_proposal_voted_down() {
             max_members: None,
             skip_fee: 0,
             max_skips_per_cycle: 0,
-            voting_mode: VotingMode::Equal,},
+            voting_mode: VotingMode::Equal, late_fee_bps: 0, grace_period_seconds: 0, auction_enabled: false, auction_window_ledgers: 0,},
         &None,
     );
 
@@ -3586,7 +3610,7 @@ fn test_penalty_appeal_execution() {
             max_members: None,
             skip_fee: 0,
             max_skips_per_cycle: 0,
-            voting_mode: VotingMode::Equal,},
+            voting_mode: VotingMode::Equal, late_fee_bps: 0, grace_period_seconds: 0, auction_enabled: false, auction_window_ledgers: 0,},
         &None,
     );
 
@@ -3660,7 +3684,7 @@ fn test_member_removal_execution() {
             max_members: None,
             skip_fee: 0,
             max_skips_per_cycle: 0,
-            voting_mode: VotingMode::Equal,},
+            voting_mode: VotingMode::Equal, late_fee_bps: 0, grace_period_seconds: 0, auction_enabled: false, auction_window_ledgers: 0,},
         &None,
     );
 
@@ -3725,7 +3749,7 @@ fn test_non_member_cannot_create_proposal() {
             max_members: None,
             skip_fee: 0,
             max_skips_per_cycle: 0,
-            voting_mode: VotingMode::Equal,},
+            voting_mode: VotingMode::Equal, late_fee_bps: 0, grace_period_seconds: 0, auction_enabled: false, auction_window_ledgers: 0,},
         &None,
     );
 
@@ -3777,7 +3801,7 @@ fn test_cannot_vote_after_deadline() {
             max_members: None,
             skip_fee: 0,
             max_skips_per_cycle: 0,
-            voting_mode: VotingMode::Equal,},
+            voting_mode: VotingMode::Equal, late_fee_bps: 0, grace_period_seconds: 0, auction_enabled: false, auction_window_ledgers: 0,},
         &None,
     );
 
@@ -3837,7 +3861,7 @@ fn test_cannot_vote_twice() {
             max_members: None,
             skip_fee: 0,
             max_skips_per_cycle: 0,
-            voting_mode: VotingMode::Equal,},
+            voting_mode: VotingMode::Equal, late_fee_bps: 0, grace_period_seconds: 0, auction_enabled: false, auction_window_ledgers: 0,},
         &None,
     );
 
@@ -3887,7 +3911,7 @@ fn test_get_member_status_non_member() {
             max_members: None,
             skip_fee: 0,
             max_skips_per_cycle: 0,
-            voting_mode: VotingMode::Equal,},
+            voting_mode: VotingMode::Equal, late_fee_bps: 0, grace_period_seconds: 0, auction_enabled: false, auction_window_ledgers: 0,},
         &None,
     );
 
@@ -3935,7 +3959,7 @@ fn test_get_member_status_active_member() {
             max_members: None,
             skip_fee: 0,
             max_skips_per_cycle: 0,
-            voting_mode: VotingMode::Equal,},
+            voting_mode: VotingMode::Equal, late_fee_bps: 0, grace_period_seconds: 0, auction_enabled: false, auction_window_ledgers: 0,},
         &None,
     );
 
@@ -3987,7 +4011,7 @@ fn test_get_member_status_suspended_member() {
             max_members: None,
             skip_fee: 0,
             max_skips_per_cycle: 0,
-            voting_mode: VotingMode::Equal,},
+            voting_mode: VotingMode::Equal, late_fee_bps: 0, grace_period_seconds: 0, auction_enabled: false, auction_window_ledgers: 0,},
         &None,
     );
 
@@ -4043,7 +4067,7 @@ fn test_get_member_status_exited_member() {
             max_members: None,
             skip_fee: 0,
             max_skips_per_cycle: 0,
-            voting_mode: VotingMode::Equal,},
+            voting_mode: VotingMode::Equal, late_fee_bps: 0, grace_period_seconds: 0, auction_enabled: false, auction_window_ledgers: 0,},
         &None,
     );
 
@@ -4412,7 +4436,7 @@ fn setup_finalize_env(
             max_members: None,
             skip_fee: 0,
             max_skips_per_cycle: 0,
-            voting_mode: VotingMode::Equal,},
+            voting_mode: VotingMode::Equal, late_fee_bps: 0, grace_period_seconds: 0, auction_enabled: false, auction_window_ledgers: 0,},
         &None,
     );
 
@@ -4551,7 +4575,7 @@ fn setup_exit_penalty_env(
             max_members: None,
             skip_fee: 0,
             max_skips_per_cycle: 0,
-            voting_mode: VotingMode::Equal,},
+            voting_mode: VotingMode::Equal, late_fee_bps: 0, grace_period_seconds: 0, auction_enabled: false, auction_window_ledgers: 0,},
         &None,
     );
 

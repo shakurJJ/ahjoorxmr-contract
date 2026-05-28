@@ -88,6 +88,8 @@ pub struct EscrowCreateRequest {
     pub release_threshold_price: Option<i128>,
     pub arbiter_fee_bps: Option<u32>,
     pub dispute_default_winner: Option<u32>, // 0 = Buyer, 1 = Seller
+    /// Optional auto-renewal configuration for recurring service agreements.
+    pub auto_renew_config: Option<AutoRenewConfig>,
 }
 
 #[contracttype]
@@ -138,6 +140,10 @@ pub struct EscrowExtensions {
     pub delivery_proof_hash: Option<BytesN<32>>,
     /// #272: Optional inspector address for three-party quality gate.
     pub inspector: Option<Address>,
+    /// Auto-renewal config (max_renewals + renewal_interval_ledgers); None = no auto-renewal.
+    pub auto_renew_config: Option<AutoRenewConfig>,
+    /// Number of renewal cycles completed so far (incremented on each successful renewal).
+    pub renewals_completed: u32,
 }
 
 #[contracttype]
@@ -321,6 +327,12 @@ pub enum DataKey {
     InspectorReport(u32),
     /// #272: Pending inspector replacement
     InspectorReplacement(u32),
+    /// Auto-renewal: ordered list of successor escrow IDs for a given original escrow
+    RenewalHistory(u32),
+    /// Auto-renewal: number of renewals completed for a given escrow chain (keyed by original ID)
+    RenewalsCompleted(u32),
+    /// Auto-renewal: whether the buyer has cancelled future renewals for this escrow
+    AutoRenewalCancelled(u32),
 }
 
 const MAX_PROTOCOL_FEE_BPS: u32 = 200; // 2%
@@ -328,6 +340,18 @@ const MAX_ARBITER_FEE_BPS: u32 = 1_000; // 10%
 const DEFAULT_RESOLUTION_COOLING_OFF_SECONDS: u64 = 24 * 60 * 60; // 24 hours
 const DEFAULT_SELLER_TRANSFER_VETO_WINDOW: u32 = 100; // ledgers
 const DEFAULT_AMENDMENT_EXPIRY_SECONDS: u64 = 7 * 24 * 60 * 60; // 7 days
+
+/// Auto-renewal configuration for recurring service agreements.
+/// When provided at escrow creation, the escrow will automatically re-fund
+/// and restart at the end of each period for up to `max_renewals` cycles.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AutoRenewConfig {
+    /// Maximum number of automatic renewal cycles.
+    pub max_renewals: u32,
+    /// Duration of each renewal period in ledgers (used to compute new deadline).
+    pub renewal_interval_ledgers: u32,
+}
 
 /// #244: Pending seller role transfer proposal.
 #[contracttype]
@@ -360,6 +384,9 @@ pub struct AmendmentProposal {
     /// Whether the buyer has signed this proposal.
     pub buyer_signed: bool,
     /// Whether the seller has signed this proposal.
+    pub seller_signed: bool,
+}
+
 /// #272: Inspector report stored on-chain.
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -472,6 +499,7 @@ impl AhjoorEscrowContract {
             release_threshold_price: None,
             arbiter_fee_bps: None,
             dispute_default_winner: None,
+            auto_renew_config: None,
         };
 
         Self::create_escrow_core(&env, &buyer, request)
@@ -514,6 +542,7 @@ impl AhjoorEscrowContract {
             release_threshold_price: None,
             arbiter_fee_bps: None,
             dispute_default_winner: None,
+            auto_renew_config: None,
         };
 
         Self::create_escrow_core(&env, &buyer, request)
@@ -523,6 +552,47 @@ impl AhjoorEscrowContract {
     pub fn create_escrow_v2(env: Env, buyer: Address, request: EscrowCreateRequest) -> u32 {
         Self::require_not_paused(&env);
         buyer.require_auth();
+
+        Self::create_escrow_core(&env, &buyer, request)
+    }
+
+    /// Create a new escrow with an AutoRenewConfig for recurring service agreements.
+    /// Funds are transferred from buyer to contract immediately.
+    /// Returns the escrow ID.
+    pub fn create_escrow_with_auto_renew(
+        env: Env,
+        buyer: Address,
+        seller: Address,
+        arbiter: Address,
+        amount: i128,
+        token: Address,
+        deadline: u64,
+        metadata_hash: Option<BytesN<32>>,
+        auto_renew_config: AutoRenewConfig,
+    ) -> u32 {
+        Self::require_not_paused(&env);
+        buyer.require_auth();
+
+        let request = EscrowCreateRequest {
+            seller,
+            arbiter,
+            amount,
+            token,
+            deadline,
+            metadata_hash,
+            sellers: Vec::new(&env),
+            auto_renew: true,
+            renewal_count: auto_renew_config.max_renewals,
+            buyer_inactivity_secs: 0,
+            min_lock_until: None,
+            release_base: None,
+            release_quote: None,
+            release_comparison: None,
+            release_threshold_price: None,
+            arbiter_fee_bps: None,
+            dispute_default_winner: None,
+            auto_renew_config: Some(auto_renew_config),
+        };
 
         Self::create_escrow_core(&env, &buyer, request)
     }
@@ -571,6 +641,7 @@ impl AhjoorEscrowContract {
                     release_threshold_price: None,
                     arbiter_fee_bps: None,
                     dispute_default_winner: None,
+                    auto_renew_config: None,
                 },
             );
 
@@ -738,6 +809,7 @@ impl AhjoorEscrowContract {
             release_threshold_price,
             arbiter_fee_bps,
             dispute_default_winner,
+            auto_renew_config,
         } = request;
 
         if amount <= 0 {
@@ -865,6 +937,8 @@ impl AhjoorEscrowContract {
                 collateral_amount: 0,
                 delivery_proof_hash: None,
                 inspector: None,
+                auto_renew_config,
+                renewals_completed: 0,
             },
         };
 
@@ -1200,6 +1274,52 @@ impl AhjoorEscrowContract {
             .persistent()
             .set(&DataKey::Escrow(escrow_id), &escrow);
         env.storage().persistent().remove(&DataKey::RenewalAllowance(escrow_id));
+    }
+
+    /// Cancel future auto-renewals for an escrow configured with AutoRenewConfig.
+    /// Buyer can call this at any time before the current period's release.
+    /// After cancellation, no new renewal will be triggered on release.
+    pub fn cancel_auto_renewal(env: Env, buyer: Address, escrow_id: u32) {
+        Self::require_not_paused(&env);
+        buyer.require_auth();
+
+        let escrow: Escrow = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Escrow(escrow_id))
+            .expect("Escrow not found");
+
+        if buyer != escrow.buyer {
+            panic!("Only buyer can cancel auto-renewal");
+        }
+
+        if escrow.extensions.auto_renew_config.is_none() {
+            panic!("No AutoRenewConfig set on this escrow");
+        }
+
+        env.storage()
+            .persistent()
+            .set(&DataKey::AutoRenewalCancelled(escrow_id), &true);
+        env.storage().persistent().extend_ttl(
+            &DataKey::AutoRenewalCancelled(escrow_id),
+            PERSISTENT_LIFETIME_THRESHOLD,
+            PERSISTENT_BUMP_AMOUNT,
+        );
+
+        events::emit_auto_renewal_cancelled(&env, escrow_id);
+
+        env.storage()
+            .instance()
+            .extend_ttl(INSTANCE_LIFETIME_THRESHOLD, INSTANCE_BUMP_AMOUNT);
+    }
+
+    /// Returns the ordered list of successor escrow IDs created by auto-renewals
+    /// for the given original escrow ID.
+    pub fn get_renewal_history(env: Env, escrow_id: u32) -> Vec<u32> {
+        env.storage()
+            .persistent()
+            .get(&DataKey::RenewalHistory(escrow_id))
+            .unwrap_or(Vec::new(&env))
     }
 
     /// Release part of the escrowed funds to seller. Can be called by buyer or arbiter.
@@ -3148,6 +3268,8 @@ impl AhjoorEscrowContract {
                 collateral_amount: 0,
                 delivery_proof_hash: None,
                 inspector: None,
+                auto_renew_config: None,
+                renewals_completed: 0,
             },
         };
 
@@ -3342,6 +3464,8 @@ impl AhjoorEscrowContract {
                 collateral_amount: 0,
                 delivery_proof_hash: None,
                 inspector: None,
+                auto_renew_config: None,
+                renewals_completed: 0,
             },
         };
 
@@ -3980,6 +4104,134 @@ impl AhjoorEscrowContract {
     }
 
     fn try_auto_renew(env: &Env, old_escrow_id: u32, source: &Escrow) {
+        // ── New AutoRenewConfig path ──────────────────────────────────────────
+        if let Some(ref cfg) = source.extensions.auto_renew_config {
+            // Check if buyer has cancelled renewals for this escrow chain
+            let cancelled: bool = env
+                .storage()
+                .persistent()
+                .get(&DataKey::AutoRenewalCancelled(old_escrow_id))
+                .unwrap_or(false);
+            if cancelled {
+                return;
+            }
+
+            let renewals_completed = source.extensions.renewals_completed;
+
+            // Enforce max_renewals cap
+            if renewals_completed >= cfg.max_renewals {
+                return;
+            }
+
+            let renewal_index = renewals_completed + 1;
+
+            // Attempt to pull funds from buyer's pre-approved allowance
+            let token_client = token::Client::new(env, &source.token);
+            let transfer_result = token_client.try_transfer_from(
+                &env.current_contract_address(),
+                &source.buyer,
+                &env.current_contract_address(),
+                &source.amount,
+            );
+
+            if transfer_result.is_err() {
+                // Insufficient allowance — emit RenewalFailed and return gracefully
+                events::emit_renewal_failed(
+                    env,
+                    old_escrow_id,
+                    renewal_index,
+                    soroban_sdk::String::from_str(env, "InsufficientAllowance"),
+                );
+                return;
+            }
+
+            // Compute new deadline using renewal_interval_ledgers converted to seconds
+            // (Soroban ledger ≈ 5 s; we store interval in ledgers but deadline is unix timestamp)
+            let interval_secs = (cfg.renewal_interval_ledgers as u64) * 5;
+            let now = env.ledger().timestamp();
+            let new_deadline = now + interval_secs;
+
+            let new_escrow_id = Self::next_escrow_id(env);
+
+            let renewed = Escrow {
+                id: new_escrow_id,
+                buyer: source.buyer.clone(),
+                seller: source.seller.clone(),
+                arbiter: source.arbiter.clone(),
+                amount: source.amount,
+                token: source.token.clone(),
+                status: EscrowStatus::Active,
+                created_at: now,
+                deadline: new_deadline,
+                metadata_hash: source.metadata_hash.clone(),
+                sellers: source.sellers.clone(),
+                extensions: EscrowExtensions {
+                    auto_renew: source.extensions.auto_renew,
+                    renewal_count: source.extensions.renewal_count,
+                    renewals_remaining: source.extensions.renewals_remaining.saturating_sub(1),
+                    dispute_timeout_seconds: source.extensions.dispute_timeout_seconds,
+                    buyer_inactivity_secs: source.extensions.buyer_inactivity_secs,
+                    min_lock_until: source.extensions.min_lock_until,
+                    release_base: source.extensions.release_base.clone(),
+                    release_quote: source.extensions.release_quote.clone(),
+                    release_comparison: source.extensions.release_comparison,
+                    release_threshold_price: source.extensions.release_threshold_price,
+                    arbiter_fee_bps: source.extensions.arbiter_fee_bps,
+                    dispute_default_winner: source.extensions.dispute_default_winner,
+                    required_collateral_bps: source.extensions.required_collateral_bps,
+                    collateral_forfeit_bps: source.extensions.collateral_forfeit_bps,
+                    collateral_deposit_deadline: 0,
+                    collateral_amount: 0,
+                    delivery_proof_hash: source.extensions.delivery_proof_hash.clone(),
+                    inspector: source.extensions.inspector.clone(),
+                    auto_renew_config: Some(cfg.clone()),
+                    renewals_completed: renewal_index,
+                },
+            };
+
+            env.storage()
+                .persistent()
+                .set(&DataKey::Escrow(new_escrow_id), &renewed);
+            env.storage().persistent().extend_ttl(
+                &DataKey::Escrow(new_escrow_id),
+                PERSISTENT_LIFETIME_THRESHOLD,
+                PERSISTENT_BUMP_AMOUNT,
+            );
+
+            // #150: Initialize LastBuyerAction for renewed escrow
+            if source.extensions.buyer_inactivity_secs > 0 {
+                env.storage()
+                    .persistent()
+                    .set(&DataKey::LastBuyerAction(new_escrow_id), &now);
+                env.storage().persistent().extend_ttl(
+                    &DataKey::LastBuyerAction(new_escrow_id),
+                    PERSISTENT_LIFETIME_THRESHOLD,
+                    PERSISTENT_BUMP_AMOUNT,
+                );
+            }
+
+            // Append new_escrow_id to the renewal history of the original escrow
+            // The "original" escrow is tracked by walking back: we store history keyed
+            // by old_escrow_id so callers can call get_renewal_history(original_id).
+            let history_key = DataKey::RenewalHistory(old_escrow_id);
+            let mut history: Vec<u32> = env
+                .storage()
+                .persistent()
+                .get(&history_key)
+                .unwrap_or(Vec::new(env));
+            history.push_back(new_escrow_id);
+            env.storage().persistent().set(&history_key, &history);
+            env.storage().persistent().extend_ttl(
+                &history_key,
+                PERSISTENT_LIFETIME_THRESHOLD,
+                PERSISTENT_BUMP_AMOUNT,
+            );
+
+            events::emit_escrow_auto_renewed_v2(env, old_escrow_id, new_escrow_id, renewal_index);
+            return;
+        }
+
+        // ── Legacy auto_renew path (backward-compatible) ─────────────────────
         if !source.extensions.auto_renew {
             return;
         }
@@ -4049,6 +4301,8 @@ impl AhjoorEscrowContract {
                 collateral_amount: 0,
                 delivery_proof_hash: source.extensions.delivery_proof_hash.clone(),
                 inspector: source.extensions.inspector.clone(),
+                auto_renew_config: None,
+                renewals_completed: 0,
             },
         };
 
@@ -4843,3 +5097,6 @@ mod test_seller_veto;
 
 #[cfg(test)]
 mod test_inspector;
+
+#[cfg(test)]
+mod test_auto_renewal;

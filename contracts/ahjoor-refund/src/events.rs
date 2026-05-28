@@ -666,3 +666,63 @@ pub fn emit_evidence_period_expired(e: &Env, refund_id: u32, merchant: Address) 
         (refund_id, merchant),
     );
 }
+
+// --- Store-Credit Voucher Events ---
+
+/// Event: Store-credit voucher issued as alternative to token refund
+#[contractevent]
+#[derive(Clone, Debug)]
+pub struct StoreCreditIssued {
+    pub refund_id: u32,
+    pub customer: Address,
+    pub merchant: Address,
+    pub credit_amount: i128,
+    pub expiry_ledger: u64,
+}
+
+/// Event: Store-credit redeemed against a payment
+#[contractevent]
+#[derive(Clone, Debug)]
+pub struct StoreCreditRedeemed {
+    pub payment_id: u32,
+    pub customer: Address,
+    pub merchant: Address,
+    pub amount_used: i128,
+    pub remaining_credit: i128,
+}
+
+pub fn emit_store_credit_issued(
+    e: &Env,
+    refund_id: u32,
+    customer: Address,
+    merchant: Address,
+    credit_amount: i128,
+    expiry_ledger: u64,
+) {
+    StoreCreditIssued {
+        refund_id,
+        customer,
+        merchant,
+        credit_amount,
+        expiry_ledger,
+    }
+    .publish(e);
+}
+
+pub fn emit_store_credit_redeemed(
+    e: &Env,
+    payment_id: u32,
+    customer: Address,
+    merchant: Address,
+    amount_used: i128,
+    remaining_credit: i128,
+) {
+    StoreCreditRedeemed {
+        payment_id,
+        customer,
+        merchant,
+        amount_used,
+        remaining_credit,
+    }
+    .publish(e);
+}

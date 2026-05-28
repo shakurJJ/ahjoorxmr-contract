@@ -45,6 +45,10 @@ fn setup_snapshot<'a>() -> (Env, AhjoorContractClient<'a>, Address, Address, Add
             skip_fee: 0,
             max_skips_per_cycle: 0,
             voting_mode: VotingMode::Equal,
+        late_fee_bps: 0,
+        grace_period_seconds: 0,
+        auction_enabled: false,
+        auction_window_ledgers: 0,
         },
         &None,
     );

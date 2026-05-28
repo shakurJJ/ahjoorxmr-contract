@@ -70,6 +70,10 @@ fn test_protocol_fee_deducted_from_payout() {
             skip_fee: 0,
             max_skips_per_cycle: 0,
             voting_mode: VotingMode::Equal,
+        late_fee_bps: 0,
+        grace_period_seconds: 0,
+        auction_enabled: false,
+        auction_window_ledgers: 0,
         },
         &None,
     );
@@ -121,6 +125,10 @@ fn test_protocol_fee_max_cap_enforced() {
             skip_fee: 0,
             max_skips_per_cycle: 0,
             voting_mode: VotingMode::Equal,
+        late_fee_bps: 0,
+        grace_period_seconds: 0,
+        auction_enabled: false,
+        auction_window_ledgers: 0,
         },
         &None,
     );
@@ -158,6 +166,10 @@ fn test_update_fee_function() {
             skip_fee: 0,
             max_skips_per_cycle: 0,
             voting_mode: VotingMode::Equal,
+        late_fee_bps: 0,
+        grace_period_seconds: 0,
+        auction_enabled: false,
+        auction_window_ledgers: 0,
         },
         &None,
     );
@@ -201,6 +213,10 @@ fn test_no_fee_when_fee_bps_zero() {
             skip_fee: 0,
             max_skips_per_cycle: 0,
             voting_mode: VotingMode::Equal,
+        late_fee_bps: 0,
+        grace_period_seconds: 0,
+        auction_enabled: false,
+        auction_window_ledgers: 0,
         },
         &None,
     );
@@ -247,6 +263,10 @@ fn test_partial_contribution_installments() {
             skip_fee: 0,
             max_skips_per_cycle: 0,
             voting_mode: VotingMode::Equal,
+        late_fee_bps: 0,
+        grace_period_seconds: 0,
+        auction_enabled: false,
+        auction_window_ledgers: 0,
         },
         &None,
     );
@@ -313,6 +333,10 @@ fn test_partial_contribution_events_emitted() {
             skip_fee: 0,
             max_skips_per_cycle: 0,
             voting_mode: VotingMode::Equal,
+        late_fee_bps: 0,
+        grace_period_seconds: 0,
+        auction_enabled: false,
+        auction_window_ledgers: 0,
         },
         &None,
     );
@@ -352,6 +376,10 @@ fn test_cannot_exceed_remaining_contribution() {
             skip_fee: 0,
             max_skips_per_cycle: 0,
             voting_mode: VotingMode::Equal,
+        late_fee_bps: 0,
+        grace_period_seconds: 0,
+        auction_enabled: false,
+        auction_window_ledgers: 0,
         },
         &None,
     );
@@ -395,6 +423,10 @@ fn test_get_member_contribution_status() {
             skip_fee: 0,
             max_skips_per_cycle: 0,
             voting_mode: VotingMode::Equal,
+        late_fee_bps: 0,
+        grace_period_seconds: 0,
+        auction_enabled: false,
+        auction_window_ledgers: 0,
         },
         &None,
     );
@@ -449,7 +481,7 @@ fn test_timestamp_based_scheduling() {
             max_members: None,
             skip_fee: 0,
             max_skips_per_cycle: 0,
-            voting_mode: VotingMode::Equal,},
+            voting_mode: VotingMode::Equal, late_fee_bps: 0, grace_period_seconds: 0, auction_enabled: false, auction_window_ledgers: 0,},
         &None,
     );
 
@@ -513,7 +545,7 @@ fn test_max_members_enforcement() {
         
             skip_fee: 0,
             max_skips_per_cycle: 0,
-            voting_mode: VotingMode::Equal,},
+            voting_mode: VotingMode::Equal, late_fee_bps: 0, grace_period_seconds: 0, auction_enabled: false, auction_window_ledgers: 0,},
         &None,
     );
 
@@ -554,7 +586,7 @@ fn test_update_max_members() {
         
             skip_fee: 0,
             max_skips_per_cycle: 0,
-            voting_mode: VotingMode::Equal,},
+            voting_mode: VotingMode::Equal, late_fee_bps: 0, grace_period_seconds: 0, auction_enabled: false, auction_window_ledgers: 0,},
         &None,
     );
 
@@ -602,7 +634,7 @@ fn test_max_members_boundary() {
         
             skip_fee: 0,
             max_skips_per_cycle: 0,
-            voting_mode: VotingMode::Equal,},
+            voting_mode: VotingMode::Equal, late_fee_bps: 0, grace_period_seconds: 0, auction_enabled: false, auction_window_ledgers: 0,},
         &None,
     );
 
@@ -645,7 +677,7 @@ fn test_max_members_proposal() {
         
             skip_fee: 0,
             max_skips_per_cycle: 0,
-            voting_mode: VotingMode::Equal,},
+            voting_mode: VotingMode::Equal, late_fee_bps: 0, grace_period_seconds: 0, auction_enabled: false, auction_window_ledgers: 0,},
         &None,
     );
 
@@ -703,7 +735,7 @@ fn test_configurable_max_defaults() {
             max_members: None,
             skip_fee: 0,
             max_skips_per_cycle: 0,
-            voting_mode: VotingMode::Equal,},
+            voting_mode: VotingMode::Equal, late_fee_bps: 0, grace_period_seconds: 0, auction_enabled: false, auction_window_ledgers: 0,},
         &None,
     );
 
@@ -758,6 +790,10 @@ fn test_suspension_threshold_set_event() {
             skip_fee: 0,
             max_skips_per_cycle: 0,
             voting_mode: VotingMode::Equal,
+        late_fee_bps: 0,
+        grace_period_seconds: 0,
+        auction_enabled: false,
+        auction_window_ledgers: 0,
         },
         &None,
     );
@@ -792,7 +828,7 @@ fn test_max_defaults_must_be_at_least_one() {
             max_members: None,
             skip_fee: 0,
             max_skips_per_cycle: 0,
-            voting_mode: VotingMode::Equal,},
+            voting_mode: VotingMode::Equal, late_fee_bps: 0, grace_period_seconds: 0, auction_enabled: false, auction_window_ledgers: 0,},
         &None,
     );
 
@@ -828,7 +864,7 @@ fn test_penalise_defaulter_uses_max_defaults() {
             max_members: None,
             skip_fee: 0,
             max_skips_per_cycle: 0,
-            voting_mode: VotingMode::Equal,},
+            voting_mode: VotingMode::Equal, late_fee_bps: 0, grace_period_seconds: 0, auction_enabled: false, auction_window_ledgers: 0,},
         &None,
     );
 
@@ -896,7 +932,7 @@ fn test_all_features_integrated() {
             max_members: None,
             skip_fee: 0,
             max_skips_per_cycle: 0,
-            voting_mode: VotingMode::Equal,},
+            voting_mode: VotingMode::Equal, late_fee_bps: 0, grace_period_seconds: 0, auction_enabled: false, auction_window_ledgers: 0,},
         &None,
     );
 

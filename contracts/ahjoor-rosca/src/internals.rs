@@ -1,4 +1,4 @@
-use crate::{errors::{Error, ExtError}, events, audit_trail, ContributionEntry, DataKey, DataKey2, DataKey3, PersistentKey, PayoutRecord, types::{InsuranceClaim, InsuranceCoverageMode}};
+use crate::{errors::{Error, ExtError}, events, audit_trail, ContributionEntry, DataKey, DataKey2, DataKey3, PersistentKey, PayoutRecord, SlotBid, types::{InsuranceClaim, InsuranceCoverageMode}};
 use soroban_sdk::{panic_with_error, token, Address, Env, Map, Vec};
 
 const PERSISTENT_LIFETIME_THRESHOLD: u32 = 100_000;
@@ -342,9 +342,10 @@ pub(crate) fn reset_round_state(env: &Env, current_round: u32) {
     } else {
         env.storage().instance().get(&DataKey::RoundDuration).unwrap()
     };
+    let new_round = current_round + 1;
     env.storage()
         .instance()
-        .set(&DataKey::CurrentRound, &(current_round + 1));
+        .set(&DataKey::CurrentRound, &new_round);
     env.storage()
         .instance()
         .set(&DataKey::PaidMembers, &Vec::<Address>::new(env));
@@ -374,7 +375,43 @@ pub(crate) fn reset_round_state(env: &Env, current_round: u32) {
         env.storage()
             .instance()
             .set(&DataKey::RoundDeadlineTimestamp, &next_timestamp_deadline);
-        events::emit_round_deadline_timestamp_set(env, current_round + 1, next_timestamp_deadline);
+        events::emit_round_deadline_timestamp_set(env, new_round, next_timestamp_deadline);
+    }
+
+    // Slot Auction: open a new auction at the start of each cycle
+    let auction_enabled: bool = env
+        .storage()
+        .instance()
+        .get(&DataKey3::AuctionEnabled)
+        .unwrap_or(false);
+    if auction_enabled {
+        let payout_order_len: u32 = {
+            let order: Vec<Address> = env
+                .storage()
+                .instance()
+                .get(&DataKey::PayoutOrder)
+                .unwrap_or(Vec::new(env));
+            order.len() as u32
+        };
+        let is_cycle_start = payout_order_len > 0 && new_round % payout_order_len == 0;
+        if is_cycle_start {
+            let window: u64 = env
+                .storage()
+                .instance()
+                .get(&DataKey3::AuctionWindowLedgers)
+                .unwrap_or(0);
+            let open_until = env.ledger().timestamp() + window;
+            env.storage()
+                .instance()
+                .set(&DataKey3::AuctionOpenUntil, &open_until);
+            // Clear any leftover bids from a previous auction
+            env.storage()
+                .instance()
+                .set(&DataKey3::AuctionBids, &Vec::<SlotBid>::new(env));
+            env.storage()
+                .instance()
+                .set(&DataKey3::AuctionRound, &new_round);
+        }
     }
 
     events::emit_reset(env, current_round);

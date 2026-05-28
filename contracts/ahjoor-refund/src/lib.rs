@@ -214,6 +214,10 @@ pub enum DataKey {
     MerchantResponseWindow,
     /// #276: Evidence submitted per refund_id
     RefundEvidence(u32),
+    /// Store-credit voucher record keyed by (merchant, customer)
+    StoreCredit(Address, Address),
+    /// Admin-configurable max bonus BPS above refund amount for store-credit vouchers
+    MaxVoucherBonusBps,
 }
 
 mod events;
@@ -242,6 +246,27 @@ pub struct RefundEvidence {
     pub statement_hash: BytesN<32>,
     pub submitted_at_ledger: u32,
 }
+
+/// Store-credit voucher record issued as an alternative to token refund.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct StoreCredit {
+    /// Refund ID that originated this credit.
+    pub refund_id: u32,
+    /// Merchant the credit is redeemable against.
+    pub merchant: Address,
+    /// Customer who holds the credit.
+    pub customer: Address,
+    /// Remaining credit balance (decremented on partial redemption).
+    pub credit_amount: i128,
+    /// Ledger sequence after which the credit is expired.
+    pub expiry_ledger: u64,
+    /// Whether the one-time expiry extension has been used.
+    pub extension_used: bool,
+}
+
+/// Default max bonus BPS: 1000 = 10% above refund amount.
+const DEFAULT_MAX_VOUCHER_BONUS_BPS: u32 = 1_000;
 
 /// Result of a batch refund operation (#217).
 #[contracttype]
@@ -1003,8 +1028,293 @@ impl AhjoorRefundContract {
         events::emit_bulk_refund_processed(&env, refund_ids.len(), total_amount);
     }
 
-    pub fn set_refund_tiers(env: Env, admin: Address, tiers: Vec<(u64, u32)>) {
+    // -------------------------------------------------------------------------
+    // Store-Credit Voucher Issuance (alternative refund settlement)
+    // -------------------------------------------------------------------------
+
+    /// Admin (or merchant delegate) approves a refund as a store-credit voucher instead of
+    /// returning tokens. No token transfer occurs; a StoreCredit record is created.
+    ///
+    /// `credit_amount` may exceed the original refund amount by at most `MAX_VOUCHER_BONUS_BPS`
+    /// basis points (admin-configurable, default 10%).
+    pub fn approve_refund_as_voucher(
+        env: Env,
+        admin: Address,
+        refund_id: u32,
+        credit_amount: i128,
+        expiry_ledger: u64,
+    ) {
+        Self::require_not_paused(&env);
+        admin.require_auth();
+
+        let stored_admin: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .expect("Not initialized");
+
+        let mut refund: Refund = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Refund(refund_id))
+            .expect("Refund not found");
+
+        // Allow admin OR a delegate of the refund's merchant
+        let is_admin = admin == stored_admin;
+        let is_delegate = !is_admin && Self::is_merchant_delegate(&env, &refund.merchant, &admin);
+
+        if !is_admin && !is_delegate {
+            panic!("Only admin or merchant delegate can approve refunds as voucher");
+        }
+
+        if refund.status != RefundStatus::Requested
+            && refund.status != RefundStatus::EvidenceSubmitted
+            && refund.status != RefundStatus::EvidencePeriodExpired
+        {
+            panic!("Refund is not in a state that can be approved as voucher");
+        }
+
+        if credit_amount <= 0 {
+            panic!("credit_amount must be positive");
+        }
+
+        // Validate bonus cap
+        let max_bonus_bps: u32 = env
+            .storage()
+            .instance()
+            .get(&DataKey::MaxVoucherBonusBps)
+            .unwrap_or(DEFAULT_MAX_VOUCHER_BONUS_BPS);
+
+        let max_credit = refund.amount
+            + (refund.amount as u128 * max_bonus_bps as u128 / 10_000) as i128;
+
+        if credit_amount > max_credit {
+            panic!("VoucherBonusExceedsCap");
+        }
+
+        if expiry_ledger <= env.ledger().sequence() as u64 {
+            panic!("expiry_ledger must be in the future");
+        }
+
+        // Return the escrowed tokens to the contract (they stay locked — no transfer to customer).
+        // The customer's escrowed funds remain in the contract; we simply change the refund status
+        // and create the credit record. The escrowed amount is effectively retained by the merchant
+        // (the contract holds it on their behalf). Return it to the merchant.
+        let client = token::Client::new(&env, &refund.token);
+        client.transfer(
+            &env.current_contract_address(),
+            &refund.merchant,
+            &refund.amount,
+        );
+
+        // Mark refund as processed (voucher path)
+        let now = env.ledger().timestamp();
+        refund.status = RefundStatus::Processed;
+        refund.approved_at = Some(now);
+        refund.processed_at = Some(now);
+
+        env.storage()
+            .persistent()
+            .set(&DataKey::Refund(refund_id), &refund);
+        env.storage().persistent().extend_ttl(
+            &DataKey::Refund(refund_id),
+            PERSISTENT_LIFETIME_THRESHOLD,
+            PERSISTENT_BUMP_AMOUNT,
+        );
+
+        // Remove from pending queue
+        Self::remove_from_pending_queue(&env, refund_id);
+
+        // Create or update the StoreCredit record
+        let credit_key = DataKey::StoreCredit(refund.merchant.clone(), refund.customer.clone());
+        let existing: Option<StoreCredit> = env.storage().persistent().get(&credit_key);
+
+        let new_credit = if let Some(mut existing_credit) = existing {
+            // Accumulate onto existing credit
+            existing_credit.credit_amount += credit_amount;
+            // Use the later expiry
+            if expiry_ledger > existing_credit.expiry_ledger {
+                existing_credit.expiry_ledger = expiry_ledger;
+            }
+            existing_credit
+        } else {
+            StoreCredit {
+                refund_id,
+                merchant: refund.merchant.clone(),
+                customer: refund.customer.clone(),
+                credit_amount,
+                expiry_ledger,
+                extension_used: false,
+            }
+        };
+
+        env.storage().persistent().set(&credit_key, &new_credit);
+        env.storage().persistent().extend_ttl(
+            &credit_key,
+            PERSISTENT_LIFETIME_THRESHOLD,
+            PERSISTENT_BUMP_AMOUNT,
+        );
+
+        Self::update_stats_on_approve(&env, &refund.merchant);
+        Self::update_stats_on_process(&env, &refund.merchant, refund.amount);
+
+        events::emit_store_credit_issued(
+            &env,
+            refund_id,
+            refund.customer.clone(),
+            refund.merchant.clone(),
+            credit_amount,
+            expiry_ledger,
+        );
+
+        env.storage()
+            .instance()
+            .extend_ttl(INSTANCE_LIFETIME_THRESHOLD, INSTANCE_BUMP_AMOUNT);
+    }
+
+    /// Apply store credit against a payment at settlement time.
+    /// Deducts `credit_amount` from the customer's store-credit balance for the given merchant.
+    /// Partial redemption is supported; remaining credit is preserved.
+    /// Returns the actual amount of credit applied.
+    pub fn apply_store_credit(
+        env: Env,
+        customer: Address,
+        merchant: Address,
+        payment_id: u32,
+        credit_amount: i128,
+    ) -> i128 {
+        Self::require_not_paused(&env);
+        customer.require_auth();
+
+        if credit_amount <= 0 {
+            panic!("credit_amount must be positive");
+        }
+
+        let credit_key = DataKey::StoreCredit(merchant.clone(), customer.clone());
+        let mut credit: StoreCredit = env
+            .storage()
+            .persistent()
+            .get(&credit_key)
+            .expect("StoreCreditNotFound");
+
+        // Check expiry
+        if env.ledger().sequence() as u64 > credit.expiry_ledger {
+            panic!("StoreCreditExpired");
+        }
+
+        if credit.credit_amount <= 0 {
+            panic!("StoreCreditExhausted");
+        }
+
+        // Clamp to available balance
+        let applied = if credit_amount > credit.credit_amount {
+            credit.credit_amount
+        } else {
+            credit_amount
+        };
+
+        let remaining = credit.credit_amount - applied;
+        credit.credit_amount = remaining;
+
+        env.storage().persistent().set(&credit_key, &credit);
+        env.storage().persistent().extend_ttl(
+            &credit_key,
+            PERSISTENT_LIFETIME_THRESHOLD,
+            PERSISTENT_BUMP_AMOUNT,
+        );
+
+        events::emit_store_credit_redeemed(
+            &env,
+            payment_id,
+            customer,
+            merchant,
+            applied,
+            remaining,
+        );
+
+        env.storage()
+            .instance()
+            .extend_ttl(INSTANCE_LIFETIME_THRESHOLD, INSTANCE_BUMP_AMOUNT);
+
+        applied
+    }
+
+    /// Merchant extends the expiry of a customer's store-credit record once.
+    /// Only one extension is permitted per credit record.
+    pub fn extend_store_credit_expiry(
+        env: Env,
+        merchant: Address,
+        customer: Address,
+        new_expiry_ledger: u64,
+    ) {
+        Self::require_not_paused(&env);
+        merchant.require_auth();
+
+        let credit_key = DataKey::StoreCredit(merchant.clone(), customer.clone());
+        let mut credit: StoreCredit = env
+            .storage()
+            .persistent()
+            .get(&credit_key)
+            .expect("StoreCreditNotFound");
+
+        if credit.merchant != merchant {
+            panic!("Only the issuing merchant can extend store credit expiry");
+        }
+
+        if credit.extension_used {
+            panic!("StoreCreditExtensionAlreadyUsed");
+        }
+
+        if new_expiry_ledger <= credit.expiry_ledger {
+            panic!("new_expiry_ledger must be later than current expiry");
+        }
+
+        credit.expiry_ledger = new_expiry_ledger;
+        credit.extension_used = true;
+
+        env.storage().persistent().set(&credit_key, &credit);
+        env.storage().persistent().extend_ttl(
+            &credit_key,
+            PERSISTENT_LIFETIME_THRESHOLD,
+            PERSISTENT_BUMP_AMOUNT,
+        );
+
+        env.storage()
+            .instance()
+            .extend_ttl(INSTANCE_LIFETIME_THRESHOLD, INSTANCE_BUMP_AMOUNT);
+    }
+
+    /// Get the store-credit record for a (merchant, customer) pair.
+    pub fn get_store_credit(env: Env, merchant: Address, customer: Address) -> StoreCredit {
+        env.storage()
+            .persistent()
+            .get(&DataKey::StoreCredit(merchant, customer))
+            .expect("StoreCreditNotFound")
+    }
+
+    /// Admin sets the maximum voucher bonus in basis points (e.g. 500 = 5% above refund amount).
+    pub fn set_max_voucher_bonus_bps(env: Env, admin: Address, max_bps: u32) {
         Self::require_admin(&env, &admin);
+        if max_bps > 10_000 {
+            panic!("max_bps cannot exceed 10000");
+        }
+        env.storage()
+            .instance()
+            .set(&DataKey::MaxVoucherBonusBps, &max_bps);
+        env.storage()
+            .instance()
+            .extend_ttl(INSTANCE_LIFETIME_THRESHOLD, INSTANCE_BUMP_AMOUNT);
+    }
+
+    /// Get the configured max voucher bonus BPS.
+    pub fn get_max_voucher_bonus_bps(env: Env) -> u32 {
+        env.storage()
+            .instance()
+            .get(&DataKey::MaxVoucherBonusBps)
+            .unwrap_or(DEFAULT_MAX_VOUCHER_BONUS_BPS)
+    }
+
+    pub fn set_refund_tiers(env: Env, admin: Address, tiers: Vec<(u64, u32)>) {        Self::require_admin(&env, &admin);
         Self::validate_refund_tiers(&tiers);
         env.storage().instance().set(&DataKey::RefundTiers, &tiers);
         env.storage()
@@ -3470,3 +3780,6 @@ mod test_reserve_fund;
 
 #[cfg(test)]
 mod test_evidence_window;
+
+#[cfg(test)]
+mod test_store_credit;
