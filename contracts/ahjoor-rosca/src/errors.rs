@@ -146,28 +146,20 @@ pub enum ExtError {
     InsufficientCreditScore = 83,
     /// Round duration is out of the configured bounds.
     RoundDurationOutOfBounds = 84,
-    /// Auction is not enabled for this group.
-    AuctionNotEnabled = 85,
-    /// Bidding window has already closed.
-    AuctionWindowClosed = 86,
-    /// No auction is currently open.
-    AuctionNotOpen = 87,
-    /// Desired slot index is out of range.
-    InvalidSlotIndex = 88,
-    /// Member has no active bid to update.
-    NoBidFound = 89,
-    /// Migration request not found for this member.
-    MigrationNotFound = 90,
-    /// Migration has already been executed.
-    MigrationAlreadyExecuted = 91,
-    /// Both admin approvals are required before executing migration.
-    MigrationNotApproved = 92,
-    /// Source and destination groups use different tokens — migration not allowed.
-    TokenMismatch = 93,
-    /// A migration request already exists for this member.
-    MigrationAlreadyPending = 94,
-    /// Target slot index is already occupied in the destination group.
-    SlotOccupied = 95,
-    /// Proxy supplied an amount that does not exactly match required contribution.
-    IncorrectContributionAmount = 85,
+    /// Contribution delegation has passed its expiry ledger (#330).
+    DelegationExpired = 85,
+    /// Caller is not the registered proxy for this member (#330).
+    NotContribDelegate = 86,
+    /// Split proposal not found (#331).
+    SplitProposalNotFound = 87,
+    /// Member list for split is invalid (overlap or missing members) (#331).
+    SplitMembersInvalid = 88,
+    /// Split confirmation window has closed (#331).
+    SplitConfirmationWindowClosed = 89,
+    /// Group has already been split (#331).
+    SourceGroupAlreadySplit = 90,
+    /// Member already confirmed split participation (#331).
+    SplitAlreadyConfirmed = 91,
+    /// Not all members have confirmed; cannot execute split yet (#331).
+    SplitNotFullyConfirmed = 92,
 }

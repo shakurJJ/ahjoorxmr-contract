@@ -5879,3 +5879,133 @@ fn test_volume_cap_boundary_n_minus_1_pass_nth_rejected() {
         Error::MerchantVolumeCapped.into()
     );
 }
+
+// ===========================================================================
+//  #FEATURE — Payments Invoice Expiry Grace Period Extension by Merchant
+// ===========================================================================
+
+#[test]
+fn test_extend_payment_expiry_single() {
+    let s = setup();
+    s.init();
+
+    let customer = Address::generate(&s.env);
+    let merchant = Address::generate(&s.env);
+    s.token_admin_client.mint(&customer, &1000);
+
+    let payment_id = s.client.create_payment(
+        &customer,
+        &merchant,
+        &100,
+        &s.token_addr,
+        &None,
+        &None,
+        &None,
+    );
+
+    let initial_payment = s.client.get_payment(&payment_id);
+    assert_eq!(initial_payment.extension_count, 0);
+
+    s.client.extend_payment_expiry(&merchant, &payment_id, &100);
+
+    let updated_payment = s.client.get_payment(&payment_id);
+    assert_eq!(updated_payment.extension_count, 1);
+    assert_eq!(updated_payment.expires_at, initial_payment.expires_at + 100 * 5); // 5 seconds per ledger
+}
+
+#[test]
+fn test_extend_payment_expiry_max_extensions() {
+    let s = setup();
+    s.init();
+
+    let customer = Address::generate(&s.env);
+    let merchant = Address::generate(&s.env);
+    s.token_admin_client.mint(&customer, &1000);
+
+    let payment_id = s.client.create_payment(
+        &customer,
+        &merchant,
+        &100,
+        &s.token_addr,
+        &None,
+        &None,
+        &None,
+    );
+
+    // Extend 3 times (default max)
+    s.client.extend_payment_expiry(&merchant, &payment_id, &100);
+    s.client.extend_payment_expiry(&merchant, &payment_id, &100);
+    s.client.extend_payment_expiry(&merchant, &payment_id, &100);
+
+    // 4th extension should fail
+    let result = s.client.try_extend_payment_expiry(&merchant, &payment_id, &100);
+    assert_eq!(result.unwrap_err().unwrap(), Error::MaxExtensionsReached.into());
+}
+
+#[test]
+fn test_extend_payment_expiry_invalid_status() {
+    let s = setup();
+    s.init();
+
+    let customer = Address::generate(&s.env);
+    let merchant = Address::generate(&s.env);
+    s.token_admin_client.mint(&customer, &1000);
+
+    let payment_id = s.client.create_payment(
+        &customer,
+        &merchant,
+        &100,
+        &s.token_addr,
+        &None,
+        &None,
+        &None,
+    );
+
+    // Complete payment first
+    s.client.complete_payment(&payment_id);
+
+    // Try to extend completed payment
+    let result = s.client.try_extend_payment_expiry(&merchant, &payment_id, &100);
+    assert_eq!(result.unwrap_err().unwrap(), Error::InvalidPaymentStatus.into());
+}
+
+#[test]
+fn test_admin_configure_extension_settings() {
+    let s = setup();
+    s.init();
+
+    // Check defaults
+    let (max_ledgers, max_extensions) = s.client.get_extension_config();
+    assert_eq!(max_ledgers, DEFAULT_MAX_EXTENSION_LEDGERS);
+    assert_eq!(max_extensions, DEFAULT_MAX_EXTENSIONS);
+
+    // Update config
+    s.client.update_extension_config(&s.admin, &5000, &5);
+    let (new_max_ledgers, new_max_extensions) = s.client.get_extension_config();
+    assert_eq!(new_max_ledgers, 5000);
+    assert_eq!(new_max_extensions, 5);
+}
+
+#[test]
+fn test_extend_payment_expiry_max_ledgers_exceeded() {
+    let s = setup();
+    s.init();
+
+    let customer = Address::generate(&s.env);
+    let merchant = Address::generate(&s.env);
+    s.token_admin_client.mint(&customer, &1000);
+
+    let payment_id = s.client.create_payment(
+        &customer,
+        &merchant,
+        &100,
+        &s.token_addr,
+        &None,
+        &None,
+        &None,
+    );
+
+    // Try to extend with more than default max ledgers
+    let result = s.client.try_extend_payment_expiry(&merchant, &payment_id, &(DEFAULT_MAX_EXTENSION_LEDGERS + 1));
+    assert_eq!(result.unwrap_err().unwrap(), Error::MaxExtensionLedgersExceeded.into());
+}

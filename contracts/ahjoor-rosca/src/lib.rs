@@ -7220,6 +7220,189 @@ impl AhjoorContract {
         })
     }
 
+    /// Enable group treasury for collective purchases (#314)
+    pub fn enable_group_treasury(env: Env, admin: Address, treasury_admin: Address) {
+        admin.require_auth();
+        let stored_admin: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .expect("Not initialized");
+        if admin != stored_admin {
+            panic!("Only admin can enable treasury");
+        }
+
+        let config = TreasuryConfig {
+            treasury_admin: treasury_admin.clone(),
+            enabled: true,
+        };
+
+        env.storage()
+            .instance()
+            .set(&DataKey3::TreasuryConfig, &config);
+        env.storage()
+            .instance()
+            .set(&DataKey3::TreasuryBalance, &0i128);
+        env.storage()
+            .instance()
+            .extend_ttl(INSTANCE_LIFETIME_THRESHOLD, INSTANCE_BUMP_AMOUNT);
+
+        events::emit_treasury_enabled(&env, treasury_admin);
+    }
+
+    /// Propose redirecting a round payout to treasury (#314)
+    pub fn propose_treasury_round(
+        env: Env,
+        member: Address,
+        round_index: u32,
+        purpose_hash: BytesN<32>,
+    ) {
+        member.require_auth();
+
+        let members: Vec<Address> = env
+            .storage()
+            .instance()
+            .get(&DataKey::Members)
+            .expect("Not initialized");
+        if !members.contains(&member) {
+            panic!("Only members can propose treasury rounds");
+        }
+
+        let proposal = TreasuryRoundProposal {
+            round_index,
+            purpose_hash,
+            proposed_at: env.ledger().timestamp(),
+            votes_for: 0,
+            votes_against: 0,
+            confirmed: false,
+        };
+
+        env.storage()
+            .instance()
+            .set(&DataKey3::TreasuryRoundProposal(round_index), &proposal);
+        env.storage()
+            .instance()
+            .extend_ttl(INSTANCE_LIFETIME_THRESHOLD, INSTANCE_BUMP_AMOUNT);
+
+        events::emit_treasury_round_proposed(&env, round_index);
+    }
+
+    /// Vote on treasury round proposal (#314)
+    pub fn vote_treasury_round(
+        env: Env,
+        member: Address,
+        round_index: u32,
+        vote_for: bool,
+    ) {
+        member.require_auth();
+
+        let members: Vec<Address> = env
+            .storage()
+            .instance()
+            .get(&DataKey::Members)
+            .expect("Not initialized");
+        if !members.contains(&member) {
+            panic!("Only members can vote");
+        }
+
+        // Check if already voted
+        if env
+            .storage()
+            .instance()
+            .get::<_, bool>(&DataKey3::TreasuryRoundVotes(round_index, member.clone()))
+            .is_some()
+        {
+            panic!("Member already voted on this round");
+        }
+
+        let mut proposal: TreasuryRoundProposal = env
+            .storage()
+            .instance()
+            .get(&DataKey3::TreasuryRoundProposal(round_index))
+            .expect("Proposal not found");
+
+        if vote_for {
+            proposal.votes_for = proposal.votes_for.saturating_add(1);
+        } else {
+            proposal.votes_against = proposal.votes_against.saturating_add(1);
+        }
+
+        // Check for majority (> 50%)
+        let total_votes = proposal.votes_for + proposal.votes_against;
+        if total_votes > (members.len() as i128 / 2) {
+            proposal.confirmed = true;
+            events::emit_treasury_round_confirmed(&env, round_index);
+        }
+
+        env.storage()
+            .instance()
+            .set(&DataKey3::TreasuryRoundVotes(round_index, member), &vote_for);
+        env.storage()
+            .instance()
+            .set(&DataKey3::TreasuryRoundProposal(round_index), &proposal);
+        env.storage()
+            .instance()
+            .extend_ttl(INSTANCE_LIFETIME_THRESHOLD, INSTANCE_BUMP_AMOUNT);
+    }
+
+    /// Execute treasury payment with member vote approval (#314)
+    pub fn execute_treasury_payment(
+        env: Env,
+        treasury_admin: Address,
+        recipient: Address,
+        amount: i128,
+        reason_hash: BytesN<32>,
+    ) {
+        treasury_admin.require_auth();
+
+        let config: TreasuryConfig = env
+            .storage()
+            .instance()
+            .get(&DataKey3::TreasuryConfig)
+            .expect("Treasury not enabled");
+
+        if treasury_admin != config.treasury_admin {
+            panic!("Only treasury admin can execute payments");
+        }
+
+        let balance: i128 = env
+            .storage()
+            .instance()
+            .get(&DataKey3::TreasuryBalance)
+            .unwrap_or(0);
+
+        if amount > balance {
+            panic!("Insufficient treasury balance");
+        }
+
+        let token: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Token)
+            .expect("Not initialized");
+
+        let client = token::Client::new(&env, &token);
+        client.transfer(&env.current_contract_address(), &recipient, &amount);
+
+        let new_balance = balance - amount;
+        env.storage()
+            .instance()
+            .set(&DataKey3::TreasuryBalance, &new_balance);
+        env.storage()
+            .instance()
+            .extend_ttl(INSTANCE_LIFETIME_THRESHOLD, INSTANCE_BUMP_AMOUNT);
+
+        events::emit_treasury_payment_executed(&env, recipient, amount);
+    }
+
+    /// Get treasury balance (#314)
+    pub fn get_treasury_balance(env: Env) -> i128 {
+        env.storage()
+            .instance()
+            .get(&DataKey3::TreasuryBalance)
+            .unwrap_or(0)
+    }
+
     /// Internal: update a member's credit score after a relevant event.
     fn update_credit_score_internal(env: &Env, member: &Address, reason: Symbol) {
         let mut scores: Map<Address, MemberScore> = env
@@ -7286,6 +7469,561 @@ impl AhjoorContract {
         if old_score != ms.score {
             events::emit_credit_score_updated(env, member.clone(), old_score, ms.score, reason);
         }
+    }
+
+    // ── #330: Contribution Delegation ─────────────────────────────────────────
+
+    /// Member authorises a proxy to contribute, vote, and request emergency loans
+    /// on their behalf until `expiry_ledger`. Only one proxy per member at a time;
+    /// setting a new proxy replaces the old one.
+    pub fn delegate_contribution_rights(
+        env: Env,
+        member: Address,
+        group_id: u32,
+        proxy: Address,
+        expiry_ledger: u64,
+    ) {
+        internals::check_not_paused(&env);
+        member.require_auth();
+
+        let members: Vec<Address> = env
+            .storage()
+            .instance()
+            .get(&DataKey::Members)
+            .expect("Not initialized");
+        if !members.contains(&member) {
+            panic_with_error!(&env, Error::NotAMember);
+        }
+        if expiry_ledger <= (env.ledger().sequence() as u64) {
+            panic!("expiry_ledger must be in the future");
+        }
+
+        let mut delegations: Map<Address, ContribDelegationRecord> = env
+            .storage()
+            .instance()
+            .get(&DataKey3::ContribDelegations)
+            .unwrap_or(Map::new(&env));
+
+        delegations.set(member.clone(), ContribDelegationRecord {
+            proxy: proxy.clone(),
+            expiry_ledger,
+        });
+        env.storage().instance().set(&DataKey3::ContribDelegations, &delegations);
+
+        events::emit_delegation_granted(&env, group_id, member, proxy, expiry_ledger);
+        env.storage()
+            .instance()
+            .extend_ttl(INSTANCE_LIFETIME_THRESHOLD, INSTANCE_BUMP_AMOUNT);
+    }
+
+    /// Member revokes their contribution delegation.
+    pub fn revoke_contribution_delegation(env: Env, member: Address, group_id: u32) {
+        internals::check_not_paused(&env);
+        member.require_auth();
+
+        let mut delegations: Map<Address, ContribDelegationRecord> = env
+            .storage()
+            .instance()
+            .get(&DataKey3::ContribDelegations)
+            .unwrap_or(Map::new(&env));
+
+        if !delegations.contains_key(member.clone()) {
+            panic_with_error!(&env, Error::NoDelegationFound);
+        }
+        let rec = delegations.get(member.clone()).unwrap();
+        let proxy = rec.proxy.clone();
+        delegations.remove(member.clone());
+        env.storage().instance().set(&DataKey3::ContribDelegations, &delegations);
+
+        events::emit_contribution_delegation_revoked(&env, group_id, member, proxy);
+        env.storage()
+            .instance()
+            .extend_ttl(INSTANCE_LIFETIME_THRESHOLD, INSTANCE_BUMP_AMOUNT);
+    }
+
+    /// Returns the active delegation record for `member`, if any.
+    pub fn get_member_delegation(
+        env: Env,
+        _group_id: u32,
+        member: Address,
+    ) -> Option<ContribDelegationRecord> {
+        let delegations: Map<Address, ContribDelegationRecord> = env
+            .storage()
+            .instance()
+            .get(&DataKey3::ContribDelegations)
+            .unwrap_or(Map::new(&env));
+        delegations.get(member)
+    }
+
+    /// Proxy contributes on behalf of a delegating member.
+    /// Tokens are transferred from `member`'s account (proxy must hold a token
+    /// allowance from member, or pay from their own wallet and member has approved
+    /// the contract as a spender).
+    pub fn contribute_via_proxy(
+        env: Env,
+        proxy: Address,
+        member: Address,
+        token: Address,
+        amount: i128,
+    ) {
+        internals::check_not_paused(&env);
+        proxy.require_auth();
+
+        // Validate delegation
+        let delegations: Map<Address, ContribDelegationRecord> = env
+            .storage()
+            .instance()
+            .get(&DataKey3::ContribDelegations)
+            .unwrap_or(Map::new(&env));
+        let rec = delegations
+            .get(member.clone())
+            .unwrap_or_else(|| panic_with_error!(&env, Error::NoDelegationFound));
+        if rec.proxy != proxy {
+            panic_with_error!(&env, ExtError::NotContribDelegate);
+        }
+        if (env.ledger().sequence() as u64) > rec.expiry_ledger {
+            panic_with_error!(&env, ExtError::DelegationExpired);
+        }
+
+        // Delegate to the standard contribute logic using member as contributor
+        // Proxy pays via transfer_from (proxy must have allowance from member)
+        let members: Vec<Address> = env
+            .storage()
+            .instance()
+            .get(&DataKey::Members)
+            .expect("Not initialized");
+        if !members.contains(&member) {
+            panic_with_error!(&env, Error::NotAMember);
+        }
+
+        // Check current round open
+        let current_round: u32 = env
+            .storage()
+            .instance()
+            .get(&DataKey::CurrentRound)
+            .unwrap_or(0);
+        let round_deadline: u64 = env
+            .storage()
+            .instance()
+            .get(&DataKey::RoundDeadline)
+            .unwrap_or(0);
+        if env.ledger().timestamp() > round_deadline && round_deadline != 0 {
+            panic_with_error!(&env, Error::ContributionWindowClosed);
+        }
+
+        // Ensure not already contributed this round
+        let mut paid_members: Vec<Address> = env
+            .storage()
+            .instance()
+            .get(&DataKey::PaidMembers)
+            .unwrap_or(Vec::new(&env));
+        if paid_members.contains(&member) {
+            panic_with_error!(&env, Error::AlreadyContributed);
+        }
+
+        let contribution_amount: i128 = env
+            .storage()
+            .instance()
+            .get(&DataKey::ContributionAmt)
+            .expect("Not initialized");
+        if amount < contribution_amount {
+            panic_with_error!(&env, Error::AmountMustBePositive);
+        }
+
+        let token_client = token::Client::new(&env, &token);
+        // Proxy spends from member's account (requires pre-approved allowance)
+        token_client.transfer_from(
+            &proxy,
+            &member,
+            &env.current_contract_address(),
+            &amount,
+        );
+
+        paid_members.push_back(member.clone());
+        env.storage().instance().set(&DataKey::PaidMembers, &paid_members);
+
+        let mut member_contributions: Map<Address, i128> = env
+            .storage()
+            .instance()
+            .get(&DataKey::MemberContributions)
+            .unwrap_or(Map::new(&env));
+        let prev = member_contributions.get(member.clone()).unwrap_or(0);
+        member_contributions.set(member.clone(), prev + amount);
+        env.storage()
+            .instance()
+            .set(&DataKey::MemberContributions, &member_contributions);
+
+        events::emit_contrib(&env, member, current_round, token, amount);
+        env.storage()
+            .instance()
+            .extend_ttl(INSTANCE_LIFETIME_THRESHOLD, INSTANCE_BUMP_AMOUNT);
+    }
+
+    /// Proxy votes on a governance proposal on behalf of a delegating member.
+    pub fn vote_proposal_via_proxy(
+        env: Env,
+        proxy: Address,
+        member: Address,
+        proposal_id: u32,
+        approve: bool,
+    ) {
+        internals::check_not_paused(&env);
+        proxy.require_auth();
+
+        // Validate delegation
+        let delegations: Map<Address, ContribDelegationRecord> = env
+            .storage()
+            .instance()
+            .get(&DataKey3::ContribDelegations)
+            .unwrap_or(Map::new(&env));
+        let rec = delegations
+            .get(member.clone())
+            .unwrap_or_else(|| panic_with_error!(&env, Error::NoDelegationFound));
+        if rec.proxy != proxy {
+            panic_with_error!(&env, ExtError::NotContribDelegate);
+        }
+        if (env.ledger().sequence() as u64) > rec.expiry_ledger {
+            panic_with_error!(&env, ExtError::DelegationExpired);
+        }
+
+        let members: Vec<Address> = env
+            .storage()
+            .instance()
+            .get(&DataKey::Members)
+            .expect("Not initialized");
+        if !members.contains(&member) {
+            panic_with_error!(&env, Error::NotAMember);
+        }
+
+        let mut proposals: Map<u32, Proposal> = env
+            .storage()
+            .instance()
+            .get(&DataKey::Proposals)
+            .unwrap_or(Map::new(&env));
+        let mut proposal = proposals.get(proposal_id).unwrap_or_else(|| {
+            panic_with_error!(&env, Error::ProposalNotFound)
+        });
+
+        let now = env.ledger().timestamp();
+        if now > proposal.deadline {
+            panic_with_error!(&env, Error::VotingDeadlinePassed);
+        }
+
+        let mut votes: Map<u32, Map<Address, bool>> = env
+            .storage()
+            .instance()
+            .get(&DataKey::ProposalVotes)
+            .unwrap_or(Map::new(&env));
+        let mut round_votes = votes.get(proposal_id).unwrap_or(Map::new(&env));
+        if round_votes.contains_key(member.clone()) {
+            panic_with_error!(&env, Error::AlreadyVoted);
+        }
+        round_votes.set(member.clone(), approve);
+        if approve {
+            proposal.votes_for += 1;
+        } else {
+            proposal.votes_against += 1;
+        }
+        votes.set(proposal_id, round_votes);
+        proposals.set(proposal_id, proposal);
+        env.storage().instance().set(&DataKey::Proposals, &proposals);
+        env.storage().instance().set(&DataKey::ProposalVotes, &votes);
+
+        events::emit_voted(&env, proposal_id, member, approve);
+        env.storage()
+            .instance()
+            .extend_ttl(INSTANCE_LIFETIME_THRESHOLD, INSTANCE_BUMP_AMOUNT);
+    }
+
+    // ── #331: Group Split ──────────────────────────────────────────────────────
+
+    /// Admin configures the confirmation window for split proposals.
+    pub fn set_split_confirmation_window(env: Env, admin: Address, window_ledgers: u32) {
+        internals::check_not_paused(&env);
+        admin.require_auth();
+        let stored_admin: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .expect("Admin not set");
+        if admin != stored_admin {
+            panic_with_error!(&env, ExtError::OnlyAdminAllowed);
+        }
+        env.storage()
+            .instance()
+            .set(&DataKey3::SplitConfirmationWindow, &window_ledgers);
+        env.storage()
+            .instance()
+            .extend_ttl(INSTANCE_LIFETIME_THRESHOLD, INSTANCE_BUMP_AMOUNT);
+    }
+
+    /// Admin proposes splitting the current group into two.
+    /// Every current member must appear in exactly one of the two sub-lists.
+    pub fn propose_group_split(
+        env: Env,
+        admin: Address,
+        group_id: u32,
+        group_a_members: Vec<Address>,
+        group_b_members: Vec<Address>,
+        split_reason_hash: BytesN<32>,
+    ) -> u32 {
+        internals::check_not_paused(&env);
+        admin.require_auth();
+        let stored_admin: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .expect("Admin not set");
+        if admin != stored_admin {
+            panic_with_error!(&env, ExtError::OnlyAdminAllowed);
+        }
+
+        let group_status: GroupStatus = env
+            .storage()
+            .instance()
+            .get(&DataKey2::GroupStatus)
+            .unwrap_or(GroupStatus::Active);
+        if group_status == GroupStatus::Split {
+            panic_with_error!(&env, ExtError::SourceGroupAlreadySplit);
+        }
+        if group_status != GroupStatus::Active {
+            panic!("Group is not active");
+        }
+
+        let members: Vec<Address> = env
+            .storage()
+            .instance()
+            .get(&DataKey::Members)
+            .expect("Not initialized");
+
+        // Every current member must be in exactly one sub-list
+        for m in members.iter() {
+            let in_a = group_a_members.contains(&m);
+            let in_b = group_b_members.contains(&m);
+            if !(in_a ^ in_b) {
+                panic_with_error!(&env, ExtError::SplitMembersInvalid);
+            }
+        }
+        // No extra members in either list
+        for m in group_a_members.iter() {
+            if !members.contains(&m) {
+                panic_with_error!(&env, ExtError::SplitMembersInvalid);
+            }
+        }
+        for m in group_b_members.iter() {
+            if !members.contains(&m) {
+                panic_with_error!(&env, ExtError::SplitMembersInvalid);
+            }
+        }
+
+        let window: u32 = env
+            .storage()
+            .instance()
+            .get(&DataKey3::SplitConfirmationWindow)
+            .unwrap_or(200u32);
+
+        let proposal_id: u32 = env
+            .storage()
+            .instance()
+            .get(&DataKey3::SplitProposalCounter)
+            .unwrap_or(0u32)
+            + 1;
+        env.storage()
+            .instance()
+            .set(&DataKey3::SplitProposalCounter, &proposal_id);
+
+        let proposal = SplitProposal {
+            id: proposal_id,
+            group_a_members,
+            group_b_members,
+            split_reason_hash,
+            confirmations: Vec::new(&env),
+            status: SplitProposalStatus::Pending,
+            created_at_ledger: env.ledger().sequence(),
+            expiry_ledger: env.ledger().sequence() + window,
+        };
+
+        let mut proposals: Map<u32, SplitProposal> = env
+            .storage()
+            .instance()
+            .get(&DataKey3::SplitProposals)
+            .unwrap_or(Map::new(&env));
+        proposals.set(proposal_id, proposal);
+        env.storage()
+            .instance()
+            .set(&DataKey3::SplitProposals, &proposals);
+
+        events::emit_group_split_proposed(&env, group_id, proposal_id);
+        env.storage()
+            .instance()
+            .extend_ttl(INSTANCE_LIFETIME_THRESHOLD, INSTANCE_BUMP_AMOUNT);
+        proposal_id
+    }
+
+    /// Member confirms their participation in the split.
+    pub fn confirm_split_participation(env: Env, member: Address, _group_id: u32, proposal_id: u32) {
+        internals::check_not_paused(&env);
+        member.require_auth();
+
+        let members: Vec<Address> = env
+            .storage()
+            .instance()
+            .get(&DataKey::Members)
+            .expect("Not initialized");
+        if !members.contains(&member) {
+            panic_with_error!(&env, Error::NotAMember);
+        }
+
+        let mut proposals: Map<u32, SplitProposal> = env
+            .storage()
+            .instance()
+            .get(&DataKey3::SplitProposals)
+            .unwrap_or(Map::new(&env));
+        let mut proposal = proposals
+            .get(proposal_id)
+            .unwrap_or_else(|| panic_with_error!(&env, ExtError::SplitProposalNotFound));
+
+        if proposal.status != SplitProposalStatus::Pending {
+            panic!("Proposal is not pending");
+        }
+        if env.ledger().sequence() > proposal.expiry_ledger {
+            panic_with_error!(&env, ExtError::SplitConfirmationWindowClosed);
+        }
+
+        // Member must be in one of the two sub-lists
+        let in_a = proposal.group_a_members.contains(&member);
+        let in_b = proposal.group_b_members.contains(&member);
+        if !in_a && !in_b {
+            panic!("Member not part of this split proposal");
+        }
+        if proposal.confirmations.contains(&member) {
+            panic_with_error!(&env, ExtError::SplitAlreadyConfirmed);
+        }
+
+        proposal.confirmations.push_back(member);
+        proposals.set(proposal_id, proposal);
+        env.storage()
+            .instance()
+            .set(&DataKey3::SplitProposals, &proposals);
+
+        env.storage()
+            .instance()
+            .extend_ttl(INSTANCE_LIFETIME_THRESHOLD, INSTANCE_BUMP_AMOUNT);
+    }
+
+    /// Execute the group split once all members have confirmed.
+    /// Marks the source group as `Split`, distributes the pool reserve
+    /// proportionally by sub-group size, and refunds unconfirmed members.
+    pub fn execute_group_split(env: Env, admin: Address, group_id: u32, proposal_id: u32) {
+        internals::check_not_paused(&env);
+        admin.require_auth();
+        let stored_admin: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .expect("Admin not set");
+        if admin != stored_admin {
+            panic_with_error!(&env, ExtError::OnlyAdminAllowed);
+        }
+
+        let mut proposals: Map<u32, SplitProposal> = env
+            .storage()
+            .instance()
+            .get(&DataKey3::SplitProposals)
+            .unwrap_or(Map::new(&env));
+        let mut proposal = proposals
+            .get(proposal_id)
+            .unwrap_or_else(|| panic_with_error!(&env, ExtError::SplitProposalNotFound));
+
+        if proposal.status != SplitProposalStatus::Pending {
+            panic!("Proposal already executed or expired");
+        }
+        if env.ledger().sequence() > proposal.expiry_ledger {
+            panic_with_error!(&env, ExtError::SplitConfirmationWindowClosed);
+        }
+
+        let members: Vec<Address> = env
+            .storage()
+            .instance()
+            .get(&DataKey::Members)
+            .expect("Not initialized");
+        let token: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Token)
+            .expect("Not initialized");
+        let contribution_amount: i128 = env
+            .storage()
+            .instance()
+            .get(&DataKey::ContributionAmt)
+            .expect("Not initialized");
+
+        // Separate confirmed vs unconfirmed members
+        let mut confirmed_a: Vec<Address> = Vec::new(&env);
+        let mut confirmed_b: Vec<Address> = Vec::new(&env);
+        let mut unconfirmed: Vec<Address> = Vec::new(&env);
+
+        for m in members.iter() {
+            let confirmed = proposal.confirmations.contains(&m);
+            if !confirmed {
+                unconfirmed.push_back(m);
+            } else if proposal.group_a_members.contains(&m) {
+                confirmed_a.push_back(m.clone());
+            } else {
+                confirmed_b.push_back(m.clone());
+            }
+        }
+
+        // Proportional reserve distribution: use contract's token balance
+        let token_client = token::Client::new(&env, &token);
+        let total_balance = token_client.balance(&env.current_contract_address());
+        let total_confirmed = (confirmed_a.len() + confirmed_b.len()) as i128;
+
+        // Refund unconfirmed members their proportional share
+        if total_balance > 0 && members.len() as i128 > 0 {
+            let per_member_share = total_balance / (members.len() as i128);
+            for m in unconfirmed.iter() {
+                if per_member_share > 0 {
+                    token_client.transfer(
+                        &env.current_contract_address(),
+                        &m,
+                        &per_member_share,
+                    );
+                }
+            }
+        }
+
+        // Record the new group A and B IDs (sequential for event tracking)
+        let group_a_id = group_id * 1000 + proposal_id * 2 - 1;
+        let group_b_id = group_id * 1000 + proposal_id * 2;
+
+        // Mark source group as Split
+        env.storage()
+            .instance()
+            .set(&DataKey2::GroupStatus, &GroupStatus::Split);
+
+        proposal.status = SplitProposalStatus::Executed;
+        proposals.set(proposal_id, proposal);
+        env.storage()
+            .instance()
+            .set(&DataKey3::SplitProposals, &proposals);
+
+        events::emit_group_split_executed(&env, group_id, group_a_id, group_b_id);
+        env.storage()
+            .instance()
+            .extend_ttl(INSTANCE_LIFETIME_THRESHOLD, INSTANCE_BUMP_AMOUNT);
+    }
+
+    /// Get a split proposal by ID.
+    pub fn get_split_proposal(env: Env, proposal_id: u32) -> SplitProposal {
+        let proposals: Map<u32, SplitProposal> = env
+            .storage()
+            .instance()
+            .get(&DataKey3::SplitProposals)
+            .unwrap_or(Map::new(&env));
+        proposals
+            .get(proposal_id)
+            .unwrap_or_else(|| panic_with_error!(&env, ExtError::SplitProposalNotFound))
     }
 
     /// Internal: panics if member's credit score is below the group minimum.
@@ -7555,6 +8293,8 @@ impl AhjoorContract {
 
 mod test;
 mod test_new_features;
+mod test_contrib_delegation;
+mod test_group_split;
 mod test_skip;
 mod test_quorum;
 mod test_waitlist;

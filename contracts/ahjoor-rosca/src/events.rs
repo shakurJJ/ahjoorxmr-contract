@@ -1385,64 +1385,123 @@ pub fn emit_credit_score_updated(e: &Env, member: Address, old_score: i128, new_
     CreditScoreUpdated { member, old_score, new_score, reason }.publish(e);
 }
 
-// ── Slot Auction Events ────────────────────────────────────────────────────────
+// ── #330: Contribution Delegation Events ─────────────────────────────────────
 
-/// Event: A member placed a bid in the slot auction.
+/// Event: Member granted contribution delegation to a proxy (#330)
 #[contractevent]
 #[derive(Clone, Debug)]
-pub struct SlotBidPlaced {
+pub struct DelegationGranted {
     pub group_id: u32,
     pub member: Address,
-    pub slot_index: u32,
-    pub bid_amount: i128,
+    pub proxy: Address,
+    pub expiry_ledger: u64,
 }
 
-/// Event: The slot auction was resolved — winner swapped, losers refunded, bonus distributed.
+/// Event: Member revoked contribution delegation (#330)
 #[contractevent]
 #[derive(Clone, Debug)]
-pub struct SlotAuctionResolved {
+pub struct ContribDelegationRevoked {
     pub group_id: u32,
-    pub winner: Address,
-    pub slot_index: u32,
-    pub winning_bid: i128,
-    pub bonus_per_member: i128,
+    pub member: Address,
+    pub proxy: Address,
 }
 
-pub fn emit_slot_bid_placed(e: &Env, group_id: u32, member: Address, slot_index: u32, bid_amount: i128) {
-    SlotBidPlaced { group_id, member, slot_index, bid_amount }.publish(e);
+pub fn emit_delegation_granted(e: &Env, group_id: u32, member: Address, proxy: Address, expiry_ledger: u64) {
+    DelegationGranted { group_id, member, proxy, expiry_ledger }.publish(e);
 }
 
-pub fn emit_slot_auction_resolved(e: &Env, group_id: u32, winner: Address, slot_index: u32, winning_bid: i128, bonus_per_member: i128) {
-    SlotAuctionResolved { group_id, winner, slot_index, winning_bid, bonus_per_member }.publish(e);
+pub fn emit_contribution_delegation_revoked(e: &Env, group_id: u32, member: Address, proxy: Address) {
+    ContribDelegationRevoked { group_id, member, proxy }.publish(e);
 }
 
-// ── Cross-Group Migration Events ──────────────────────────────────────────────
+// ── #331: Group Split Events ──────────────────────────────────────────────────
 
-/// Event: A member requested cross-group migration.
+/// Event: Group split proposed (#331)
 #[contractevent]
 #[derive(Clone, Debug)]
-pub struct MigrationRequested {
-    pub member: Address,
-    pub from_group: Address,
-    pub to_group: Address,
+pub struct GroupSplitProposed {
+    pub source_group_id: u32,
+    pub proposal_id: u32,
 }
 
-/// Event: Cross-group migration executed successfully.
+/// Event: Group split executed (#331)
 #[contractevent]
 #[derive(Clone, Debug)]
-pub struct MigrationExecuted {
-    pub member: Address,
-    pub from_group: Address,
-    pub to_group: Address,
-    pub slot_index: u32,
+pub struct GroupSplitExecuted {
+    pub source_group_id: u32,
+    pub group_a_id: u32,
+    pub group_b_id: u32,
 }
 
-pub fn emit_migration_requested(e: &Env, member: Address, from_group: Address, to_group: Address) {
-    MigrationRequested { member, from_group, to_group }.publish(e);
+pub fn emit_group_split_proposed(e: &Env, source_group_id: u32, proposal_id: u32) {
+    GroupSplitProposed { source_group_id, proposal_id }.publish(e);
 }
 
-pub fn emit_migration_executed(e: &Env, member: Address, from_group: Address, to_group: Address, slot_index: u32) {
-    MigrationExecuted { member, from_group, to_group, slot_index }.publish(e);
+pub fn emit_group_split_executed(e: &Env, source_group_id: u32, group_a_id: u32, group_b_id: u32) {
+    GroupSplitExecuted { source_group_id, group_a_id, group_b_id }.publish(e);
+}
+
+
+/// Event: Group treasury enabled (#314)
+#[contractevent]
+#[derive(Clone, Debug)]
+pub struct TreasuryEnabled {
+    pub group_id: u32,
+    pub treasury_admin: Address,
+}
+
+/// Event: Treasury round proposed (#314)
+#[contractevent]
+#[derive(Clone, Debug)]
+pub struct TreasuryRoundProposed {
+    pub group_id: u32,
+    pub round_index: u32,
+}
+
+/// Event: Treasury round confirmed by majority vote (#314)
+#[contractevent]
+#[derive(Clone, Debug)]
+pub struct TreasuryRoundConfirmed {
+    pub group_id: u32,
+    pub round_index: u32,
+}
+
+/// Event: Treasury payment executed (#314)
+#[contractevent]
+#[derive(Clone, Debug)]
+pub struct TreasuryPaymentExecuted {
+    pub group_id: u32,
+    pub recipient: Address,
+    pub amount: i128,
+}
+
+
+pub fn emit_treasury_enabled(env: &Env, treasury_admin: Address) {
+    env.events().publish(
+        ("ahjoor", "treasury_enabled"),
+        TreasuryEnabled { group_id: 0, treasury_admin },
+    );
+}
+
+pub fn emit_treasury_round_proposed(env: &Env, round_index: u32) {
+    env.events().publish(
+        ("ahjoor", "treasury_round_proposed"),
+        TreasuryRoundProposed { group_id: 0, round_index },
+    );
+}
+
+pub fn emit_treasury_round_confirmed(env: &Env, round_index: u32) {
+    env.events().publish(
+        ("ahjoor", "treasury_round_confirmed"),
+        TreasuryRoundConfirmed { group_id: 0, round_index },
+    );
+}
+
+pub fn emit_treasury_payment_executed(env: &Env, recipient: Address, amount: i128) {
+    env.events().publish(
+        ("ahjoor", "treasury_payment_executed"),
+        TreasuryPaymentExecuted { group_id: 0, recipient, amount },
+    );
 }
 
 // --- Emergency Liquidity Reserve Events (#313) ---

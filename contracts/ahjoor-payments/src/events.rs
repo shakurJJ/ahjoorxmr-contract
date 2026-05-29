@@ -198,6 +198,23 @@ pub struct BatchSettlementProcessed {
     pub payment_count: u32,
 }
 
+/// Event: Merchant KYB verification hash set (#310)
+#[contractevent]
+#[derive(Clone, Debug)]
+pub struct MerchantKYBSet {
+    pub merchant: Address,
+    pub kyb_hash: BytesN<32>,
+    pub expiry_ledger: u64,
+    pub jurisdiction: String,
+}
+
+/// Event: Merchant KYB verification revoked (#310)
+#[contractevent]
+#[derive(Clone, Debug)]
+pub struct MerchantKYBRevoked {
+    pub merchant: Address,
+}
+
 /// Event: Payment disputed by customer
 #[contractevent]
 #[derive(Clone, Debug)]
@@ -290,6 +307,15 @@ pub struct WithdrawalProcessed {
 pub struct InvoiceAttached {
     pub payment_id: u32,
     pub invoice_hash: BytesN<32>,
+}
+
+/// Event: Payment expiry extended by merchant
+#[contractevent]
+#[derive(Clone, Debug)]
+pub struct PaymentExpiryExtended {
+    pub payment_id: u32,
+    pub new_expires_at: u64,
+    pub extension_count: u32,
 }
 
 // --- Helper Emission Functions ---
@@ -768,6 +794,15 @@ pub fn emit_invoice_attached(e: &Env, payment_id: u32, invoice_hash: BytesN<32>)
     InvoiceAttached {
         payment_id,
         invoice_hash,
+    }
+    .publish(e);
+}
+
+pub fn emit_payment_expiry_extended(e: &Env, payment_id: u32, new_expires_at: u64, extension_count: u32) {
+    PaymentExpiryExtended {
+        payment_id,
+        new_expires_at,
+        extension_count,
     }
     .publish(e);
 }
@@ -1438,5 +1473,54 @@ pub fn emit_cooling_off_cancellation(e: &Env, payment_id: u32, customer: Address
             customer,
             refund_amount,
         },
+
+pub fn emit_merchant_kyb_set(
+    env: &Env,
+    merchant: Address,
+    kyb_hash: BytesN<32>,
+    expiry_ledger: u64,
+    jurisdiction: String,
+) {
+    env.events().publish(
+        ("ahjoor", "merchant_kyb_set"),
+        MerchantKYBSet {
+            merchant,
+            kyb_hash,
+            expiry_ledger,
+            jurisdiction,
+        },
+    );
+}
+
+pub fn emit_merchant_kyb_revoked(env: &Env, merchant: Address) {
+    env.events().publish(
+        ("ahjoor", "merchant_kyb_revoked"),
+        MerchantKYBRevoked { merchant },
+// ── #329: Failed Auto-Debit Retry Queue Events ────────────────────────────────
+
+pub fn emit_debit_failed(
+    e: &Env,
+    record_id: u32,
+    plan_id: u32,
+    attempt_number: u32,
+    next_retry_ledger: u64,
+) {
+    e.events().publish(
+        (soroban_sdk::Symbol::new(e, "DebitFailed"),),
+        (record_id, plan_id, attempt_number, next_retry_ledger),
+    );
+}
+
+pub fn emit_debit_retry_succeeded(e: &Env, record_id: u32, plan_id: u32, amount: i128) {
+    e.events().publish(
+        (soroban_sdk::Symbol::new(e, "DebitRetrySucceeded"),),
+        (record_id, plan_id, amount),
+    );
+}
+
+pub fn emit_debit_abandoned(e: &Env, record_id: u32, plan_id: u32) {
+    e.events().publish(
+        (soroban_sdk::Symbol::new(e, "DebitAbandoned"),),
+        (record_id, plan_id),
     );
 }

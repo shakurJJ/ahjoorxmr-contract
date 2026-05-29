@@ -152,6 +152,39 @@ pub struct EscrowRefunded {
     pub amount: i128,
 }
 
+/// Event: Multi-seller escrow released with distributions (#317)
+#[contractevent]
+#[derive(Clone, Debug)]
+pub struct MultiSellerEscrowReleased {
+    pub escrow_id: u32,
+    pub distributions: Vec<(Address, i128)>,
+}
+
+/// Event: Seller share delegated to another address (#317)
+#[contractevent]
+#[derive(Clone, Debug)]
+pub struct SellerShareDelegated {
+    pub escrow_id: u32,
+    pub original_seller: Address,
+    pub delegate: Address,
+}
+
+/// Event: Conditional release triggered by oracle (#318)
+#[contractevent]
+#[derive(Clone, Debug)]
+pub struct ConditionalReleaseTriggered {
+    pub escrow_id: u32,
+    pub oracle_contract: Address,
+    pub condition_value: i128,
+}
+
+/// Event: Release condition waived by mutual agreement (#318)
+#[contractevent]
+#[derive(Clone, Debug)]
+pub struct ReleaseConditionWaived {
+    pub escrow_id: u32,
+}
+
 /// Event: Contract WASM upgraded
 #[contractevent]
 #[derive(Clone, Debug)]
@@ -1170,6 +1203,118 @@ pub fn emit_inspection_result_submitted(
         inspector,
         approved,
         report_hash,
+
+pub fn emit_multi_seller_escrow_released(
+    env: &Env,
+    escrow_id: u32,
+    distributions: Vec<(Address, i128)>,
+) {
+    env.events().publish(
+        ("ahjoor", "multi_seller_escrow_released"),
+        MultiSellerEscrowReleased {
+            escrow_id,
+            distributions,
+        },
+    );
+}
+
+pub fn emit_seller_share_delegated(
+    env: &Env,
+    escrow_id: u32,
+    original_seller: Address,
+    delegate: Address,
+) {
+    env.events().publish(
+        ("ahjoor", "seller_share_delegated"),
+        SellerShareDelegated {
+            escrow_id,
+            original_seller,
+            delegate,
+        },
+    );
+}
+
+
+pub fn emit_conditional_release_triggered(
+    env: &Env,
+    escrow_id: u32,
+    oracle_contract: Address,
+    condition_value: i128,
+) {
+    env.events().publish(
+        ("ahjoor", "conditional_release_triggered"),
+        ConditionalReleaseTriggered {
+            escrow_id,
+            oracle_contract,
+            condition_value,
+        },
+    );
+}
+
+pub fn emit_release_condition_waived(env: &Env, escrow_id: u32) {
+    env.events().publish(
+        ("ahjoor", "release_condition_waived"),
+        ReleaseConditionWaived { escrow_id },
+    );
+// ── #332: Milestone BPS Events ────────────────────────────────────────────────
+
+pub fn emit_milestone_submitted(e: &Env, escrow_id: u32, milestone_index: u32, delivery_hash: BytesN<32>) {
+    e.events().publish(
+        (soroban_sdk::Symbol::new(e, "MilestoneSubmitted"),),
+        (escrow_id, milestone_index, delivery_hash),
+    );
+}
+
+pub fn emit_milestone_rejected(e: &Env, escrow_id: u32, milestone_index: u32) {
+    e.events().publish(
+        (soroban_sdk::Symbol::new(e, "MilestoneRejected"),),
+        (escrow_id, milestone_index),
+    );
+/// Event: Escrow topped up by buyer
+#[contractevent]
+#[derive(Clone, Debug)]
+pub struct EscrowToppedUp {
+    pub escrow_id: u32,
+    pub buyer: Address,
+    pub additional_amount: i128,
+    pub new_total: i128,
+}
+
+pub fn emit_escrow_topped_up(
+    e: &Env,
+    escrow_id: u32,
+    buyer: Address,
+    additional_amount: i128,
+    new_total: i128,
+) {
+    EscrowToppedUp {
+        escrow_id,
+        buyer,
+        additional_amount,
+        new_total,
+    }
+    .publish(e);
+}
+
+/// Event: Seller acknowledged top-up
+#[contractevent]
+#[derive(Clone, Debug)]
+pub struct TopUpAcknowledged {
+    pub escrow_id: u32,
+    pub seller: Address,
+    pub new_total: i128,
+}
+
+pub fn emit_top_up_acknowledged(
+    e: &Env,
+    escrow_id: u32,
+    seller: Address,
+    new_total: i128,
+) {
+    TopUpAcknowledged {
+        escrow_id,
+        seller,
+        new_total,
     }
     .publish(e);
 }
@@ -1184,6 +1329,71 @@ pub fn emit_inspector_updated(
         escrow_id,
         old_inspector,
         new_inspector,
+/// Event: Partial release requested by seller
+#[contractevent]
+#[derive(Clone, Debug)]
+pub struct PartialReleaseRequested {
+    pub escrow_id: u32,
+    pub request_id: u64,
+    pub seller: Address,
+    pub amount: i128,
+}
+
+pub fn emit_partial_release_requested(
+    e: &Env,
+    escrow_id: u32,
+    request_id: u64,
+    seller: Address,
+    amount: i128,
+) {
+    PartialReleaseRequested {
+        escrow_id,
+        request_id,
+        seller,
+        amount,
+    }
+    .publish(e);
+}
+
+/// Event: Partial release approved by buyer
+#[contractevent]
+#[derive(Clone, Debug)]
+pub struct PartialReleaseApproved {
+    pub escrow_id: u32,
+    pub request_id: u64,
+    pub amount: i128,
+}
+
+pub fn emit_partial_release_approved(
+    e: &Env,
+    escrow_id: u32,
+    request_id: u64,
+    amount: i128,
+) {
+    PartialReleaseApproved {
+        escrow_id,
+        request_id,
+        amount,
+    }
+    .publish(e);
+}
+
+/// Event: Partial release rejected by buyer
+#[contractevent]
+#[derive(Clone, Debug)]
+pub struct PartialReleaseRejected {
+    pub escrow_id: u32,
+    pub request_id: u64,
+}
+
+pub fn emit_partial_release_rejected(
+    e: &Env,
+    escrow_id: u32,
+    request_id: u64,
+) {
+    PartialReleaseRejected {
+        escrow_id,
+        request_id,
     }
     .publish(e);
 }
