@@ -7315,6 +7315,154 @@ impl AhjoorContract {
         }
     }
 
+    // =========================================================================
+    // Payout Order Randomization (#315)
+    // =========================================================================
+
+    /// Finalize payout order using Fisher-Yates shuffle with ledger-derived entropy.
+    /// Can only be called once per group. Uses sha256(ledger_hash || group_id || member_count)
+    /// as the seed for deterministic, reproducible randomization.
+    pub fn finalize_payout_order(env: Env, admin: Address) {
+        admin.require_auth();
+        let stored_admin: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .expect("Not initialized");
+        if admin != stored_admin {
+            panic!("Only admin can finalize payout order");
+        }
+
+        // Check if randomization is enabled
+        let randomize_enabled: bool = env
+            .storage()
+            .instance()
+            .get(&DataKey2::RandomizePayoutOrder)
+            .unwrap_or(false);
+        if !randomize_enabled {
+            panic!("Payout order randomization not enabled for this group");
+        }
+
+        // Check if already finalized
+        let already_finalized: bool = env
+            .storage()
+            .instance()
+            .get(&DataKey2::PayoutOrderFinalized)
+            .unwrap_or(false);
+        if already_finalized {
+            panic!("Payout order already finalized");
+        }
+
+        // Get current payout order
+        let mut payout_order: Vec<Address> = env
+            .storage()
+            .instance()
+            .get(&DataKey::PayoutOrder)
+            .expect("Payout order not initialized");
+
+        // Generate seed from ledger hash + group_id + member_count
+        let ledger_hash = env.ledger().sequence();
+        let member_count = payout_order.len() as u32;
+
+        // Create seed: sha256(ledger_sequence || member_count)
+        let mut seed_input = Vec::new(&env);
+        seed_input.push_back(ledger_hash as u8);
+        seed_input.push_back((ledger_hash >> 8) as u8);
+        seed_input.push_back((ledger_hash >> 16) as u8);
+        seed_input.push_back((ledger_hash >> 24) as u8);
+        seed_input.push_back(member_count as u8);
+        seed_input.push_back((member_count >> 8) as u8);
+        seed_input.push_back((member_count >> 16) as u8);
+        seed_input.push_back((member_count >> 24) as u8);
+
+        let seed_bytes = env.crypto().sha256(&seed_input);
+
+        // Perform Fisher-Yates shuffle
+        payout_order = Self::fisher_yates_shuffle(&env, payout_order, &seed_bytes);
+
+        // Store finalized order
+        env.storage()
+            .instance()
+            .set(&DataKey::PayoutOrder, &payout_order.clone());
+        env.storage()
+            .instance()
+            .set(&DataKey2::PayoutOrderFinalized, &true);
+        env.storage()
+            .instance()
+            .set(&DataKey2::PayoutOrderSeed, &seed_bytes);
+
+        // Extend TTL
+        env.storage()
+            .instance()
+            .extend_ttl(INSTANCE_LIFETIME_THRESHOLD, INSTANCE_BUMP_AMOUNT);
+
+        // Emit event
+        let current_round: u32 = env
+            .storage()
+            .instance()
+            .get(&DataKey::CurrentRound)
+            .unwrap_or(1);
+        events::emit_payout_order_finalized(&env, current_round, payout_order);
+    }
+
+    /// Fisher-Yates shuffle using seed-derived randomness.
+    /// Deterministic: same seed produces same shuffle.
+    fn fisher_yates_shuffle(
+        env: &Env,
+        mut items: Vec<Address>,
+        seed: &BytesN<32>,
+    ) -> Vec<Address> {
+        let n = items.len();
+        if n <= 1 {
+            return items;
+        }
+
+        // Use seed bytes as pseudo-random source
+        let seed_bytes = seed.to_bytes();
+        let mut seed_index = 0u32;
+
+        for i in (1..n).rev() {
+            // Get next pseudo-random byte from seed
+            let rand_byte = seed_bytes.get(seed_index as usize % 32).unwrap_or(0);
+            seed_index = seed_index.wrapping_add(1);
+
+            // Compute j = random index in [0, i]
+            let j = (rand_byte as usize) % (i + 1);
+
+            // Swap items[i] and items[j]
+            if i != j {
+                let mut new_items = Vec::new(env);
+                for (idx, item) in items.iter().enumerate() {
+                    if idx == i {
+                        new_items.push_back(items.get(j).unwrap());
+                    } else if idx == j {
+                        new_items.push_back(items.get(i).unwrap());
+                    } else {
+                        new_items.push_back(item);
+                    }
+                }
+                items = new_items;
+            }
+        }
+
+        items
+    }
+
+    /// Get the current payout order (randomized if enabled and finalized).
+    pub fn get_payout_order(env: Env) -> Vec<Address> {
+        let payout_order: Vec<Address> = env
+            .storage()
+            .instance()
+            .get(&DataKey::PayoutOrder)
+            .unwrap_or(Vec::new(&env));
+
+        env.storage()
+            .instance()
+            .extend_ttl(INSTANCE_LIFETIME_THRESHOLD, INSTANCE_BUMP_AMOUNT);
+
+        payout_order
+    }
+
 }
 
 mod test;

@@ -42,6 +42,14 @@ pub struct RoundClosed {
     pub defaulters: Vec<Address>,
 }
 
+/// Event: Payout order finalized via randomization (#315)
+#[contractevent]
+#[derive(Clone, Debug)]
+pub struct PayoutOrderFinalized {
+    pub round: u32,
+    pub payout_order: Vec<Address>,
+}
+
 /// Event: Member defaulted on a round
 #[contractevent]
 #[derive(Clone, Debug)]
@@ -435,6 +443,10 @@ pub fn emit_milestone(e: &Env, milestone: u32, total_collected: i128) {
 
 pub fn emit_closed(e: &Env, round: u32, defaulters: Vec<Address>) {
     RoundClosed { round, defaulters }.publish(e);
+}
+
+pub fn emit_payout_order_finalized(e: &Env, round: u32, payout_order: Vec<Address>) {
+    PayoutOrderFinalized { round, payout_order }.publish(e);
 }
 
 pub fn emit_defaulted(
