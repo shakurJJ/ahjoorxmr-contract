@@ -134,6 +134,8 @@ pub enum Error {
     TippingNotEnabled = 18,
     /// Tip amount exceeds the admin-configured maximum tip bps of the base amount (#265)
     TipExceedsMaxBps = 19,
+    /// KYB verification required but merchant not verified (#310)
+    KYBVerificationRequired = 25,
     /// retry_failed_debit called before back-off interval has elapsed (#329)
     RetryNotDue = 25,
     /// Failed debit record not found (#329)
@@ -217,6 +219,25 @@ pub struct MerchantAppeal {
     pub submitted_at: u64,
     pub resolved: bool,
     pub approved: bool,
+}
+
+/// KYB (Know Your Business) verification record (#310)
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MerchantKYB {
+    pub kyb_hash: BytesN<32>,
+    pub expiry_ledger: u64,
+    pub jurisdiction: String,
+    pub revoked: bool,
+}
+
+/// KYB status response (#310)
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct KYBStatus {
+    pub verified: bool,
+    pub expiry_ledger: u64,
+    pub jurisdiction: String,
 }
 
 /// Conditional release based on oracle price (#125)
@@ -681,6 +702,10 @@ pub enum DataKey2 {
     RecurringInvoice(u32),
     /// #265: maximum tip as basis points of the base payment amount (instance storage)
     MaxTipBps,
+    /// Persistent: merchant KYB verification record (#310)
+    MerchantKYB(Address),
+    /// Instance: KYB enforcement flag (#310)
+    KYBEnforcementEnabled,
     /// #329: counter for failed debit records
     FailedDebitCounter,
     /// #329: failed debit record keyed by record ID
@@ -968,6 +993,14 @@ impl AhjoorPaymentsContract {
 
         // Merchant allowlist check (#58)
         Self::require_merchant_approved(&env, &merchant);
+
+        // KYB enforcement check (#310)
+        if Self::is_kyb_enforcement_enabled(env.clone()) {
+            let kyb_status = Self::get_merchant_kyb_status(env.clone(), merchant.clone());
+            if !kyb_status.verified {
+                panic_with_error!(&env, Error::KYBVerificationRequired);
+            }
+        }
 
         let client = token::Client::new(&env, &token);
         client.transfer(&customer, &env.current_contract_address(), &amount);
@@ -6890,6 +6923,132 @@ impl AhjoorPaymentsContract {
             .extend_ttl(INSTANCE_LIFETIME_THRESHOLD, INSTANCE_BUMP_AMOUNT);
     }
 
+    /// Admin sets KYB verification hash for a merchant (#310)
+    pub fn set_merchant_kyb(
+        env: Env,
+        admin: Address,
+        merchant: Address,
+        kyb_hash: BytesN<32>,
+        expiry_ledger: u64,
+        jurisdiction: String,
+    ) {
+        admin.require_auth();
+        let stored_admin: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .expect("Not initialized");
+        if admin != stored_admin {
+            panic!("Only admin can set merchant KYB");
+        }
+
+        let kyb = MerchantKYB {
+            kyb_hash,
+            expiry_ledger,
+            jurisdiction: jurisdiction.clone(),
+            revoked: false,
+        };
+
+        env.storage()
+            .persistent()
+            .set(&DataKey2::MerchantKYB(merchant.clone()), &kyb);
+        env.storage().persistent().extend_ttl(
+            &DataKey2::MerchantKYB(merchant.clone()),
+            PERSISTENT_LIFETIME_THRESHOLD,
+            PERSISTENT_BUMP_AMOUNT,
+        );
+
+        events::emit_merchant_kyb_set(&env, merchant, kyb_hash, expiry_ledger, jurisdiction);
+    }
+
+    /// Admin toggles KYB enforcement globally (#310)
+    pub fn set_kyb_enforcement(env: Env, admin: Address, enabled: bool) {
+        admin.require_auth();
+        let stored_admin: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .expect("Not initialized");
+        if admin != stored_admin {
+            panic!("Only admin can set KYB enforcement");
+        }
+
+        env.storage()
+            .instance()
+            .set(&DataKey2::KYBEnforcementEnabled, &enabled);
+        env.storage()
+            .instance()
+            .extend_ttl(INSTANCE_LIFETIME_THRESHOLD, INSTANCE_BUMP_AMOUNT);
+    }
+
+    /// Admin revokes a merchant's KYB verification (#310)
+    pub fn revoke_merchant_kyb(env: Env, admin: Address, merchant: Address) {
+        admin.require_auth();
+        let stored_admin: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .expect("Not initialized");
+        if admin != stored_admin {
+            panic!("Only admin can revoke merchant KYB");
+        }
+
+        if let Some(mut kyb) = env
+            .storage()
+            .persistent()
+            .get::<_, MerchantKYB>(&DataKey2::MerchantKYB(merchant.clone()))
+        {
+            kyb.revoked = true;
+            env.storage()
+                .persistent()
+                .set(&DataKey2::MerchantKYB(merchant.clone()), &kyb);
+            env.storage().persistent().extend_ttl(
+                &DataKey2::MerchantKYB(merchant.clone()),
+                PERSISTENT_LIFETIME_THRESHOLD,
+                PERSISTENT_BUMP_AMOUNT,
+            );
+        }
+
+        events::emit_merchant_kyb_revoked(&env, merchant);
+    }
+
+    /// Get merchant KYB status (#310)
+    pub fn get_merchant_kyb_status(env: Env, merchant: Address) -> KYBStatus {
+        let current_ledger = env.ledger().sequence() as u64;
+
+        if let Some(kyb) = env
+            .storage()
+            .persistent()
+            .get::<_, MerchantKYB>(&DataKey2::MerchantKYB(merchant.clone()))
+        {
+            env.storage().persistent().extend_ttl(
+                &DataKey2::MerchantKYB(merchant),
+                PERSISTENT_LIFETIME_THRESHOLD,
+                PERSISTENT_BUMP_AMOUNT,
+            );
+
+            let verified = !kyb.revoked && current_ledger <= kyb.expiry_ledger;
+            KYBStatus {
+                verified,
+                expiry_ledger: kyb.expiry_ledger,
+                jurisdiction: kyb.jurisdiction,
+            }
+        } else {
+            KYBStatus {
+                verified: false,
+                expiry_ledger: 0,
+                jurisdiction: String::from_slice(&env, ""),
+            }
+        }
+    }
+
+    /// Check if KYB enforcement is enabled (#310)
+    pub fn is_kyb_enforcement_enabled(env: Env) -> bool {
+        env.storage()
+            .instance()
+            .get::<_, bool>(&DataKey2::KYBEnforcementEnabled)
+            .unwrap_or(false)
+    }
     /// Returns the current maximum tip in basis points (default: 3 000).
     pub fn get_max_tip_bps(env: Env) -> u32 {
         env.storage()

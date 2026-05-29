@@ -198,6 +198,23 @@ pub struct BatchSettlementProcessed {
     pub payment_count: u32,
 }
 
+/// Event: Merchant KYB verification hash set (#310)
+#[contractevent]
+#[derive(Clone, Debug)]
+pub struct MerchantKYBSet {
+    pub merchant: Address,
+    pub kyb_hash: BytesN<32>,
+    pub expiry_ledger: u64,
+    pub jurisdiction: String,
+}
+
+/// Event: Merchant KYB verification revoked (#310)
+#[contractevent]
+#[derive(Clone, Debug)]
+pub struct MerchantKYBRevoked {
+    pub merchant: Address,
+}
+
 /// Event: Payment disputed by customer
 #[contractevent]
 #[derive(Clone, Debug)]
@@ -1373,6 +1390,29 @@ pub fn emit_payment_indexed_by_external_id(e: &Env, payment_id: u32, ext_id: sor
     );
 }
 
+
+pub fn emit_merchant_kyb_set(
+    env: &Env,
+    merchant: Address,
+    kyb_hash: BytesN<32>,
+    expiry_ledger: u64,
+    jurisdiction: String,
+) {
+    env.events().publish(
+        ("ahjoor", "merchant_kyb_set"),
+        MerchantKYBSet {
+            merchant,
+            kyb_hash,
+            expiry_ledger,
+            jurisdiction,
+        },
+    );
+}
+
+pub fn emit_merchant_kyb_revoked(env: &Env, merchant: Address) {
+    env.events().publish(
+        ("ahjoor", "merchant_kyb_revoked"),
+        MerchantKYBRevoked { merchant },
 // ── #329: Failed Auto-Debit Retry Queue Events ────────────────────────────────
 
 pub fn emit_debit_failed(

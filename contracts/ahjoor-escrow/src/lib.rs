@@ -63,6 +63,15 @@ pub struct ReleaseCondition {
     pub threshold_price: i128,
 }
 
+/// Conditional release based on external contract state (#318)
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ConditionalRelease {
+    pub oracle_contract: Address,
+    pub condition_method: Symbol,
+    pub expected_value: i128,
+}
+
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PriceData {
@@ -366,6 +375,18 @@ pub enum DataKey {
     AutoRenewalCancelled(u32),
 }
 
+/// Overflow storage keys — split from DataKey because #[contracttype] is bounded to 50 variants.
+#[derive(Clone)]
+#[contracttype]
+pub enum DataKey2 {
+    /// #317: seller share delegation per escrow (escrow_id, original_seller) → delegate_address
+    SellerShareDelegate(u32, Address),
+    /// #318: conditional release condition per escrow
+    ConditionalReleaseCondition(u32),
+    /// #318: buyer waiver signature for conditional release
+    BuyerWaiverSigned(u32),
+    /// #318: seller waiver signature for conditional release
+    SellerWaiverSigned(u32),
 /// Overflow storage keys for escrow — DataKey is capped at 52 variants.
 #[derive(Clone)]
 #[contracttype]
@@ -1201,6 +1222,128 @@ impl AhjoorEscrowContract {
             .extend_ttl(INSTANCE_LIFETIME_THRESHOLD, INSTANCE_BUMP_AMOUNT);
 
         Self::try_auto_renew(&env, escrow_id, &renewal_source);
+    }
+
+    /// Trigger conditional release by verifying oracle condition (#318)
+    pub fn trigger_conditional_release(env: Env, caller: Address, escrow_id: u32) {
+        Self::require_not_paused(&env);
+        caller.require_auth();
+
+        let escrow: Escrow = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Escrow(escrow_id))
+            .expect("Escrow not found");
+
+        // Get conditional release condition
+        let condition: ConditionalRelease = env
+            .storage()
+            .persistent()
+            .get(&DataKey2::ConditionalReleaseCondition(escrow_id))
+            .expect("No conditional release set for this escrow");
+
+        // Verify oracle is whitelisted
+        let whitelist: Vec<Address> = env
+            .storage()
+            .instance()
+            .get(&DataKey::OracleWhitelist)
+            .unwrap_or(Vec::new(&env));
+        
+        let mut is_whitelisted = false;
+        for addr in whitelist.iter() {
+            if addr == condition.oracle_contract {
+                is_whitelisted = true;
+                break;
+            }
+        }
+        if !is_whitelisted {
+            panic!("Oracle contract not whitelisted");
+        }
+
+        // Call oracle contract to get condition value
+        let oracle_client = oracle::OracleClient::new(&env, &condition.oracle_contract);
+        let condition_value: i128 = oracle_client.lastprice(&condition.oracle_contract, &condition.oracle_contract)
+            .map(|pd| pd.price)
+            .unwrap_or(0);
+
+        // Check if condition is met (>= expected_value)
+        if condition_value < condition.expected_value {
+            panic!("Condition not met");
+        }
+
+        // Condition met, proceed with release
+        events::emit_conditional_release_triggered(&env, escrow_id, condition.oracle_contract, condition_value);
+
+        // Call release_escrow logic
+        Self::release_escrow(env, caller, escrow_id);
+    }
+
+    /// Waive conditional release by mutual agreement (#318)
+    pub fn waive_release_condition(env: Env, caller: Address, escrow_id: u32) {
+        Self::require_not_paused(&env);
+        caller.require_auth();
+
+        let escrow: Escrow = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Escrow(escrow_id))
+            .expect("Escrow not found");
+
+        if caller != escrow.buyer && caller != escrow.seller {
+            panic!("Only buyer or seller can waive condition");
+        }
+
+        // Check if condition exists
+        if env
+            .storage()
+            .persistent()
+            .get::<_, ConditionalRelease>(&DataKey2::ConditionalReleaseCondition(escrow_id))
+            .is_none()
+        {
+            panic!("No conditional release set for this escrow");
+        }
+
+        // Track signatures
+        if caller == escrow.buyer {
+            env.storage()
+                .persistent()
+                .set(&DataKey2::BuyerWaiverSigned(escrow_id), &true);
+        } else {
+            env.storage()
+                .persistent()
+                .set(&DataKey2::SellerWaiverSigned(escrow_id), &true);
+        }
+
+        // Check if both have signed
+        let buyer_signed: bool = env
+            .storage()
+            .persistent()
+            .get(&DataKey2::BuyerWaiverSigned(escrow_id))
+            .unwrap_or(false);
+        let seller_signed: bool = env
+            .storage()
+            .persistent()
+            .get(&DataKey2::SellerWaiverSigned(escrow_id))
+            .unwrap_or(false);
+
+        if buyer_signed && seller_signed {
+            // Remove condition
+            env.storage()
+                .persistent()
+                .remove(&DataKey2::ConditionalReleaseCondition(escrow_id));
+            env.storage()
+                .persistent()
+                .remove(&DataKey2::BuyerWaiverSigned(escrow_id));
+            env.storage()
+                .persistent()
+                .remove(&DataKey2::SellerWaiverSigned(escrow_id));
+
+            events::emit_release_condition_waived(&env, escrow_id);
+        }
+
+        env.storage()
+            .instance()
+            .extend_ttl(INSTANCE_LIFETIME_THRESHOLD, INSTANCE_BUMP_AMOUNT);
     }
 
     /// Submit evidence hash anchors for an escrow dispute workflow.
@@ -2883,6 +3026,9 @@ impl AhjoorEscrowContract {
             .expect("Escrow not found")
     }
 
+    /// Get list of sellers for an escrow (#317)
+    pub fn get_escrow_sellers(env: Env, escrow_id: u32) -> Vec<(Address, u32)> {
+        let escrow: Escrow = env
     /// Buyer tops up an active or awaiting inspection escrow
     pub fn top_up_escrow(env: Env, buyer: Address, escrow_id: u32, additional_amount: i128) {
         Self::require_not_paused(&env);
@@ -2893,6 +3039,15 @@ impl AhjoorEscrowContract {
             .persistent()
             .get(&DataKey::Escrow(escrow_id))
             .expect("Escrow not found");
+        escrow.sellers
+    }
+
+    /// Delegate seller's share to another address before release (#317)
+    pub fn delegate_escrow_share(
+        env: Env,
+        seller: Address,
+        escrow_id: u32,
+        delegate: Address,
 
         if buyer != escrow.buyer {
             panic!("Only buyer can top up escrow");
@@ -2996,6 +3151,10 @@ impl AhjoorEscrowContract {
     ) {
         Self::require_not_paused(&env);
         seller.require_auth();
+
+        if seller == delegate {
+            panic!("Delegate must be different from seller");
+        }
 
         let escrow: Escrow = env
             .storage()
@@ -3140,6 +3299,28 @@ impl AhjoorEscrowContract {
             .get(&DataKey::Escrow(escrow_id))
             .expect("Escrow not found");
 
+        // Verify seller is part of this escrow
+        let mut is_seller = false;
+        for (addr, _) in escrow.sellers.iter() {
+            if addr == seller {
+                is_seller = true;
+                break;
+            }
+        }
+        if !is_seller {
+            panic!("Seller is not part of this escrow");
+        }
+
+        // Only allow delegation before release
+        if !Self::is_open_escrow_status(escrow.status) {
+            panic!("Can only delegate before escrow is released");
+        }
+
+        env.storage()
+            .persistent()
+            .set(&DataKey2::SellerShareDelegate(escrow_id, seller.clone()), &delegate);
+        env.storage().persistent().extend_ttl(
+            &DataKey2::SellerShareDelegate(escrow_id, seller.clone()),
         if buyer != escrow.buyer {
             panic!("Only buyer can reject partial release");
         }
@@ -3210,6 +3391,11 @@ impl AhjoorEscrowContract {
             PERSISTENT_BUMP_AMOUNT,
         );
 
+        events::emit_seller_share_delegated(&env, escrow_id, seller, delegate);
+
+        env.storage()
+            .instance()
+            .extend_ttl(INSTANCE_LIFETIME_THRESHOLD, INSTANCE_BUMP_AMOUNT);
         // Create a dispute record (using existing Dispute struct)
         let dispute = Dispute {
             escrow_id,
@@ -4491,12 +4677,23 @@ impl AhjoorEscrowContract {
             return;
         }
 
+        // Multi-seller distribution (#317)
+        let mut distributions: Vec<(Address, i128)> = Vec::new(env);
         let mut distributed: i128 = 0;
+        
         for i in 1..escrow.sellers.len() {
             let (addr, bps) = escrow.sellers.get(i).unwrap();
             let share = (total * bps as i128) / 10_000;
             if share > 0 {
-                client.transfer(&env.current_contract_address(), &addr, &share);
+                // Check for delegation (#317)
+                let recipient = env
+                    .storage()
+                    .persistent()
+                    .get::<_, Address>(&DataKey2::SellerShareDelegate(escrow_id, addr.clone()))
+                    .unwrap_or(addr.clone());
+                
+                client.transfer(&env.current_contract_address(), &recipient, &share);
+                distributions.push_back((recipient, share));
             }
             distributed += share;
         }
@@ -4504,9 +4701,18 @@ impl AhjoorEscrowContract {
         let first_share = total - distributed;
         if first_share > 0 {
             let (first_addr, _) = escrow.sellers.get(0).unwrap();
-            client.transfer(&env.current_contract_address(), &first_addr, &first_share);
+            // Check for delegation (#317)
+            let recipient = env
+                .storage()
+                .persistent()
+                .get::<_, Address>(&DataKey2::SellerShareDelegate(escrow_id, first_addr.clone()))
+                .unwrap_or(first_addr.clone());
+            
+            client.transfer(&env.current_contract_address(), &recipient, &first_share);
+            distributions.push_back((recipient, first_share));
         }
-        events::emit_multi_party_escrow_released(env, escrow_id, total);
+        
+        events::emit_multi_seller_escrow_released(env, escrow_id, distributions);
     }
 
     fn get_oracle_price(env: &Env, base: &Address, quote: &Address) -> PriceData {

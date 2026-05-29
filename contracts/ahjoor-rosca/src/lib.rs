@@ -7220,6 +7220,189 @@ impl AhjoorContract {
         })
     }
 
+    /// Enable group treasury for collective purchases (#314)
+    pub fn enable_group_treasury(env: Env, admin: Address, treasury_admin: Address) {
+        admin.require_auth();
+        let stored_admin: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .expect("Not initialized");
+        if admin != stored_admin {
+            panic!("Only admin can enable treasury");
+        }
+
+        let config = TreasuryConfig {
+            treasury_admin: treasury_admin.clone(),
+            enabled: true,
+        };
+
+        env.storage()
+            .instance()
+            .set(&DataKey3::TreasuryConfig, &config);
+        env.storage()
+            .instance()
+            .set(&DataKey3::TreasuryBalance, &0i128);
+        env.storage()
+            .instance()
+            .extend_ttl(INSTANCE_LIFETIME_THRESHOLD, INSTANCE_BUMP_AMOUNT);
+
+        events::emit_treasury_enabled(&env, treasury_admin);
+    }
+
+    /// Propose redirecting a round payout to treasury (#314)
+    pub fn propose_treasury_round(
+        env: Env,
+        member: Address,
+        round_index: u32,
+        purpose_hash: BytesN<32>,
+    ) {
+        member.require_auth();
+
+        let members: Vec<Address> = env
+            .storage()
+            .instance()
+            .get(&DataKey::Members)
+            .expect("Not initialized");
+        if !members.contains(&member) {
+            panic!("Only members can propose treasury rounds");
+        }
+
+        let proposal = TreasuryRoundProposal {
+            round_index,
+            purpose_hash,
+            proposed_at: env.ledger().timestamp(),
+            votes_for: 0,
+            votes_against: 0,
+            confirmed: false,
+        };
+
+        env.storage()
+            .instance()
+            .set(&DataKey3::TreasuryRoundProposal(round_index), &proposal);
+        env.storage()
+            .instance()
+            .extend_ttl(INSTANCE_LIFETIME_THRESHOLD, INSTANCE_BUMP_AMOUNT);
+
+        events::emit_treasury_round_proposed(&env, round_index);
+    }
+
+    /// Vote on treasury round proposal (#314)
+    pub fn vote_treasury_round(
+        env: Env,
+        member: Address,
+        round_index: u32,
+        vote_for: bool,
+    ) {
+        member.require_auth();
+
+        let members: Vec<Address> = env
+            .storage()
+            .instance()
+            .get(&DataKey::Members)
+            .expect("Not initialized");
+        if !members.contains(&member) {
+            panic!("Only members can vote");
+        }
+
+        // Check if already voted
+        if env
+            .storage()
+            .instance()
+            .get::<_, bool>(&DataKey3::TreasuryRoundVotes(round_index, member.clone()))
+            .is_some()
+        {
+            panic!("Member already voted on this round");
+        }
+
+        let mut proposal: TreasuryRoundProposal = env
+            .storage()
+            .instance()
+            .get(&DataKey3::TreasuryRoundProposal(round_index))
+            .expect("Proposal not found");
+
+        if vote_for {
+            proposal.votes_for = proposal.votes_for.saturating_add(1);
+        } else {
+            proposal.votes_against = proposal.votes_against.saturating_add(1);
+        }
+
+        // Check for majority (> 50%)
+        let total_votes = proposal.votes_for + proposal.votes_against;
+        if total_votes > (members.len() as i128 / 2) {
+            proposal.confirmed = true;
+            events::emit_treasury_round_confirmed(&env, round_index);
+        }
+
+        env.storage()
+            .instance()
+            .set(&DataKey3::TreasuryRoundVotes(round_index, member), &vote_for);
+        env.storage()
+            .instance()
+            .set(&DataKey3::TreasuryRoundProposal(round_index), &proposal);
+        env.storage()
+            .instance()
+            .extend_ttl(INSTANCE_LIFETIME_THRESHOLD, INSTANCE_BUMP_AMOUNT);
+    }
+
+    /// Execute treasury payment with member vote approval (#314)
+    pub fn execute_treasury_payment(
+        env: Env,
+        treasury_admin: Address,
+        recipient: Address,
+        amount: i128,
+        reason_hash: BytesN<32>,
+    ) {
+        treasury_admin.require_auth();
+
+        let config: TreasuryConfig = env
+            .storage()
+            .instance()
+            .get(&DataKey3::TreasuryConfig)
+            .expect("Treasury not enabled");
+
+        if treasury_admin != config.treasury_admin {
+            panic!("Only treasury admin can execute payments");
+        }
+
+        let balance: i128 = env
+            .storage()
+            .instance()
+            .get(&DataKey3::TreasuryBalance)
+            .unwrap_or(0);
+
+        if amount > balance {
+            panic!("Insufficient treasury balance");
+        }
+
+        let token: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Token)
+            .expect("Not initialized");
+
+        let client = token::Client::new(&env, &token);
+        client.transfer(&env.current_contract_address(), &recipient, &amount);
+
+        let new_balance = balance - amount;
+        env.storage()
+            .instance()
+            .set(&DataKey3::TreasuryBalance, &new_balance);
+        env.storage()
+            .instance()
+            .extend_ttl(INSTANCE_LIFETIME_THRESHOLD, INSTANCE_BUMP_AMOUNT);
+
+        events::emit_treasury_payment_executed(&env, recipient, amount);
+    }
+
+    /// Get treasury balance (#314)
+    pub fn get_treasury_balance(env: Env) -> i128 {
+        env.storage()
+            .instance()
+            .get(&DataKey3::TreasuryBalance)
+            .unwrap_or(0)
+    }
+
     /// Internal: update a member's credit score after a relevant event.
     fn update_credit_score_internal(env: &Env, member: &Address, reason: Symbol) {
         let mut scores: Map<Address, MemberScore> = env

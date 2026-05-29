@@ -152,6 +152,39 @@ pub struct EscrowRefunded {
     pub amount: i128,
 }
 
+/// Event: Multi-seller escrow released with distributions (#317)
+#[contractevent]
+#[derive(Clone, Debug)]
+pub struct MultiSellerEscrowReleased {
+    pub escrow_id: u32,
+    pub distributions: Vec<(Address, i128)>,
+}
+
+/// Event: Seller share delegated to another address (#317)
+#[contractevent]
+#[derive(Clone, Debug)]
+pub struct SellerShareDelegated {
+    pub escrow_id: u32,
+    pub original_seller: Address,
+    pub delegate: Address,
+}
+
+/// Event: Conditional release triggered by oracle (#318)
+#[contractevent]
+#[derive(Clone, Debug)]
+pub struct ConditionalReleaseTriggered {
+    pub escrow_id: u32,
+    pub oracle_contract: Address,
+    pub condition_value: i128,
+}
+
+/// Event: Release condition waived by mutual agreement (#318)
+#[contractevent]
+#[derive(Clone, Debug)]
+pub struct ReleaseConditionWaived {
+    pub escrow_id: u32,
+}
+
 /// Event: Contract WASM upgraded
 #[contractevent]
 #[derive(Clone, Debug)]
@@ -1137,6 +1170,59 @@ pub fn emit_amendment_cancelled(e: &Env, escrow_id: u32, nonce: u32, cancelled_b
     .publish(e);
 }
 
+
+pub fn emit_multi_seller_escrow_released(
+    env: &Env,
+    escrow_id: u32,
+    distributions: Vec<(Address, i128)>,
+) {
+    env.events().publish(
+        ("ahjoor", "multi_seller_escrow_released"),
+        MultiSellerEscrowReleased {
+            escrow_id,
+            distributions,
+        },
+    );
+}
+
+pub fn emit_seller_share_delegated(
+    env: &Env,
+    escrow_id: u32,
+    original_seller: Address,
+    delegate: Address,
+) {
+    env.events().publish(
+        ("ahjoor", "seller_share_delegated"),
+        SellerShareDelegated {
+            escrow_id,
+            original_seller,
+            delegate,
+        },
+    );
+}
+
+
+pub fn emit_conditional_release_triggered(
+    env: &Env,
+    escrow_id: u32,
+    oracle_contract: Address,
+    condition_value: i128,
+) {
+    env.events().publish(
+        ("ahjoor", "conditional_release_triggered"),
+        ConditionalReleaseTriggered {
+            escrow_id,
+            oracle_contract,
+            condition_value,
+        },
+    );
+}
+
+pub fn emit_release_condition_waived(env: &Env, escrow_id: u32) {
+    env.events().publish(
+        ("ahjoor", "release_condition_waived"),
+        ReleaseConditionWaived { escrow_id },
+    );
 // ── #332: Milestone BPS Events ────────────────────────────────────────────────
 
 pub fn emit_milestone_submitted(e: &Env, escrow_id: u32, milestone_index: u32, delivery_hash: BytesN<32>) {
