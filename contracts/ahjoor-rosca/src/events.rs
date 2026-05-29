@@ -1218,6 +1218,73 @@ pub fn emit_co_signer_contributed(e: &Env, group_id: u32, member: Address, co_si
 pub fn emit_co_signer_window_expired(e: &Env, group_id: u32, member: Address) {
     e.events().publish((soroban_sdk::Symbol::new(e, "CoSignerWinExpired"),), (group_id, member));
 }
+
+#[contractevent]
+#[derive(Clone, Debug)]
+pub struct ProxyAuthorized {
+    pub group_id: u32,
+    pub member: Address,
+    pub proxy: Address,
+    pub max_rounds: u32,
+}
+
+#[contractevent]
+#[derive(Clone, Debug)]
+pub struct ProxyContributed {
+    pub group_id: u32,
+    pub member: Address,
+    pub proxy: Address,
+    pub round_index: u32,
+}
+
+#[contractevent]
+#[derive(Clone, Debug)]
+pub struct ProxyRevoked {
+    pub group_id: u32,
+    pub member: Address,
+    pub proxy: Address,
+}
+
+pub fn emit_proxy_authorized(
+    e: &Env,
+    group_id: u32,
+    member: Address,
+    proxy: Address,
+    max_rounds: u32,
+) {
+    ProxyAuthorized {
+        group_id,
+        member,
+        proxy,
+        max_rounds,
+    }
+    .publish(e);
+}
+
+pub fn emit_proxy_contributed(
+    e: &Env,
+    group_id: u32,
+    member: Address,
+    proxy: Address,
+    round_index: u32,
+) {
+    ProxyContributed {
+        group_id,
+        member,
+        proxy,
+        round_index,
+    }
+    .publish(e);
+}
+
+pub fn emit_proxy_revoked(e: &Env, group_id: u32, member: Address, proxy: Address) {
+    ProxyRevoked {
+        group_id,
+        member,
+        proxy,
+    }
+    .publish(e);
+}
 // #236: Group Activity Freeze Events
 
 /// Event: Group frozen by contract-level admin
@@ -1316,4 +1383,64 @@ pub struct CreditScoreUpdated {
 
 pub fn emit_credit_score_updated(e: &Env, member: Address, old_score: i128, new_score: i128, reason: soroban_sdk::Symbol) {
     CreditScoreUpdated { member, old_score, new_score, reason }.publish(e);
+}
+
+// ── Slot Auction Events ────────────────────────────────────────────────────────
+
+/// Event: A member placed a bid in the slot auction.
+#[contractevent]
+#[derive(Clone, Debug)]
+pub struct SlotBidPlaced {
+    pub group_id: u32,
+    pub member: Address,
+    pub slot_index: u32,
+    pub bid_amount: i128,
+}
+
+/// Event: The slot auction was resolved — winner swapped, losers refunded, bonus distributed.
+#[contractevent]
+#[derive(Clone, Debug)]
+pub struct SlotAuctionResolved {
+    pub group_id: u32,
+    pub winner: Address,
+    pub slot_index: u32,
+    pub winning_bid: i128,
+    pub bonus_per_member: i128,
+}
+
+pub fn emit_slot_bid_placed(e: &Env, group_id: u32, member: Address, slot_index: u32, bid_amount: i128) {
+    SlotBidPlaced { group_id, member, slot_index, bid_amount }.publish(e);
+}
+
+pub fn emit_slot_auction_resolved(e: &Env, group_id: u32, winner: Address, slot_index: u32, winning_bid: i128, bonus_per_member: i128) {
+    SlotAuctionResolved { group_id, winner, slot_index, winning_bid, bonus_per_member }.publish(e);
+}
+
+// ── Cross-Group Migration Events ──────────────────────────────────────────────
+
+/// Event: A member requested cross-group migration.
+#[contractevent]
+#[derive(Clone, Debug)]
+pub struct MigrationRequested {
+    pub member: Address,
+    pub from_group: Address,
+    pub to_group: Address,
+}
+
+/// Event: Cross-group migration executed successfully.
+#[contractevent]
+#[derive(Clone, Debug)]
+pub struct MigrationExecuted {
+    pub member: Address,
+    pub from_group: Address,
+    pub to_group: Address,
+    pub slot_index: u32,
+}
+
+pub fn emit_migration_requested(e: &Env, member: Address, from_group: Address, to_group: Address) {
+    MigrationRequested { member, from_group, to_group }.publish(e);
+}
+
+pub fn emit_migration_executed(e: &Env, member: Address, from_group: Address, to_group: Address, slot_index: u32) {
+    MigrationExecuted { member, from_group, to_group, slot_index }.publish(e);
 }

@@ -621,6 +621,60 @@ pub fn emit_escrow_auto_renewed(
     .publish(e);
 }
 
+// --- Auto-Renewal Clause Events (recurring service agreements) ---
+
+/// Event: Escrow auto-renewed with renewal index tracking.
+#[contractevent]
+#[derive(Clone, Debug)]
+pub struct EscrowAutoRenewedV2 {
+    pub original_escrow_id: u32,
+    pub new_escrow_id: u32,
+    pub renewal_index: u32,
+}
+
+/// Event: Auto-renewal failed (e.g. insufficient buyer allowance).
+#[contractevent]
+#[derive(Clone, Debug)]
+pub struct RenewalFailed {
+    pub escrow_id: u32,
+    pub renewal_index: u32,
+    pub reason: String,
+}
+
+/// Event: Buyer cancelled future auto-renewals for an escrow.
+#[contractevent]
+#[derive(Clone, Debug)]
+pub struct AutoRenewalCancelled {
+    pub escrow_id: u32,
+}
+
+pub fn emit_escrow_auto_renewed_v2(
+    e: &Env,
+    original_escrow_id: u32,
+    new_escrow_id: u32,
+    renewal_index: u32,
+) {
+    EscrowAutoRenewedV2 {
+        original_escrow_id,
+        new_escrow_id,
+        renewal_index,
+    }
+    .publish(e);
+}
+
+pub fn emit_renewal_failed(e: &Env, escrow_id: u32, renewal_index: u32, reason: String) {
+    RenewalFailed {
+        escrow_id,
+        renewal_index,
+        reason,
+    }
+    .publish(e);
+}
+
+pub fn emit_auto_renewal_cancelled(e: &Env, escrow_id: u32) {
+    AutoRenewalCancelled { escrow_id }.publish(e);
+}
+
 pub fn emit_buyer_role_transferred(
     e: &Env,
     escrow_id: u32,

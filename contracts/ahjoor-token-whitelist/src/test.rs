@@ -2,8 +2,8 @@
 
 use crate::{TokenWhitelistContract, TokenWhitelistContractClient};
 use soroban_sdk::{
-    testutils::{Address as _, Events},
-    Address, Env, Vec,
+    testutils::{Address as _, Events, Ledger},
+    Address, BytesN, Env,
 };
 
 fn setup_test() -> (Env, Address, TokenWhitelistContractClient<'static>) {
@@ -227,7 +227,175 @@ fn test_token_delisted_mid_operation() {
 
     // Simulate mid-operation: token gets delisted
     client.remove_token(&admin, &token);
-    
+
     // Token should no longer be allowed
     assert!(!client.is_token_allowed(&token));
+}
+
+// ── Suspension tests ──────────────────────────────────────────────────────────
+
+#[test]
+fn test_suspension_active() {
+    let (env, admin, client) = setup_test();
+    let token = Address::generate(&env);
+
+    client.add_token(&admin, &token);
+    assert!(client.is_token_allowed(&token));
+
+    let reason = BytesN::from_array(&env, &[1u8; 32]);
+    client.suspend_token_timed(&admin, &token, &50u32, &reason);
+
+    assert!(!client.is_token_allowed(&token));
+}
+
+#[test]
+fn test_auto_reinstatement_on_expiry_query() {
+    let (env, admin, client) = setup_test();
+    let token = Address::generate(&env);
+
+    client.add_token(&admin, &token);
+
+    let reason = BytesN::from_array(&env, &[1u8; 32]);
+    let start_seq = env.ledger().sequence();
+    client.suspend_token_timed(&admin, &token, &50u32, &reason);
+
+    assert!(!client.is_token_allowed(&token));
+
+    // Advance ledger past suspension expiry
+    env.ledger().with_mut(|l| l.sequence_number = start_seq + 51);
+
+    // Lazy reinstatement: first call after expiry clears the record and returns true
+    assert!(client.is_token_allowed(&token));
+    // Subsequent calls must also return true (suspension fully cleared)
+    assert!(client.is_token_allowed(&token));
+}
+
+#[test]
+fn test_early_lift() {
+    let (env, admin, client) = setup_test();
+    let token = Address::generate(&env);
+
+    client.add_token(&admin, &token);
+
+    let reason = BytesN::from_array(&env, &[1u8; 32]);
+    client.suspend_token_timed(&admin, &token, &50u32, &reason);
+    assert!(!client.is_token_allowed(&token));
+
+    client.lift_token_suspension(&admin, &token);
+
+    assert!(client.is_token_allowed(&token));
+}
+
+#[test]
+fn test_suspension_extension() {
+    let (env, admin, client) = setup_test();
+    let token = Address::generate(&env);
+
+    client.add_token(&admin, &token);
+
+    let reason = BytesN::from_array(&env, &[1u8; 32]);
+    let start_seq = env.ledger().sequence();
+    // Suspend for 50 ledgers, then extend by 50 more → effective expiry = start + 100
+    client.suspend_token_timed(&admin, &token, &50u32, &reason);
+    client.extend_token_suspension(&admin, &token, &50u32);
+
+    // Advance past original expiry (50) but before extended expiry (100)
+    env.ledger().with_mut(|l| l.sequence_number = start_seq + 55);
+    assert!(!client.is_token_allowed(&token));
+
+    // Advance past extended expiry
+    env.ledger().with_mut(|l| l.sequence_number = start_seq + 101);
+    assert!(client.is_token_allowed(&token));
+}
+
+#[test]
+fn test_suspension_history_record() {
+    let (env, admin, client) = setup_test();
+    let token = Address::generate(&env);
+
+    client.add_token(&admin, &token);
+
+    // First suspension — lift early so we can create a second
+    let reason1 = BytesN::from_array(&env, &[1u8; 32]);
+    client.suspend_token_timed(&admin, &token, &100u32, &reason1);
+    client.lift_token_suspension(&admin, &token);
+
+    // Second suspension
+    let reason2 = BytesN::from_array(&env, &[2u8; 32]);
+    client.suspend_token_timed(&admin, &token, &100u32, &reason2);
+
+    let history = client.get_suspension_history(&token);
+    assert_eq!(history.len(), 2);
+    assert_eq!(history.get(0).unwrap().reason_hash, reason1);
+    assert_eq!(history.get(1).unwrap().reason_hash, reason2);
+}
+
+#[test]
+fn test_suspension_history_capped_at_ten() {
+    let (env, admin, client) = setup_test();
+    let token = Address::generate(&env);
+
+    client.add_token(&admin, &token);
+
+    // Create 11 suspensions; each is lifted early before the next
+    for i in 0u32..11 {
+        let reason = BytesN::from_array(&env, &[i as u8; 32]);
+        client.suspend_token_timed(&admin, &token, &100u32, &reason);
+        if i < 10 {
+            client.lift_token_suspension(&admin, &token);
+        }
+    }
+
+    let history = client.get_suspension_history(&token);
+    assert_eq!(history.len(), 10);
+    // Oldest entry (i=0) must have been evicted; the first kept entry is i=1
+    assert_eq!(history.get(0).unwrap().reason_hash, BytesN::from_array(&env, &[1u8; 32]));
+}
+
+#[test]
+fn test_non_suspended_baseline() {
+    let (env, admin, client) = setup_test();
+    let token = Address::generate(&env);
+
+    // Normal whitelist/delist cycle is unchanged by the suspension feature
+    client.add_token(&admin, &token);
+    assert!(client.is_token_allowed(&token));
+
+    let tokens = client.get_whitelisted_tokens();
+    assert_eq!(tokens.len(), 1);
+
+    client.remove_token(&admin, &token);
+    assert!(!client.is_token_allowed(&token));
+}
+
+#[test]
+#[should_panic(expected = "Token already suspended")]
+fn test_double_suspend_fails() {
+    let (env, admin, client) = setup_test();
+    let token = Address::generate(&env);
+
+    client.add_token(&admin, &token);
+    let reason = BytesN::from_array(&env, &[1u8; 32]);
+    client.suspend_token_timed(&admin, &token, &50u32, &reason);
+    client.suspend_token_timed(&admin, &token, &50u32, &reason);
+}
+
+#[test]
+#[should_panic(expected = "No active suspension")]
+fn test_lift_nonexistent_suspension_fails() {
+    let (env, admin, client) = setup_test();
+    let token = Address::generate(&env);
+
+    client.add_token(&admin, &token);
+    client.lift_token_suspension(&admin, &token);
+}
+
+#[test]
+#[should_panic(expected = "Token not whitelisted")]
+fn test_suspend_nonwhitelisted_token_fails() {
+    let (env, admin, client) = setup_test();
+    let token = Address::generate(&env);
+
+    let reason = BytesN::from_array(&env, &[1u8; 32]);
+    client.suspend_token_timed(&admin, &token, &50u32, &reason);
 }

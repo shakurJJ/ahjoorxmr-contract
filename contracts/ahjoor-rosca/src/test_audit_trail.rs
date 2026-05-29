@@ -40,6 +40,10 @@ fn create_test_contract(env: &Env) -> (AhjoorContractClient, Address, Vec<Addres
         skip_fee: 10i128,
         max_skips_per_cycle: 1u32,
         voting_mode: VotingMode::Equal,
+    late_fee_bps: 0,
+    grace_period_seconds: 0,
+    auction_enabled: false,
+    auction_window_ledgers: 0,
     };
 
     client.init(

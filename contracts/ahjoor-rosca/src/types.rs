@@ -52,6 +52,12 @@ pub struct RoscaConfig {
     /// Grace period duration in seconds (timestamp-based schedule).
     /// Used when use_timestamp_schedule = true. 0 = no grace period.
     pub grace_period_seconds: u64,
+    /// Enable the slot auction mechanism for this group.
+    /// When true, an auction opens at the start of each new cycle.
+    pub auction_enabled: bool,
+    /// Number of ledger timestamps (seconds) the bidding window stays open.
+    /// Ignored when auction_enabled = false.
+    pub auction_window_ledgers: u64,
 }
 
 #[contracttype]
@@ -284,6 +290,7 @@ pub enum DataKey2 {
 #[contracttype]
 pub enum DataKey3 {
     CoSignerWindowStart,     // Map<Address, u32> — member → ledger when window opened (#240)
+    ProxyAuthorizations,     // Map<(u32, Address), ProxyAuthorization> — (group_id, member)
     IsFrozen,                // bool — group is frozen by contract-level admin (#236)
     // #267: Tiered Contribution Levels
     GroupTiers,              // Vec<Tier> — named tier definitions
@@ -292,6 +299,17 @@ pub enum DataKey3 {
     // #269: On-Chain Member Credit Score
     ScoreWeights,            // ScoreWeights — admin-configurable scoring formula weights
     MinCreditScore,          // i128 — minimum score required to join this group
+    // Slot Auction
+    AuctionEnabled,          // bool — auction feature flag
+    AuctionWindowLedgers,    // u64 — bidding window duration in seconds
+    AuctionOpenUntil,        // u64 — timestamp when current auction window closes (0 = no open auction)
+    AuctionBids,             // Vec<SlotBid> — bids placed in the current auction
+    AuctionRound,            // u32 — the round for which the current auction was opened
+    // Cross-Group Migration
+    MigrationRequests,       // Map<Address, MigrationRequest> — member → pending outbound migration
+    IncomingMigrations,      // Map<Address, IncomingMigration> — member → pending inbound migration
+    MigratedMembers,         // Map<Address, MigratedMemberRecord> — member → migration annotation
+    VacantSlots,             // Vec<u32> — slot indices freed by migrated-out members
 }
 
 /// Persistent storage keys — kept separate because DataKey was hitting
@@ -347,6 +365,14 @@ pub enum CoSignerStatus {
 pub struct CoSignerRecord {
     pub co_signer: Address,
     pub status: CoSignerStatus,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ProxyAuthorization {
+    pub proxy: Address,
+    pub max_rounds: u32,
+    pub used_rounds: u32,
 }
 
 // ── Audit Trail ────────────────────────────────────────────────────────────────
@@ -503,6 +529,87 @@ pub struct ScoreWeights {
     pub default_weight: i128,
     pub exit_weight: i128,
     pub completion_weight: i128,
+}
+
+// ── Slot Auction (#slot-auction) ──────────────────────────────────────────────
+
+/// A single bid placed during a slot auction.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SlotBid {
+    /// The member who placed this bid.
+    pub bidder: Address,
+    /// The payout-order slot index the bidder wants to move into.
+    pub desired_slot: u32,
+    /// Amount of base token deposited as the bid.
+    pub amount: i128,
+    /// Ledger timestamp at which the bid was placed (used for tie-breaking).
+    pub placed_at: u64,
+}
+
+// ── Cross-Group Member Migration ───────────────────────────────────────────────
+
+/// Approval state for a pending cross-group migration.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[contracttype]
+pub enum MigrationApprovalState {
+    /// Neither admin has approved yet.
+    Pending = 0,
+    /// Source admin approved; waiting for destination admin.
+    SourceApproved = 1,
+    /// Destination admin approved; waiting for source admin.
+    DestApproved = 2,
+    /// Both admins approved — ready to execute.
+    BothApproved = 3,
+    /// Migration has been executed.
+    Executed = 4,
+}
+
+/// A pending cross-group migration request stored on the **source** contract.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MigrationRequest {
+    /// The member who wants to migrate.
+    pub member: Address,
+    /// Address of the destination group contract.
+    pub to_group: Address,
+    /// Slot index in the destination group's payout order.
+    pub target_slot: u32,
+    /// Approval state.
+    pub state: MigrationApprovalState,
+    /// Timestamp when the request was created.
+    pub created_at: u64,
+}
+
+/// Contribution history summary carried from the source group to the destination.
+/// Stored on the **destination** contract as a `MigratedMember` annotation.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MigratedMemberRecord {
+    /// Address of the source group contract.
+    pub from_group: Address,
+    /// Number of rounds the member fully completed in the source group.
+    pub rounds_completed: u32,
+    /// Number of on-time (full, non-late) contributions in the source group.
+    pub on_time_count: u32,
+    /// Slot index assigned in this (destination) group.
+    pub slot_index: u32,
+    /// Timestamp when the migration was executed.
+    pub migrated_at: u64,
+}
+
+/// Incoming migration approval stored on the **destination** contract.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct IncomingMigration {
+    /// The member being migrated in.
+    pub member: Address,
+    /// Address of the source group contract.
+    pub from_group: Address,
+    /// Slot index to insert the member at.
+    pub target_slot: u32,
+    /// Whether the destination admin has approved.
+    pub dest_approved: bool,
 }
 
 
