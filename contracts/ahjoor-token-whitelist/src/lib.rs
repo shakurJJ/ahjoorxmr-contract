@@ -20,6 +20,16 @@ pub enum Error {
     Unauthorized = 3,
     TokenAlreadyWhitelisted = 4,
     TokenNotWhitelisted = 5,
+    QuotaExceeded = 6,
+    TokenAlreadyHasQuota = 7,
+    TokenHasNoQuota = 8,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TokenQuota {
+    pub max_volume_per_period: i128,
+    pub period_ledgers: u32,
     TokenAlreadySuspended = 6,
     TokenNotSuspended = 7,
 }
@@ -52,6 +62,10 @@ pub enum DataKey {
     SuspensionRecord(Address),
     /// Persistent: Suspension history per token (last 10 entries)
     SuspensionHistory(Address),
+    /// Persistent: Token quota configuration per token
+    TokenQuota(Address),
+    /// Persistent: Token volume per ledger bucket
+    TokenVolumeBucket(Address, u32),
 }
 
 mod events;
@@ -499,6 +513,201 @@ impl TokenWhitelistContract {
             PERSISTENT_LIFETIME_THRESHOLD,
             PERSISTENT_BUMP_AMOUNT,
         );
+    }
+
+    // --- Token Quota Functions ---
+
+    /// Set a token quota (admin only)
+    pub fn set_token_quota(
+        env: Env,
+        admin: Address,
+        token: Address,
+        max_volume_per_period: i128,
+        period_ledgers: u32,
+    ) {
+        admin.require_auth();
+        Self::require_admin(&env, &admin);
+
+        // Verify token is whitelisted
+        let whitelist: Vec<Address> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::WhitelistedTokens)
+            .unwrap_or_else(|| Vec::new(&env));
+        let mut is_whitelisted = false;
+        for existing_token in whitelist.iter() {
+            if existing_token == token {
+                is_whitelisted = true;
+                break;
+            }
+        }
+        if !is_whitelisted {
+            panic!("Token not whitelisted");
+        }
+
+        // Check if quota already exists
+        if env
+            .storage()
+            .persistent()
+            .has(&DataKey::TokenQuota(token.clone()))
+        {
+            panic!("Token already has quota");
+        }
+
+        // Validate inputs
+        if max_volume_per_period <= 0 {
+            panic!("max_volume_per_period must be positive");
+        }
+        if period_ledgers == 0 {
+            panic!("period_ledgers must be positive");
+        }
+
+        // Store quota
+        let quota = TokenQuota {
+            max_volume_per_period,
+            period_ledgers,
+        };
+        env.storage()
+            .persistent()
+            .set(&DataKey::TokenQuota(token.clone()), &quota);
+        env.storage().persistent().extend_ttl(
+            &DataKey::TokenQuota(token.clone()),
+            PERSISTENT_LIFETIME_THRESHOLD,
+            PERSISTENT_BUMP_AMOUNT,
+        );
+
+        events::emit_token_quota_set(&env, token, max_volume_per_period, period_ledgers);
+    }
+
+    /// Update an existing token quota (admin only)
+    pub fn update_token_quota(
+        env: Env,
+        admin: Address,
+        token: Address,
+        max_volume_per_period: i128,
+        period_ledgers: u32,
+    ) {
+        admin.require_auth();
+        Self::require_admin(&env, &admin);
+
+        // Validate inputs
+        if max_volume_per_period <= 0 {
+            panic!("max_volume_per_period must be positive");
+        }
+        if period_ledgers == 0 {
+            panic!("period_ledgers must be positive");
+        }
+
+        // Check if quota exists
+        if !env
+            .storage()
+            .persistent()
+            .has(&DataKey::TokenQuota(token.clone()))
+        {
+            panic!("Token has no quota");
+        }
+
+        // Update quota
+        let quota = TokenQuota {
+            max_volume_per_period,
+            period_ledgers,
+        };
+        env.storage()
+            .persistent()
+            .set(&DataKey::TokenQuota(token.clone()), &quota);
+        env.storage().persistent().extend_ttl(
+            &DataKey::TokenQuota(token.clone()),
+            PERSISTENT_LIFETIME_THRESHOLD,
+            PERSISTENT_BUMP_AMOUNT,
+        );
+
+        events::emit_token_quota_set(&env, token, max_volume_per_period, period_ledgers);
+    }
+
+    /// Remove a token quota (admin only)
+    pub fn remove_token_quota(env: Env, admin: Address, token: Address) {
+        admin.require_auth();
+        Self::require_admin(&env, &admin);
+
+        // Check if quota exists
+        if !env
+            .storage()
+            .persistent()
+            .has(&DataKey::TokenQuota(token.clone()))
+        {
+            panic!("Token has no quota");
+        }
+
+        // Remove quota
+        env.storage()
+            .persistent()
+            .remove(&DataKey::TokenQuota(token.clone()));
+    }
+
+    /// Get a token quota
+    pub fn get_token_quota(env: Env, token: Address) -> Option<TokenQuota> {
+        env.storage()
+            .persistent()
+            .get(&DataKey::TokenQuota(token))
+    }
+
+    /// Record token volume (call before settlement)
+    pub fn record_token_volume(env: Env, token: Address, amount: i128) -> Result<(), Error> {
+        if amount <= 0 {
+            panic!("amount must be positive");
+        }
+
+        let Some(quota) = env.storage().persistent().get::<_, TokenQuota>(&DataKey::TokenQuota(token.clone())) else {
+            // No quota, proceed
+            return Ok(());
+        };
+
+        let current_ledger = env.ledger().sequence();
+        let start_ledger = current_ledger.saturating_sub(quota.period_ledgers - 1);
+
+        // Calculate current period volume
+        let mut current_period_volume: i128 = 0;
+        for bucket_ledger in start_ledger..=current_ledger {
+            let bucket_volume: i128 = env
+                .storage()
+                .persistent()
+                .get(&DataKey::TokenVolumeBucket(token.clone(), bucket_ledger))
+                .unwrap_or(0);
+            current_period_volume += bucket_volume;
+        }
+
+        // Check if adding the amount would exceed quota
+        if current_period_volume + amount > quota.max_volume_per_period {
+            events::emit_token_quota_exceeded(&env, token, amount, current_period_volume);
+            return Err(Error::QuotaExceeded);
+        }
+
+        // Add to current bucket
+        let bucket_key = DataKey::TokenVolumeBucket(token.clone(), current_ledger);
+        let mut bucket_volume: i128 = env.storage().persistent().get(&bucket_key).unwrap_or(0);
+        bucket_volume += amount;
+        env.storage().persistent().set(&bucket_key, &bucket_volume);
+        env.storage().persistent().extend_ttl(
+            &bucket_key,
+            PERSISTENT_LIFETIME_THRESHOLD,
+            PERSISTENT_BUMP_AMOUNT,
+        );
+
+        Ok(())
+    }
+
+    /// Get token volume for a range of ledgers
+    pub fn get_token_volume(env: Env, token: Address, from_ledger: u32, to_ledger: u32) -> i128 {
+        let mut volume: i128 = 0;
+        for bucket_ledger in from_ledger..=to_ledger {
+            let bucket_volume: i128 = env
+                .storage()
+                .persistent()
+                .get(&DataKey::TokenVolumeBucket(token.clone(), bucket_ledger))
+                .unwrap_or(0);
+            volume += bucket_volume;
+        }
+        volume
     }
 
     /// Internal helper to check admin authorization

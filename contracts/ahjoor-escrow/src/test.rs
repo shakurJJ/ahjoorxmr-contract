@@ -3981,3 +3981,382 @@ fn test_milestone_out_of_range_rejected() {
 
     s.client.approve_milestone(&buyer, &escrow_id, &5);
 }
+
+// ------------------------------
+// Top-up Tests
+// ------------------------------
+
+#[test]
+fn test_single_top_up() {
+    let s = setup();
+    let buyer = Address::generate(&s.env);
+    let seller = Address::generate(&s.env);
+    let arbiter = Address::generate(&s.env);
+    s.token_admin_client.mint(&buyer, &1000);
+
+    let deadline = s.env.ledger().timestamp() + 1000;
+    let escrow_id = s.client.create_escrow(
+        &buyer,
+        &seller,
+        &arbiter,
+        &250,
+        &s.token_addr,
+        &deadline,
+        &None,
+        &Vec::new(&s.env),
+        &false,
+        &0,
+    );
+
+    // Check initial state
+    let escrow = s.client.get_escrow(&escrow_id);
+    assert_eq!(escrow.amount, 250);
+    assert_eq!(escrow.original_amount, 250);
+    assert!(escrow.top_up_history.is_empty());
+    assert!(escrow.top_up_acknowledged);
+
+    // Perform top-up
+    s.client.top_up_escrow(&buyer, &escrow_id, &150);
+
+    // Check new state
+    let escrow = s.client.get_escrow(&escrow_id);
+    assert_eq!(escrow.amount, 400);
+    assert_eq!(escrow.original_amount, 250);
+    assert_eq!(escrow.top_up_history.len(), 1);
+    assert_eq!(escrow.top_up_history.get(0).unwrap().amount, 150);
+    assert_eq!(escrow.top_up_history.get(0).unwrap().cumulative_total, 400);
+    assert!(!escrow.top_up_acknowledged);
+
+    // Check token balances
+    assert_eq!(s.token_client.balance(&buyer), 600); // 1000 - 250 -150
+    assert_eq!(s.token_client.balance(&s.client.address), 400);
+}
+
+#[test]
+fn test_multiple_top_ups() {
+    let s = setup();
+    let buyer = Address::generate(&s.env);
+    let seller = Address::generate(&s.env);
+    let arbiter = Address::generate(&s.env);
+    s.token_admin_client.mint(&buyer, &2000);
+
+    let deadline = s.env.ledger().timestamp() + 1000;
+    let escrow_id = s.client.create_escrow(
+        &buyer,
+        &seller,
+        &arbiter,
+        &200,
+        &s.token_addr,
+        &deadline,
+        &None,
+        &Vec::new(&s.env),
+        &false,
+        &0,
+    );
+
+    // First top-up
+    s.client.top_up_escrow(&buyer, &escrow_id, &100);
+    // Second top-up
+    s.client.top_up_escrow(&buyer, &escrow_id, &200);
+
+    let escrow = s.client.get_escrow(&escrow_id);
+    assert_eq!(escrow.amount, 500);
+    assert_eq!(escrow.top_up_history.len(), 2);
+    assert_eq!(escrow.top_up_history.get(0).unwrap().cumulative_total, 300);
+    assert_eq!(escrow.top_up_history.get(1).unwrap().cumulative_total, 500);
+}
+
+#[test]
+#[should_panic(expected = "Top-up limit exceeded")]
+fn test_top_up_limit_exceeded() {
+    let s = setup();
+    let buyer = Address::generate(&s.env);
+    let seller = Address::generate(&s.env);
+    let arbiter = Address::generate(&s.env);
+    s.token_admin_client.mint(&buyer, &2000);
+
+    let deadline = s.env.ledger().timestamp() + 1000;
+    let escrow_id = s.client.create_escrow(
+        &buyer,
+        &seller,
+        &arbiter,
+        &200,
+        &s.token_addr,
+        &deadline,
+        &None,
+        &Vec::new(&s.env),
+        &false,
+        &0,
+    );
+
+    // Max top-up is 3x original (200*3=600, so 400 extra allowed)
+    s.client.top_up_escrow(&buyer, &escrow_id, &450); // Will panic
+}
+
+#[test]
+#[should_panic(expected = "Escrow is not active or awaiting inspection")]
+fn test_top_up_after_release_rejected() {
+    let s = setup();
+    let buyer = Address::generate(&s.env);
+    let seller = Address::generate(&s.env);
+    let arbiter = Address::generate(&s.env);
+    s.token_admin_client.mint(&buyer, &1000);
+
+    let deadline = s.env.ledger().timestamp() + 1000;
+    let escrow_id = s.client.create_escrow(
+        &buyer,
+        &seller,
+        &arbiter,
+        &250,
+        &s.token_addr,
+        &deadline,
+        &None,
+        &Vec::new(&s.env),
+        &false,
+        &0,
+    );
+
+    // Release escrow
+    s.client.release_escrow(&buyer, &escrow_id);
+
+    // Try to top up
+    s.client.top_up_escrow(&buyer, &escrow_id, &100);
+}
+
+#[test]
+fn test_seller_acknowledge_topup() {
+    let s = setup();
+    let buyer = Address::generate(&s.env);
+    let seller = Address::generate(&s.env);
+    let arbiter = Address::generate(&s.env);
+    s.token_admin_client.mint(&buyer, &1000);
+
+    let deadline = s.env.ledger().timestamp() + 1000;
+    let escrow_id = s.client.create_escrow(
+        &buyer,
+        &seller,
+        &arbiter,
+        &250,
+        &s.token_addr,
+        &deadline,
+        &None,
+        &Vec::new(&s.env),
+        &false,
+        &0,
+    );
+
+    // Top up
+    s.client.top_up_escrow(&buyer, &escrow_id, &150);
+    assert!(!s.client.get_escrow(&escrow_id).top_up_acknowledged);
+
+    // Seller acknowledges
+    s.client.acknowledge_topup(&seller, &escrow_id);
+
+    assert!(s.client.get_escrow(&escrow_id).top_up_acknowledged);
+}
+
+#[test]
+fn test_admin_update_topup_multiplier() {
+    let s = setup();
+    // Check default
+    assert_eq!(s.client.get_max_topup_multiplier(), 3);
+
+    // Update to 5
+    s.client.update_max_topup_multiplier(&s.admin, &5);
+    assert_eq!(s.client.get_max_topup_multiplier(), 5);
+}
+
+#[test]
+fn test_partial_release_request() {
+    let s = setup();
+    let buyer = Address::generate(&s.env);
+    let seller = Address::generate(&s.env);
+    let arbiter = Address::generate(&s.env);
+    s.token_admin_client.mint(&buyer, &1000);
+
+    let deadline = s.env.ledger().timestamp() + 1000;
+    let escrow_id = s.client.create_escrow(
+        &buyer,
+        &seller,
+        &arbiter,
+        &250,
+        &s.token_addr,
+        &deadline,
+        &None,
+        &Vec::new(&s.env),
+        &false,
+        &0,
+    );
+
+    // Request partial release
+    let justification_hash = BytesN::from_array(&s.env, &[1u8; 32]);
+    s.client.request_partial_release(&seller, &escrow_id, &100, &justification_hash);
+}
+
+#[test]
+fn test_partial_release_approve() {
+    let s = setup();
+    let buyer = Address::generate(&s.env);
+    let seller = Address::generate(&s.env);
+    let arbiter = Address::generate(&s.env);
+    s.token_admin_client.mint(&buyer, &1000);
+
+    let deadline = s.env.ledger().timestamp() + 1000;
+    let escrow_id = s.client.create_escrow(
+        &buyer,
+        &seller,
+        &arbiter,
+        &250,
+        &s.token_addr,
+        &deadline,
+        &None,
+        &Vec::new(&s.env),
+        &false,
+        &0,
+    );
+
+    // Request partial release
+    let justification_hash = BytesN::from_array(&s.env, &[1u8; 32]);
+    s.client.request_partial_release(&seller, &escrow_id, &100, &justification_hash);
+
+    // Approve
+    s.client.approve_partial_release(&buyer, &escrow_id, &1);
+
+    // Check escrow amount
+    let escrow = s.client.get_escrow(&escrow_id);
+    assert_eq!(escrow.amount, 150);
+
+    // Check seller balance
+    assert_eq!(s.token_client.balance(&seller), 100);
+}
+
+#[test]
+fn test_partial_release_reject() {
+    let s = setup();
+    let buyer = Address::generate(&s.env);
+    let seller = Address::generate(&s.env);
+    let arbiter = Address::generate(&s.env);
+    s.token_admin_client.mint(&buyer, &1000);
+
+    let deadline = s.env.ledger().timestamp() + 1000;
+    let escrow_id = s.client.create_escrow(
+        &buyer,
+        &seller,
+        &arbiter,
+        &250,
+        &s.token_addr,
+        &deadline,
+        &None,
+        &Vec::new(&s.env),
+        &false,
+        &0,
+    );
+
+    // Request partial release
+    let justification_hash = BytesN::from_array(&s.env, &[1u8; 32]);
+    s.client.request_partial_release(&seller, &escrow_id, &100, &justification_hash);
+
+    // Reject
+    let reason_hash = BytesN::from_array(&s.env, &[2u8; 32]);
+    s.client.reject_partial_release(&buyer, &escrow_id, &1, &reason_hash);
+}
+
+#[test]
+#[should_panic(expected = "Request already pending")]
+fn test_duplicate_partial_release() {
+    let s = setup();
+    let buyer = Address::generate(&s.env);
+    let seller = Address::generate(&s.env);
+    let arbiter = Address::generate(&s.env);
+    s.token_admin_client.mint(&buyer, &1000);
+
+    let deadline = s.env.ledger().timestamp() + 1000;
+    let escrow_id = s.client.create_escrow(
+        &buyer,
+        &seller,
+        &arbiter,
+        &250,
+        &s.token_addr,
+        &deadline,
+        &None,
+        &Vec::new(&s.env),
+        &false,
+        &0,
+    );
+
+    // First request
+    let justification_hash = BytesN::from_array(&s.env, &[1u8; 32]);
+    s.client.request_partial_release(&seller, &escrow_id, &100, &justification_hash);
+
+    // Second request (should panic)
+    s.client.request_partial_release(&seller, &escrow_id, &100, &justification_hash);
+}
+
+#[test]
+fn test_partial_release_escalate() {
+    let s = setup();
+    let buyer = Address::generate(&s.env);
+    let seller = Address::generate(&s.env);
+    let arbiter = Address::generate(&s.env);
+    s.token_admin_client.mint(&buyer, &1000);
+
+    let deadline = s.env.ledger().timestamp() + 1000;
+    let escrow_id = s.client.create_escrow(
+        &buyer,
+        &seller,
+        &arbiter,
+        &250,
+        &s.token_addr,
+        &deadline,
+        &None,
+        &Vec::new(&s.env),
+        &false,
+        &0,
+    );
+
+    // Request partial release
+    let justification_hash = BytesN::from_array(&s.env, &[1u8; 32]);
+    s.client.request_partial_release(&seller, &escrow_id, &100, &justification_hash);
+
+    // Advance time past deadline (default is 86400 sec, so add 86401)
+    s.env.ledger().set_timestamp(s.env.ledger().timestamp() + 86401);
+
+    // Escalate to dispute
+    s.client.escalate_partial_release_to_dispute(&seller, &escrow_id);
+
+    // Check escrow status
+    let escrow = s.client.get_escrow(&escrow_id);
+    assert_eq!(escrow.status, EscrowStatus::Disputed);
+}
+
+#[test]
+#[should_panic(expected = "Partial release only allowed on active escrow")]
+fn test_partial_release_non_active() {
+    let s = setup();
+    let buyer = Address::generate(&s.env);
+    let seller = Address::generate(&s.env);
+    let arbiter = Address::generate(&s.env);
+    s.token_admin_client.mint(&buyer, &1000);
+
+    let deadline = s.env.ledger().timestamp() + 1000;
+    let escrow_id = s.client.create_escrow(
+        &buyer,
+        &seller,
+        &arbiter,
+        &250,
+        &s.token_addr,
+        &deadline,
+        &None,
+        &Vec::new(&s.env),
+        &false,
+        &0,
+    );
+
+    // Release escrow first
+    s.client.release_escrow(&buyer, &escrow_id);
+
+    // Try to request partial release (should panic)
+    let justification_hash = BytesN::from_array(&s.env, &[1u8; 32]);
+    s.client.request_partial_release(&seller, &escrow_id, &100, &justification_hash);
+}
+

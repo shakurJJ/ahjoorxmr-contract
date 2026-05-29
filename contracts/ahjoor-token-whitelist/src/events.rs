@@ -114,5 +114,43 @@ pub fn emit_token_suspension_lifted(e: &Env, token: Address, lifted_by: Address,
 }
 
 pub fn emit_token_auto_reinstated(e: &Env, token: Address, ledger: u32) {
+    e.events().publish(
+        (soroban_sdk::Symbol::new(e, "TokenAutoReinstated"),),
+        (token, ledger),
+    );
+}
+
+#[contractevent]
+#[derive(Clone, Debug)]
+pub struct TokenQuotaSet {
+    pub token: Address,
+    pub max_volume_per_period: i128,
+    pub period_ledgers: u32,
+}
+
+pub fn emit_token_quota_set(e: &Env, token: Address, max_volume_per_period: i128, period_ledgers: u32) {
+    TokenQuotaSet {
+        token,
+        max_volume_per_period,
+        period_ledgers,
+    }
+    .publish(e);
+}
+
+#[contractevent]
+#[derive(Clone, Debug)]
+pub struct TokenQuotaExceeded {
+    pub token: Address,
+    pub attempted_amount: i128,
+    pub period_volume: i128,
+}
+
+pub fn emit_token_quota_exceeded(e: &Env, token: Address, attempted_amount: i128, period_volume: i128) {
+    TokenQuotaExceeded {
+        token,
+        attempted_amount,
+        period_volume,
+    }
+    .publish(e);
     TokenAutoReinstated { token, ledger }.publish(e);
 }

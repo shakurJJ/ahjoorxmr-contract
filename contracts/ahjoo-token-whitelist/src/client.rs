@@ -22,6 +22,12 @@ pub trait TokenWhitelistInterface {
     /// Get the current admin
     fn get_admin(env: Env) -> Address;
 
+    /// Propose new admin
+    fn propose_admin(env: Env, current_admin: Address, new_admin: Address);
+
+    /// Accept admin transfer
+    fn accept_admin(env: Env, new_admin: Address);
+
     /// Set token quota (admin only)
     fn set_token_quota(
         env: Env,

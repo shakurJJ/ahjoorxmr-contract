@@ -292,6 +292,15 @@ pub struct InvoiceAttached {
     pub invoice_hash: BytesN<32>,
 }
 
+/// Event: Payment expiry extended by merchant
+#[contractevent]
+#[derive(Clone, Debug)]
+pub struct PaymentExpiryExtended {
+    pub payment_id: u32,
+    pub new_expires_at: u64,
+    pub extension_count: u32,
+}
+
 // --- Helper Emission Functions ---
 
 pub fn emit_payment_created(
@@ -768,6 +777,15 @@ pub fn emit_invoice_attached(e: &Env, payment_id: u32, invoice_hash: BytesN<32>)
     InvoiceAttached {
         payment_id,
         invoice_hash,
+    }
+    .publish(e);
+}
+
+pub fn emit_payment_expiry_extended(e: &Env, payment_id: u32, new_expires_at: u64, extension_count: u32) {
+    PaymentExpiryExtended {
+        payment_id,
+        new_expires_at,
+        extension_count,
     }
     .publish(e);
 }

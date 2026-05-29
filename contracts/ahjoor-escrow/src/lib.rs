@@ -14,6 +14,8 @@ const DEFAULT_DISPUTE_TIMEOUT_SECONDS: u64 = 7 * 24 * 60 * 60;
 const MAX_BATCH_ESCROWS: u32 = 10;
 const DEFAULT_MAX_ORACLE_AGE_SECONDS: u64 = 300;
 const DEFAULT_INSURANCE_TRIGGER_DAYS: u64 = 7;
+const DEFAULT_MAX_TOPUP_MULTIPLIER: u32 = 3;
+const DEFAULT_PARTIAL_RELEASE_RESPONSE_DEADLINE: u64 = 86400; // 1 day
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[contracttype]
@@ -100,6 +102,7 @@ pub struct Escrow {
     pub seller: Address,
     pub arbiter: Address,
     pub amount: i128,
+    pub original_amount: i128,
     pub token: Address,
     pub status: EscrowStatus,
     pub created_at: u64,
@@ -107,6 +110,8 @@ pub struct Escrow {
     pub metadata_hash: Option<BytesN<32>>,
     pub sellers: Vec<(Address, u32)>, // (address, bps) — multi-party sellers
     pub extensions: EscrowExtensions,
+    pub top_up_history: Vec<TopUpEntry>,
+    pub top_up_acknowledged: bool,
 }
 
 #[contracttype]
@@ -190,6 +195,24 @@ pub struct DeadlineProposal {
     pub proposer: Address,
     pub new_deadline: u64,
     pub proposed_at: u64,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TopUpEntry {
+    pub amount: i128,
+    pub timestamp: u64,
+    pub cumulative_total: i128,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PartialReleaseRequest {
+    pub request_id: u64,
+    pub amount: i128,
+    pub justification_hash: BytesN<32>,
+    pub created_at: u64,
+    pub response_deadline: u64,
 }
 
 #[contracttype]
@@ -297,6 +320,14 @@ pub enum DataKey {
     CancellationResponseWindow,
     /// #225: max top-up as basis points of original escrow amount (e.g. 5000 = 50%)
     MaxTopUpBps,
+    /// #(new): max top-up multiplier (e.g., 3 means max 3x original amount)
+    MaxTopupMultiplier,
+    /// #(new): partial release response deadline in seconds
+    PartialReleaseResponseDeadline,
+    /// #(new): pending partial release request per escrow
+    PendingPartialRelease(u32),
+    /// #(new): partial release request counter per escrow
+    PartialReleaseCounter(u32),
     /// #225: cumulative top-up amount per escrow
     EscrowToppedUpAmount(u32),
     /// #237: seller collateral amount locked per escrow
@@ -457,6 +488,8 @@ impl AhjoorEscrowContract {
         env.storage()
             .instance()
             .set(&DataKey::DefaultDisputeWinner, &DisputeDefaultWinner::Buyer);
+        env.storage().instance().set(&DataKey::MaxTopupMultiplier, &DEFAULT_MAX_TOPUP_MULTIPLIER);
+        env.storage().instance().set(&DataKey::PartialReleaseResponseDeadline, &DEFAULT_PARTIAL_RELEASE_RESPONSE_DEADLINE);
 
         env.storage()
             .instance()
@@ -912,6 +945,7 @@ impl AhjoorEscrowContract {
             seller: primary_seller.clone(),
             arbiter: arbiter.clone(),
             amount,
+            original_amount: amount,
             token: token.clone(),
             status: EscrowStatus::Active,
             created_at: now,
@@ -940,6 +974,8 @@ impl AhjoorEscrowContract {
                 auto_renew_config,
                 renewals_completed: 0,
             },
+            top_up_history: Vec::new(env),
+            top_up_acknowledged: true,
         };
 
         env.storage()
@@ -2093,6 +2129,50 @@ impl AhjoorEscrowContract {
             .unwrap_or(DisputeDefaultWinner::Buyer)
     }
 
+    /// Admin updates the max top-up multiplier (e.g., 3 = max 3x original amount).
+    pub fn update_max_topup_multiplier(env: Env, admin: Address, multiplier: u32) {
+        Self::require_admin(&env, &admin);
+        if multiplier == 0 {
+            panic!("Multiplier must be positive");
+        }
+
+        env.storage()
+            .instance()
+            .set(&DataKey::MaxTopupMultiplier, &multiplier);
+        env.storage()
+            .instance()
+            .extend_ttl(INSTANCE_LIFETIME_THRESHOLD, INSTANCE_BUMP_AMOUNT);
+    }
+
+    pub fn get_max_topup_multiplier(env: Env) -> u32 {
+        env.storage()
+            .instance()
+            .get(&DataKey::MaxTopupMultiplier)
+            .unwrap_or(DEFAULT_MAX_TOPUP_MULTIPLIER)
+    }
+
+    /// Admin updates the partial release response deadline in seconds
+    pub fn update_partial_release_response_deadline(env: Env, admin: Address, deadline: u64) {
+        Self::require_admin(&env, &admin);
+        if deadline == 0 {
+            panic!("Deadline must be positive");
+        }
+
+        env.storage()
+            .instance()
+            .set(&DataKey::PartialReleaseResponseDeadline, &deadline);
+        env.storage()
+            .instance()
+            .extend_ttl(INSTANCE_LIFETIME_THRESHOLD, INSTANCE_BUMP_AMOUNT);
+    }
+
+    pub fn get_partial_release_response_deadline(env: Env) -> u64 {
+        env.storage()
+            .instance()
+            .get(&DataKey::PartialReleaseResponseDeadline)
+            .unwrap_or(DEFAULT_PARTIAL_RELEASE_RESPONSE_DEADLINE)
+    }
+
     /// Enforce dispute timeout: release funds to default winner if arbiter fails to resolve within deadline.
     /// Can be called by anyone after the deadline has passed.
     pub fn enforce_dispute_timeout(env: Env, escrow_id: u32) {
@@ -2763,6 +2843,352 @@ impl AhjoorEscrowContract {
             .expect("Escrow not found")
     }
 
+    /// Buyer tops up an active or awaiting inspection escrow
+    pub fn top_up_escrow(env: Env, buyer: Address, escrow_id: u32, additional_amount: i128) {
+        Self::require_not_paused(&env);
+        buyer.require_auth();
+
+        let mut escrow: Escrow = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Escrow(escrow_id))
+            .expect("Escrow not found");
+
+        if buyer != escrow.buyer {
+            panic!("Only buyer can top up escrow");
+        }
+
+        // Check status is Active or AwaitingInspection
+        if escrow.status != EscrowStatus::Active && escrow.status != EscrowStatus::AwaitingInspection {
+            panic!("Escrow is not active or awaiting inspection");
+        }
+
+        if additional_amount <= 0 {
+            panic!("Additional amount must be positive");
+        }
+
+        let max_topup_multiplier: u32 = env
+            .storage()
+            .instance()
+            .get(&DataKey::MaxTopupMultiplier)
+            .unwrap_or(DEFAULT_MAX_TOPUP_MULTIPLIER);
+        let max_total = escrow.original_amount * (max_topup_multiplier as i128);
+        let new_total = escrow.amount + additional_amount;
+
+        if new_total > max_total {
+            panic!("Top-up limit exceeded");
+        }
+
+        // Transfer tokens
+        let token_client = token::Client::new(&env, &escrow.token);
+        token_client.transfer(&buyer, &env.current_contract_address(), &additional_amount);
+
+        // Update escrow
+        escrow.amount = new_total;
+        let topup_entry = TopUpEntry {
+            amount: additional_amount,
+            timestamp: env.ledger().timestamp(),
+            cumulative_total: new_total,
+        };
+        escrow.top_up_history.push_back(topup_entry);
+        escrow.top_up_acknowledged = false;
+
+        // Save and extend TTL
+        env.storage()
+            .persistent()
+            .set(&DataKey::Escrow(escrow_id), &escrow);
+        env.storage().persistent().extend_ttl(
+            &DataKey::Escrow(escrow_id),
+            PERSISTENT_LIFETIME_THRESHOLD,
+            PERSISTENT_BUMP_AMOUNT,
+        );
+
+        // Emit event
+        events::emit_escrow_topped_up(&env, escrow_id, buyer, additional_amount, new_total);
+
+        env.storage()
+            .instance()
+            .extend_ttl(INSTANCE_LIFETIME_THRESHOLD, INSTANCE_BUMP_AMOUNT);
+    }
+
+    /// Seller acknowledges the top-up
+    pub fn acknowledge_topup(env: Env, seller: Address, escrow_id: u32) {
+        Self::require_not_paused(&env);
+        seller.require_auth();
+
+        let mut escrow: Escrow = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Escrow(escrow_id))
+            .expect("Escrow not found");
+
+        if seller != escrow.seller {
+            panic!("Only seller can acknowledge top-up");
+        }
+
+        escrow.top_up_acknowledged = true;
+
+        // Save and extend TTL
+        env.storage()
+            .persistent()
+            .set(&DataKey::Escrow(escrow_id), &escrow);
+        env.storage().persistent().extend_ttl(
+            &DataKey::Escrow(escrow_id),
+            PERSISTENT_LIFETIME_THRESHOLD,
+            PERSISTENT_BUMP_AMOUNT,
+        );
+
+        // Emit event
+        events::emit_top_up_acknowledged(&env, escrow_id, seller, escrow.amount);
+
+        env.storage()
+            .instance()
+            .extend_ttl(INSTANCE_LIFETIME_THRESHOLD, INSTANCE_BUMP_AMOUNT);
+    }
+
+    /// Seller requests partial release of escrowed funds
+    pub fn request_partial_release(
+        env: Env,
+        seller: Address,
+        escrow_id: u32,
+        amount: i128,
+        justification_hash: BytesN<32>,
+    ) {
+        Self::require_not_paused(&env);
+        seller.require_auth();
+
+        let escrow: Escrow = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Escrow(escrow_id))
+            .expect("Escrow not found");
+
+        if seller != escrow.seller {
+            panic!("Only seller can request partial release");
+        }
+
+        if escrow.status != EscrowStatus::Active {
+            panic!("Partial release only allowed on active escrow");
+        }
+
+        if amount <= 0 {
+            panic!("Partial release amount must be positive");
+        }
+
+        if amount > escrow.amount {
+            panic!("Partial release amount cannot exceed escrow amount");
+        }
+
+        // Check if there's already a pending request
+        if env.storage().persistent().has(&DataKey::PendingPartialRelease(escrow_id)) {
+            panic!("Request already pending");
+        }
+
+        // Get next request ID
+        let mut request_counter: u64 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::PartialReleaseCounter(escrow_id))
+            .unwrap_or(0);
+        request_counter += 1;
+        env.storage()
+            .persistent()
+            .set(&DataKey::PartialReleaseCounter(escrow_id), &request_counter);
+
+        // Get response deadline
+        let response_deadline_seconds: u64 = env
+            .storage()
+            .instance()
+            .get(&DataKey::PartialReleaseResponseDeadline)
+            .unwrap_or(DEFAULT_PARTIAL_RELEASE_RESPONSE_DEADLINE);
+        let now = env.ledger().timestamp();
+        let response_deadline = now + response_deadline_seconds;
+
+        // Create request
+        let request = PartialReleaseRequest {
+            request_id: request_counter,
+            amount,
+            justification_hash,
+            created_at: now,
+            response_deadline,
+        };
+
+        // Store request
+        env.storage()
+            .persistent()
+            .set(&DataKey::PendingPartialRelease(escrow_id), &request);
+        env.storage().persistent().extend_ttl(
+            &DataKey::PendingPartialRelease(escrow_id),
+            PERSISTENT_LIFETIME_THRESHOLD,
+            PERSISTENT_BUMP_AMOUNT,
+        );
+        env.storage().persistent().extend_ttl(
+            &DataKey::PartialReleaseCounter(escrow_id),
+            PERSISTENT_LIFETIME_THRESHOLD,
+            PERSISTENT_BUMP_AMOUNT,
+        );
+
+        // Emit event
+        events::emit_partial_release_requested(&env, escrow_id, request_counter, seller, amount);
+    }
+
+    /// Buyer approves partial release request
+    pub fn approve_partial_release(env: Env, buyer: Address, escrow_id: u32, request_id: u64) {
+        Self::require_not_paused(&env);
+        buyer.require_auth();
+
+        let mut escrow: Escrow = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Escrow(escrow_id))
+            .expect("Escrow not found");
+
+        if buyer != escrow.buyer {
+            panic!("Only buyer can approve partial release");
+        }
+
+        // Get pending request
+        let request: PartialReleaseRequest = env
+            .storage()
+            .persistent()
+            .get(&DataKey::PendingPartialRelease(escrow_id))
+            .expect("No pending partial release request");
+
+        if request.request_id != request_id {
+            panic!("Invalid request ID");
+        }
+
+        // Transfer funds
+        Self::transfer_to_sellers(&env, &escrow, request.amount, escrow_id);
+
+        // Reduce escrow amount
+        escrow.amount -= request.amount;
+
+        // Save escrow
+        env.storage()
+            .persistent()
+            .set(&DataKey::Escrow(escrow_id), &escrow);
+        env.storage().persistent().extend_ttl(
+            &DataKey::Escrow(escrow_id),
+            PERSISTENT_LIFETIME_THRESHOLD,
+            PERSISTENT_BUMP_AMOUNT,
+        );
+
+        // Remove pending request
+        env.storage()
+            .persistent()
+            .remove(&DataKey::PendingPartialRelease(escrow_id));
+
+        // Emit event
+        events::emit_partial_release_approved(&env, escrow_id, request_id, request.amount);
+    }
+
+    /// Buyer rejects partial release request
+    pub fn reject_partial_release(
+        env: Env,
+        buyer: Address,
+        escrow_id: u32,
+        request_id: u64,
+        reason_hash: BytesN<32>,
+    ) {
+        Self::require_not_paused(&env);
+        buyer.require_auth();
+
+        let escrow: Escrow = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Escrow(escrow_id))
+            .expect("Escrow not found");
+
+        if buyer != escrow.buyer {
+            panic!("Only buyer can reject partial release");
+        }
+
+        // Get pending request
+        let request: PartialReleaseRequest = env
+            .storage()
+            .persistent()
+            .get(&DataKey::PendingPartialRelease(escrow_id))
+            .expect("No pending partial release request");
+
+        if request.request_id != request_id {
+            panic!("Invalid request ID");
+        }
+
+        // Remove pending request
+        env.storage()
+            .persistent()
+            .remove(&DataKey::PendingPartialRelease(escrow_id));
+
+        // Emit event
+        events::emit_partial_release_rejected(&env, escrow_id, request_id);
+    }
+
+    /// Seller escalates to dispute if buyer doesn't respond within deadline
+    pub fn escalate_partial_release_to_dispute(env: Env, seller: Address, escrow_id: u32) {
+        Self::require_not_paused(&env);
+        seller.require_auth();
+
+        let escrow: Escrow = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Escrow(escrow_id))
+            .expect("Escrow not found");
+
+        if seller != escrow.seller {
+            panic!("Only seller can escalate partial release");
+        }
+
+        // Get pending request
+        let request: PartialReleaseRequest = env
+            .storage()
+            .persistent()
+            .get(&DataKey::PendingPartialRelease(escrow_id))
+            .expect("No pending partial release request");
+
+        // Check if deadline passed
+        let now = env.ledger().timestamp();
+        if now < request.response_deadline {
+            panic!("Response deadline not yet passed");
+        }
+
+        // Remove pending request
+        env.storage()
+            .persistent()
+            .remove(&DataKey::PendingPartialRelease(escrow_id));
+
+        // Escalate to full dispute
+        let mut escrow_mut = escrow;
+        escrow_mut.status = EscrowStatus::Disputed;
+
+        env.storage()
+            .persistent()
+            .set(&DataKey::Escrow(escrow_id), &escrow_mut);
+        env.storage().persistent().extend_ttl(
+            &DataKey::Escrow(escrow_id),
+            PERSISTENT_LIFETIME_THRESHOLD,
+            PERSISTENT_BUMP_AMOUNT,
+        );
+
+        // Create a dispute record (using existing Dispute struct)
+        let dispute = Dispute {
+            escrow_id,
+            reason: String::from_str(&env, "Partial release escalation"),
+            created_at: now,
+            resolved: false,
+            dispute_amount: escrow_mut.amount,
+            timeout_seconds: None,
+        };
+        env.storage()
+            .persistent()
+            .set(&DataKey::Dispute(escrow_id), &dispute);
+        env.storage().persistent().extend_ttl(
+            &DataKey::Dispute(escrow_id),
+            PERSISTENT_LIFETIME_THRESHOLD,
+            PERSISTENT_BUMP_AMOUNT,
+        );
+    }
+
     /// Transfer buyer role in an active escrow to a new address.
     pub fn transfer_buyer_role(
         env: Env,
@@ -3243,6 +3669,7 @@ impl AhjoorEscrowContract {
             seller: seller.clone(),
             arbiter: template.config.arbiter.clone(),
             amount,
+            original_amount: amount,
             token: template.config.token.clone(),
             status: EscrowStatus::Active,
             created_at: env.ledger().timestamp(),
@@ -3271,6 +3698,8 @@ impl AhjoorEscrowContract {
                 auto_renew_config: None,
                 renewals_completed: 0,
             },
+            top_up_history: Vec::new(&env),
+            top_up_acknowledged: true,
         };
 
         env.storage()
@@ -3467,6 +3896,8 @@ impl AhjoorEscrowContract {
                 auto_renew_config: None,
                 renewals_completed: 0,
             },
+            top_up_history: Vec::new(&env),
+            top_up_acknowledged: true,
         };
 
         env.storage()
